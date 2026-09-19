@@ -74,7 +74,8 @@ class Operators(Core):
             out["remote_only"] = remote_only  # a file deleted in the repo is still live on the runner
         return out
 
-    def tofu_plan(self, stack: str | None = None, wait_s: int | None = None, sync: bool | None = None) -> dict[str, Any]:
+    def tofu_plan(self, stack: str | None = None, wait_s: int | None = None,
+                  sync: bool | None = None) -> dict[str, Any]:
         name, config = self._stack(stack)
         self.require("tofu.plan", name)
         do_sync = config.sync if sync is None else (sync and bool(config.source_dir))

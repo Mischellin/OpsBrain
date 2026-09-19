@@ -27,7 +27,8 @@ _K8S_NAME = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")
 _K8S_LOG_TARGET = re.compile(r"^((deployment|deploy|statefulset|sts|daemonset|ds|job|pod)/)?[a-z0-9]([a-z0-9.-]{0,251}"
                              r"[a-z0-9])?$")
 _SELECTOR = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./=!, ()-]{0,199}$")
-_SINCE = re.compile(r"^[0-9]{1,4} ?(s|sec|m|min|h|hour|hours|d|day|days)( ago)?$|^[0-9T:. -]{8,25}$|^(today|yesterday)$")
+_SINCE = re.compile(r"^[0-9]{1,4} ?(s|sec|m|min|h|hour|hours|d|day|days)( ago)?$|^[0-9T:. -]{8,25}$|"
+                    r"^(today|yesterday)$")
 _UNIT = re.compile(r"^[A-Za-z0-9@_.:-]{1,120}$")
 
 K8S_KINDS = {

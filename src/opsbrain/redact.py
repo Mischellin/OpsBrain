@@ -11,8 +11,8 @@ import re
 
 MARK = "[REDACTED:{kind}]"
 
-_PRIVATE_KEY = re.compile(r"-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----.{0,20000}?-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----",
-                          re.DOTALL)
+_PRIVATE_KEY = re.compile(r"-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----.{0,20000}?"
+                          r"-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----", re.DOTALL)
 _VAULT = re.compile(r"\$ANSIBLE_VAULT;[0-9.]+;AES256[^\n]{0,80}\n(?:[ \t]*[0-9a-f]{20,}\n?){1,2000}")
 
 _TOKENS: tuple[tuple[str, re.Pattern[str]], ...] = (

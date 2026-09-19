@@ -21,7 +21,8 @@ def test_tofu_plan_summary_never_carries_values() -> None:
 
 
 def test_tofu_text_lock_and_errors() -> None:
-    text = ("│ Error: Error acquiring the state lock\n│ Lock Info:\n│   ID:        9db590f1-b6fe-c5f2-2678-8804f089deba\n")
+    text = ("│ Error: Error acquiring the state lock\n│ Lock Info:\n"
+            "│   ID:        9db590f1-b6fe-c5f2-2678-8804f089deba\n")
     facts = parsers.tofu_text(text)
     assert facts["state_lock"]["id"] == "9db590f1-b6fe-c5f2-2678-8804f089deba"
     assert parsers.tofu_text("Apply complete! Resources: 1 added, 2 changed, 0 destroyed.")["applied"] == {
