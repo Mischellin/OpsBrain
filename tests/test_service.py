@@ -195,3 +195,22 @@ def test_running_job_returns_a_handle(ops, fake) -> None:  # type: ignore[no-unt
     assert view["state"] == "running" and view["next"] == f"job action=status id={view['job']}"
     assert ops.overview()["running_jobs"][0]["id"] == view["job"]
     assert isinstance(Result(0, "").ok, bool)
+
+
+def test_agent_socket_falls_back_to_launchd(config, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import subprocess
+    import sys
+
+    from opsbrain.executor import Executor
+
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, "/tmp/agent.sock\n", ""))
+    assert Executor(config).base_env()["SSH_AUTH_SOCK"] == "/tmp/agent.sock"
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/from/env")
+    assert Executor(config).base_env()["SSH_AUTH_SOCK"] == "/from/env"
+
+
+def test_unreachable_host_reports_the_reason(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    fake.on(r"uptime_s", "Permission denied (publickey).", rc=255)
+    assert ops.hosts_status(["pve"])["hosts"]["pve"]["warn"] == ["unreachable: Permission denied (publickey)."]

@@ -152,7 +152,11 @@ class Readers(Core):
         ignore = frozenset(self.config.ignore_failed_units)
         rows: dict[str, Any] = {}
         for name, result in results.items():
-            rows[name] = (parsers.host_status(result.out, ignore) if result.ok else {"warn": ["unreachable"]})
+            if result.ok:
+                rows[name] = parsers.host_status(result.out, ignore)
+            else:
+                reason = result.out.strip().splitlines()[-1] if result.out.strip() else "timeout"
+                rows[name] = {"warn": [f"unreachable: {clip(reason, 120)}"]}
         attention = {name: row for name, row in rows.items() if row.get("warn")}
         # healthy hosts cost one word each; details only where something is off (or when asked for few hosts)
         if len(names) > 3:

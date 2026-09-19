@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,10 +38,28 @@ class Result:
 class Executor:
     def __init__(self, config: Config):
         self.config = config
+        self._agent_socket: str | None = None
+
+    def agent_socket(self) -> str:
+        """ssh-agent socket. A server started by a GUI app (Claude Desktop) has no SSH_AUTH_SOCK in its
+        environment; on macOS launchd knows it. Without it every ssh is an authentication failure, and a burst
+        of those makes sshd penalise the source address (PerSourcePenalties) - for the user's terminal too."""
+        if self._agent_socket is None:
+            socket = os.environ.get("SSH_AUTH_SOCK", "")
+            if not socket and sys.platform == "darwin":
+                try:
+                    socket = subprocess.run(["launchctl", "getenv", "SSH_AUTH_SOCK"], capture_output=True, text=True,
+                                            timeout=10, check=False).stdout.strip()
+                except (OSError, subprocess.TimeoutExpired):
+                    socket = ""
+            self._agent_socket = socket
+        return self._agent_socket
 
     # -- environment -------------------------------------------------------------------------------
     def base_env(self, extra: Mapping[str, str] | None = None) -> dict[str, str]:
         env = {key: os.environ[key] for key in _PASS_ENV if key in os.environ}
+        if "SSH_AUTH_SOCK" not in env and self.agent_socket():
+            env["SSH_AUTH_SOCK"] = self.agent_socket()
         env.update(extra or {})
         return env
 
