@@ -396,8 +396,10 @@ class Readers(Core):
             raise OpsError(f"tracked export not found: {network.tracked_export}")
         tracked = parsers.mikrotik_normalise(tracked_path.read_text(encoding="utf-8", errors="replace"))
         live = self._live_export()
-        diff = [line for line in difflib.unified_diff(tracked, live, "tracked", "live", n=0, lineterm="")
-                if not line.startswith(("---", "+++", "@@"))]
+        # autojunk off: on a long export the heuristic drops "popular" lines and reports unchanged ones as changed
+        matcher = difflib.SequenceMatcher(None, tracked, live, autojunk=False)
+        diff = [sign + line for tag, a1, a2, b1, b2 in matcher.get_opcodes() if tag != "equal"
+                for sign, block in (("-", tracked[a1:a2]), ("+", live[b1:b2])) for line in block]
         if not diff:
             return {"drift": False}
         meta = self.artifacts.save("mikrotik-diff", "tracked vs live", "\n".join(diff))
