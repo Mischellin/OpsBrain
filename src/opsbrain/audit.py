@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from .redact import redact_text
+from .redact import redact_obj
 from .util import now
 
 
@@ -17,7 +17,7 @@ class AuditLog:
 
     def record(self, **fields: Any) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        line = redact_text(json.dumps({"ts": round(now(), 3), **fields}, ensure_ascii=False, default=str))
+        line = json.dumps({"ts": round(now(), 3), **redact_obj(fields)}, ensure_ascii=False, default=str)
         descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
             handle.write(line + "\n")

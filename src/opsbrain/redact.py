@@ -8,6 +8,7 @@ that never leave the runner). Every pattern starts with a literal or uses bounde
 from __future__ import annotations
 
 import re
+from typing import Any
 
 MARK = "[REDACTED:{kind}]"
 
@@ -67,3 +68,19 @@ def redact(text: str) -> tuple[str, int]:
 
 def redact_text(text: str) -> str:
     return redact(text)[0]
+
+
+_SENSITIVE_NAME = re.compile(rf"(?i)({_SENSITIVE_KEY})")
+
+
+def redact_obj(value: Any) -> Any:
+    """Structure-aware variant for data that must stay valid JSON (the audit log): strings are redacted in
+    place, values under a sensitive key are masked whole."""
+    if isinstance(value, str):
+        return redact_text(value)
+    if isinstance(value, dict):
+        return {key: (MARK.format(kind="value") if _SENSITIVE_NAME.search(str(key)) and item not in (None, "")
+                      else redact_obj(item)) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [redact_obj(item) for item in value]
+    return value
