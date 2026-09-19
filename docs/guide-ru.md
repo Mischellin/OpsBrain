@@ -8,8 +8,11 @@ OpsBrain - локальный MCP-сервер, через который Claude
 uv tool install git+https://github.com/Mischellin/OpsBrain.git
 opsbrain init              # пример конфига в ~/.opsbrain/config.yaml - опишите хосты, стеки, плейбуки
 opsbrain doctor --net      # проверка конфига, бинарей и ssh-доступности
-claude mcp add --scope user OpsBrain -- opsbrain serve
+opsbrain desktop install   # Claude Desktop: соберёт .mcpb и откроет его в приложении - нажмите Install
 ```
+
+Для CLI Claude Code: `claude mcp add --scope user OpsBrain -- opsbrain serve`. В Desktop OpsBrain виден в
+Settings -> Extensions; после обновления самого OpsBrain расширение переустанавливать не нужно.
 
 Секретов в конфиге нет. OpsBrain использует то, что уже работает на машине: ssh-agent, kubeconfig, файл пароля
 ansible-vault; env-файл tofu остаётся на раннере и только `source`-ится там.

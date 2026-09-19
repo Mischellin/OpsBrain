@@ -134,11 +134,32 @@ def cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_desktop(args: argparse.Namespace) -> int:
+    from . import desktop
+
+    config = load_config(args.config)  # a broken config must fail here, not silently inside Claude Desktop
+    if args.action == "status":
+        record = desktop.installed_extension()
+        print(f"extension: {record or 'not installed'}")
+        if desktop.legacy_config_entry():
+            print("!! claude_desktop_config.json also defines OpsBrain: remove that entry (duplicate tools)")
+        return 0 if record else 1
+    bundle = desktop.build(config_path(args.config), config.data_path / "dist")
+    print(f"built {bundle}")
+    if args.action == "install":
+        if desktop.legacy_config_entry():
+            print("!! claude_desktop_config.json also defines OpsBrain: remove that entry (duplicate tools)")
+        if args.no_open or not desktop.open_with_desktop(bundle):
+            print("open the bundle with Claude Desktop (Settings -> Extensions -> Install extension)")
+        else:
+            print("Claude Desktop is showing the extension: press Install. Tools appear as mcp__OpsBrain__<tool>.")
+    return 0
+
+
 def cmd_install(args: argparse.Namespace) -> int:
     binary = shutil.which("opsbrain") or "opsbrain"
-    print("Claude Code:\n  claude mcp add --scope user OpsBrain -- " + binary + " serve\n")
-    print("Claude Desktop (claude_desktop_config.json):")
-    print(json.dumps({"mcpServers": {"OpsBrain": {"command": binary, "args": ["serve"]}}}, indent=2))
+    print("Claude Desktop:\n  opsbrain desktop install\n")
+    print("Claude Code (CLI):\n  claude mcp add --scope user OpsBrain -- " + binary + " serve\n")
     print("\nDevBrain connector (project config), with `opsbrain serve --http` running:")
     print("  connectors:\n    opsbrain: {transport: http, url: \"http://host.docker.internal:8765/mcp\", "
           "secret: opsbrain, environment: production}")
@@ -171,7 +192,12 @@ def main(argv: list[str] | None = None) -> int:
     doctor.add_argument("--net", action="store_true")
     doctor.set_defaults(handler=cmd_doctor)
     commands.add_parser("stats", help="token savings from the audit log").set_defaults(handler=cmd_stats)
-    commands.add_parser("install", help="print how to connect Claude and DevBrain").set_defaults(handler=cmd_install)
+    desktop = commands.add_parser("desktop", help="Claude Desktop extension (.mcpb): build | install | status")
+    desktop.add_argument("action", choices=["build", "install", "status"])
+    desktop.add_argument("--no-open", action="store_true")
+    desktop.set_defaults(handler=cmd_desktop)
+    commands.add_parser("install", help="print how to connect Claude Code and DevBrain").set_defaults(
+        handler=cmd_install)
 
     args = parser.parse_args(argv)
     try:

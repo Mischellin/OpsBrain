@@ -25,8 +25,14 @@ opsbrain install     # prints the snippets for Claude Code, Claude Desktop and D
 ```
 
 ```bash
-claude mcp add --scope user OpsBrain -- opsbrain serve
+opsbrain desktop install     # Claude Desktop: builds ~/.opsbrain/dist/opsbrain-<version>.mcpb, press Install
+claude mcp add --scope user OpsBrain -- opsbrain serve     # Claude Code CLI
 ```
+
+In Claude Desktop OpsBrain is an extension (Settings -> Extensions), shared by the chat and the Code tab; the tools are
+named `mcp__OpsBrain__<tool>`. The bundle is a dependency-free Node launcher around `opsbrain serve` with the binary,
+the config path and a usable `PATH` baked in: a GUI app starts servers with a bare environment. After upgrading
+OpsBrain itself nothing has to be reinstalled - the launcher starts whatever `opsbrain` is installed.
 
 Requirements: Python >= 3.13, `ssh` with an agent; `ansible-playbook` / `kubectl` only if you use those tools.
 OpsBrain stores no credentials: it uses what already works on this machine (ssh-agent, kubeconfig, ansible-vault
