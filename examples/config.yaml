@@ -1,0 +1,56 @@
+# OpsBrain configuration. Trusted: only the operator edits it. Nothing here is a secret -
+# credentials stay where they already live (ssh-agent, env files on the runner, kubeconfig, ansible-vault).
+name: example-infra
+repo: ~/src/infra                 # local checkout of the infrastructure repository
+data_dir: ~/.opsbrain
+
+hosts:
+  pve-1:   {address: 10.0.0.11, tags: [proxmox]}
+  ops-01:  {address: 10.0.0.42, jump: pve-1, tags: [ops]}
+  proxy-1: {address: 10.0.30.10, jump: pve-1, tags: [edge], services: [caddy]}
+  monitor: {address: 10.0.0.40, user: debian, sudo: true, tags: [monitoring], services: [docker]}
+  router:  {address: 10.0.0.1, user: admin, kind: routeros}
+
+tofu:
+  proxmox:
+    runner: ops-01
+    dir: /root/tofu/proxmox
+    env_file: /root/.tofu.env     # sourced on the runner; never read by OpsBrain
+    source_dir: opentofu/proxmox
+    sync: true                    # copy *.tf to the runner before each plan
+
+ansible:
+  dir: ansible
+  playbook_bin: ~/.local/bin/ansible-playbook
+  ssh_auth_sock_from_launchctl: true   # macOS: take SSH_AUTH_SOCK from launchd
+  require_limit_for_apply: true
+
+k8s:
+  kubeconfig: ~/.kube/config
+  context: my-cluster
+
+network:
+  router: router
+  tracked_export: network/mikrotik/mikrotik.rsc
+
+observe:
+  prometheus_url: http://10.0.0.40:9090
+  loki_url: http://10.0.0.40:3100
+  http_checks:
+    site: https://example.com
+
+docs:
+  globs: ["docs/**/*.md", "*.md", "tasks/**/*.md"]
+  status_file: docs/IAC-STATUS.md
+  memory_file: docs/ai/agent-memory.md
+
+drift:
+  playbooks: [common, firewall]
+
+# capability[:target] -> allow | confirm | deny. Reads default to allow, mutations to confirm; deny always wins.
+policy:
+  "k8s.refresh": allow            # harmless: asks Argo CD to re-read git
+  "k8s.restart:dev": allow        # rollout restarts in namespace `dev` need no approval
+  "hosts.restart:pve-1": deny
+
+limits: {max_items: 20, max_chars: 6000, change_ttl_s: 3600, default_wait_s: 45}
