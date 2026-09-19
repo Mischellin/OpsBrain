@@ -16,7 +16,7 @@ def test_bundle_bakes_in_binary_config_and_path(tmp_path) -> None:  # type: igno
     assert env["OPSBRAIN_BIN"] == "/opt/bin/opsbrain" and env["OPSBRAIN_CONFIG"].endswith("config.yaml")
     assert "/usr/bin" in env["PATH"].split(":")
     assert set(env) == {"OPSBRAIN_BIN", "OPSBRAIN_CONFIG", "PATH"}  # nothing secret is ever baked in
-    assert 'stdio: "inherit"' in launcher
+    assert 'process.stdin.pipe(child.stdin)' in launcher and '"inherit"' not in launcher.split('"use strict"')[1]
 
 
 def test_detects_installed_extension_and_duplicate_config_entry(tmp_path) -> None:  # type: ignore[no-untyped-def]
