@@ -144,7 +144,7 @@ def split_marked(text: str, marker: str) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------------------- host status
-def host_status(text: str) -> dict[str, Any]:
+def host_status(text: str, ignore_units: frozenset[str] = frozenset()) -> dict[str, Any]:
     """Parses the `key=value` lines printed by the fixed status script; adds a `warn` list."""
     raw = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
     out: dict[str, Any] = {}
@@ -178,7 +178,7 @@ def host_status(text: str) -> dict[str, Any]:
         if full:
             out["disks_over_85"] = full
             warn.append("disk " + ", ".join(f"{mount} {percent}%" for mount, percent in full.items()))
-    failed = [unit for unit in raw.get("failed_units", "").split(",") if unit]
+    failed = [unit for unit in raw.get("failed_units", "").split(",") if unit and unit not in ignore_units]
     if failed:
         out["failed_units"] = failed[:10]
         warn.append(f"{len(failed)} failed unit(s)")
@@ -310,9 +310,12 @@ _MT_HEADER = re.compile(r"^# \d{4}-\d{2}-\d{2} .*by RouterOS")
 
 def mikrotik_normalise(text: str) -> list[str]:
     """Drops what changes without anyone changing the router: CRs, the timestamp header, transient
-    `# Warning:` lines (netwatch startup delay after a reboot) and the software id."""
-    lines = []
-    for line in text.replace("\r", "").splitlines():
+    `# Warning:` lines (netwatch startup delay after a reboot), the software id and line wrapping."""
+    lines: list[str] = []
+    # RouterOS wraps long commands with a trailing backslash, and re-wraps them when a value changes length:
+    # compare logical lines, so one changed comment is one changed line
+    joined = re.sub(r"\\\n[ \t]*", "", text.replace("\r", ""))
+    for line in joined.splitlines():
         if _MT_HEADER.match(line) or line.startswith("# Warning:"):
             continue
         lines.append("# software id = <redacted>" if line.startswith("# software id =") else line)

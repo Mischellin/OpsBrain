@@ -68,11 +68,14 @@ def test_host_status_warns_only_on_anomalies() -> None:
     sick = parsers.host_status("uptime_s=100\nload1=20\ncpus=4\nmem_used_pct=95\ndisks=/:91,\nfailed_units=a.service,\n"
                                "reboot_required=1\n")
     assert len(sick["warn"]) == 5 and sick["disks_over_85"] == {"/": 91} and sick["reboot_required"]
+    assert "failed_units" not in parsers.host_status("failed_units=a.service,\n", frozenset({"a.service"}))
 
 
 def test_mikrotik_normalise_drops_transient_lines() -> None:
     text = "# 2026-09-01 10:00:00 by RouterOS 7.15\r\n# software id = ABCD\r\n# Warning: netwatch\r\n/ip address\r\n"
     assert parsers.mikrotik_normalise(text) == ["# software id = <redacted>", "/ip address"]
+    wrapped = "add address=10.0.0.1 comment=\\\r\n    \"long comment\" name=\\\r\n    a.example type=A\r\n"
+    assert parsers.mikrotik_normalise(wrapped) == ['add address=10.0.0.1 comment="long comment" name=a.example type=A']
 
 
 def test_k8s_problem_pods_and_events() -> None:

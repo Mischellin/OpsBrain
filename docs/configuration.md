@@ -8,6 +8,7 @@ One YAML file: `$OPSBRAIN_CONFIG` or `~/.opsbrain/config.yaml` (`opsbrain init` 
 | `repo` | local checkout of the infrastructure repository |
 | `data_dir` | artifacts, changes, jobs, `audit.jsonl`, `http.token` (default `~/.opsbrain`) |
 | `remote_job_dir` | where detached jobs keep log / rc on a runner (default `/tmp/opsbrain`, created 0700) |
+| `ignore_failed_units` | systemd units whose failed state is known noise (not reported by `hosts status`) |
 | `hosts.<name>` | `address`, `user` (root), `port`, `jump` (another host, directly reachable), `sudo`, `tags`, `services` (units that may be inspected and restarted), `kind` (`linux` \| `routeros`) |
 | `tofu.<stack>` | `runner` (host), `dir`, `env_file` (sourced on the runner), `binary`, `source_dir` + `sync` (copy `*.tf` before a plan; never deletes remotely, reports `remote_only` files) |
 | `ansible` | `dir`, `playbook_bin`, `playbooks_dir`, `playbooks` (allowlist; empty = all), `require_limit_for_apply`, `ssh_auth_sock_from_launchctl`, `env` |

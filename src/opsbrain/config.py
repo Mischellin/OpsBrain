@@ -142,6 +142,7 @@ class Config(_Model):
     repo: str  # local checkout of the infrastructure repository
     data_dir: str = "~/.opsbrain"
     remote_job_dir: str = "/tmp/opsbrain"  # noqa: S108 - created 0700 on the runner
+    ignore_failed_units: list[str] = Field(default_factory=list)  # known-noisy units, e.g. openipmi.service
     hosts: dict[str, HostConfig] = Field(default_factory=dict)
     tofu: dict[str, TofuStack] = Field(default_factory=dict)
     ansible: AnsibleConfig | None = None

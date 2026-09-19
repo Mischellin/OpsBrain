@@ -149,9 +149,10 @@ class Readers(Core):
         self.require("hosts.read")
         names = self._select_hosts(hosts, tag)
         results = self._parallel(names, STATUS_SCRIPT)
+        ignore = frozenset(self.config.ignore_failed_units)
         rows: dict[str, Any] = {}
         for name, result in results.items():
-            rows[name] = parsers.host_status(result.out) if result.ok else {"warn": ["unreachable"]}
+            rows[name] = (parsers.host_status(result.out, ignore) if result.ok else {"warn": ["unreachable"]})
         attention = {name: row for name, row in rows.items() if row.get("warn")}
         # healthy hosts cost one word each; details only where something is off (or when asked for few hosts)
         if len(names) > 3:
