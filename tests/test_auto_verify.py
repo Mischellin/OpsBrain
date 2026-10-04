@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -93,13 +94,26 @@ def rollout(*, revision: str | None = "7", replicas: int = 3, updated: int = 3, 
     return json.dumps({"metadata": metadata, "spec": {"replicas": replicas}, "status": status})
 
 
+def _stored(ops: Any, tmp_path: Path, change_id: str, declared: list[str]) -> Verifier:
+    """A verifier whose stored preflight record authorises `declared` for `change_id`."""
+    root = tmp_path / "auto" / "preflight"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / f"pf-{change_id[:16]}.json").write_text(json.dumps({"plan": change_id, "declared_checks": declared}))
+    return Verifier(AutoConfig(enabled=True, verify={"observation_s": 0, "allow_state_changing_checks": True}),
+                    ops, clock=Clock(), root=tmp_path / "auto")
+
+
 def status_of(status: CheckStatus) -> CheckResult:
     """A bare result, for testing the status rule itself rather than any one check."""
     return CheckResult(check="x", profile="p", target="t", status=status, captured=0.0, detail="")
 
 
-def the_unit(host: str = HOST, **overrides: Any) -> Target:
-    return unit_target(host, UNIT, **{"drop_in": INTENDED_DROP_IN, **overrides})
+def the_unit(host: str = HOST, **overrides: Any) -> Target:  # a revision-bearing check needs one
+    # `systemd:*` and `k8s:rollout` require an expected revision now, so the fixture states one: without
+    # it the check is UNKNOWN, which is the point - it cannot be attributed to any change.
+    # For a systemd check the revision is the unit's `ExecMainStartTimestamp`, which is what the capture
+    # reports as `APPLIED`. A revision-bearing check refuses to guess one, so the fixture states it.
+    return unit_target(host, UNIT, **{"drop_in": INTENDED_DROP_IN, "expected_revision": APPLIED, **overrides})
 
 
 # ------------------------------------------------------------------------------------- #8 criterion 1
@@ -367,7 +381,7 @@ def test_results_are_bound_to_the_applied_change(ops, fake) -> None:  # type: ig
 
     unbound = verifier(ops).verify("chg-7", [k8s_target("web", namespace="prod")], checks=["k8s:rollout"],
                                 applied_at=1_000.0)
-    assert unbound.status is CheckStatus.PASS, "a plan that declared no revision is not made to guess one"
+    assert unbound.status is CheckStatus.UNKNOWN, "a plan that declared no revision is not made to guess one"
     assert unbound.results[0].revision == "7", "the observed revision is recorded either way"
 
     with pytest.raises(OpsError, match="name the change"):
@@ -488,12 +502,17 @@ def test_a_state_changing_check_is_not_run_unless_the_plan_declared_it(ops, fake
     assert not any("systemctl start" in script for _, script in fake.calls)
 
 
-def test_a_declared_state_changing_check_runs_and_says_that_it_acted(ops, fake) -> None:  # type: ignore[no-untyped-def]
+def test_a_declared_state_changing_check_runs_and_says_that_it_acted(ops, fake, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The declaration has to be in the *stored* change, not only in the caller's argument list.
+
+    Otherwise "no plan, so allow" hands the one action that can change a host to anyone who names a
+    check, and the recorded plan stops being the thing that authorised it.
+    """
     fake.on(r"systemctl start", "")
     fake.on(r"systemctl show", show(drop_ins=INTENDED_DROP_IN))
-    report = verifier(ops, allow_state_changing_checks=True).verify(
-        "chg-1", [the_unit()], checks=["systemd:unit-start"], applied_at=1_000.0,
-        declared=["systemd:unit-start"])
+    engine = _stored(ops, tmp_path, "chg-1", ["systemd:unit-start"])
+    report = engine.verify("chg-1", [the_unit()], checks=["systemd:unit-start"], applied_at=1_000.0,
+                          declared=["systemd:unit-start"])
     result = report.results[0]
     assert report.status is CheckStatus.PASS
     assert result.state_changing is True
@@ -503,9 +522,8 @@ def test_a_declared_state_changing_check_runs_and_says_that_it_acted(ops, fake) 
 
     fake.rules.clear()
     fake.on(r"systemctl start", "Job for logrotate.service failed\n", rc=1)
-    failed = verifier(ops, allow_state_changing_checks=True).verify(
-        "chg-1", [the_unit()], checks=["systemd:unit-start"], applied_at=1_000.0,
-        declared=["systemd:unit-start"])
+    failed = engine.verify("chg-1", [the_unit()], checks=["systemd:unit-start"], applied_at=1_000.0,
+                           declared=["systemd:unit-start"])
     assert failed.status is CheckStatus.FAIL
     assert "exited 1" in failed.results[0].detail
 
@@ -791,3 +809,55 @@ def test_the_observation_window_is_recomputed_for_each_check(ops, fake) -> None:
     windows = [result.observation_s for result in report.results]
     assert windows == [5.0, 30.0], f"each check is judged on the time it actually waited: {windows}"
     assert report.observation_s == windows[-1]
+
+
+# ============================== P1 round 4: the rules that existed but were never switched on
+def test_a_revision_bearing_check_refuses_to_guess_a_revision(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    """`requires_revision` existed on `Check` and was set on nothing, so a missing revision was still fine."""
+    fake.on(r"get deployments web", rollout(revision="7"))
+    report = verifier(ops).verify("chg-7", [k8s_target("web", namespace="prod")], checks=["k8s:rollout"],
+                           applied_at=1_000.0)
+    assert report.status is CheckStatus.UNKNOWN
+    assert "expected_revision" in report.results[0].reason
+
+    for name in ("systemd:unit-active", "systemd:drop-in", "k8s:rollout"):
+        assert REGISTRY[name].requires_revision is True, name
+
+
+def test_a_failure_is_reported_whether_or_not_it_can_be_attributed(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    """A broken unit and a rollout that has not converged are bad news without an attribution.
+
+    Downgrading them to UNKNOWN reads as "we could not tell", and `overall_status` ranks UNKNOWN above
+    PASS - so a downgrade would quietly hand a broken system the better answer.
+    """
+    fake.on(r"systemctl show", show(active="inactive", sub="dead", started=None))
+    down = verifier(ops).verify("chg-1", [the_unit(expected_revision="1.2.3")], checks=["systemd:unit-active"],
+                             applied_at=1_000.0)
+    assert down.status is CheckStatus.FAIL, "a unit that is not running fails whatever the plan promised"
+
+    fake.rules.clear()
+    fake.on(r"get deployments web", rollout(revision="7", updated=1, ready=1, generation=6, observed=6))
+    behind = verifier(ops).verify("chg-7", [k8s_target("web", namespace="prod")], checks=["k8s:rollout"],
+                             applied_at=1_000.0)
+    assert behind.status is CheckStatus.FAIL, "a rollout that has not converged is still not converged"
+
+
+def test_a_state_change_is_refused_when_the_stored_plan_is_missing(ops, fake, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """"No plan, so allow" hands the one action that can change a host to whoever names a check."""
+    fake.on(r"systemctl start", "")
+    fake.on(r"systemctl show", show(drop_ins=INTENDED_DROP_IN))
+    report = _stored(ops, tmp_path, "chg-1", ["systemd:unit-start"]).verify(
+        "chg-1", [the_unit()], checks=["systemd:unit-start"], applied_at=1_000.0,
+        declared=["systemd:unit-start"])
+    assert report.status is CheckStatus.PASS
+
+    from opsbrain.auto.verify import Verifier as V
+
+    fake.calls.clear()  # the authorised run above already started it once
+    bare = V(AutoConfig(enabled=True, verify={"observation_s": 0, "allow_state_changing_checks": True}), ops,
+             clock=Clock(), root=tmp_path / "empty").verify(
+        "chg-9", [the_unit()], checks=["systemd:unit-start"], applied_at=1_000.0,
+        declared=["systemd:unit-start"])
+    assert bare.status is CheckStatus.NOT_RUN
+    assert "does not declare it" in bare.results[0].reason
+    assert not any("systemctl start" in script for _, script in fake.calls)
