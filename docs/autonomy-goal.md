@@ -19,8 +19,8 @@ Epic: [#3](https://github.com/Mischellin/OpsBrain/issues/3). База — [#2](h
 | 8 | OPS-AUTO-07 — проверка фактического состояния | `auto/verify.py` | [#17](https://github.com/Mischellin/OpsBrain/pull/17) | 246 тестов, 4 круга замечаний закрыто |
 | 6 | OPS-AUTO-03 — preflight плана | `auto/plan.py`, `auto/preflight.py` | [#18](https://github.com/Mischellin/OpsBrain/pull/18) | 343 теста, 4 круга замечаний закрыто |
 | 14 | OPS-AUTO-05 — STALE approval, optimistic locking, single-use lease | `auto/approval.py` | [#19](https://github.com/Mischellin/OpsBrain/pull/19) | 393 теста, 20 находок Codex закрыто |
-| — | три P1 из v1 (P1-фиксы базы) | `redact.py`, `readers.py`, `changes.py`, `operators.py` | [#20](https://github.com/Mischellin/OpsBrain/pull/20) | 410 тестов, 8 находок Codex закрыто |
-| 7 | OPS-AUTO-04 — ApprovalEngine | `auto/decision.py` | [#21](https://github.com/Mischellin/OpsBrain/pull/21) | 489 тестов, 33 находки Codex закрыто |
+| — | три P1 из v1 (P1-фиксы базы) | `redact.py`, `readers.py`, `changes.py`, `operators.py` | [#20](https://github.com/Mischellin/OpsBrain/pull/20) | 411 тест, 10 находок Codex закрыто |
+| 7 | OPS-AUTO-04 — ApprovalEngine | `auto/decision.py` | [#21](https://github.com/Mischellin/OpsBrain/pull/21) | 492 теста, 35 находок Codex закрыто |
 | 9 | OPS-AUTO-10 — policy profiles | `auto/profiles.py` | — | не начато |
 | 10 | OPS-AUTO-08 — Codex postflight | `auto/postflight.py` | — | не начато |
 | 11 | OPS-AUTO-06 — canary rollout | `auto/rollout.py` | — | не начато |
