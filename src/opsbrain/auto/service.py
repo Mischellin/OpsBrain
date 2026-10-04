@@ -801,6 +801,40 @@ class AutoService:
         return (f"profile {profile.name!r} does not cover the target {change.target!r}; it covers "
                 f"{', '.join(sorted(profile.allowed_targets))}")
 
+    def postflight(self, change_id: str, plan_id: str, *,
+                   verification: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Ask whether the change achieved its goal, and record the answer against the change.
+
+        The judgement is an observation, not an authority: the postflight can say the work did not land,
+        but it cannot authorise anything, and it cannot be shown a passing report that was never produced.
+        """
+        from .postflight import postflight as judge
+        from .postflight import unobserved
+
+        self.guard_enabled()
+        change = self.core.changes.get(change_id)
+        # A change that was never applied has no outcome to observe, and the one fact that says so is the
+        # change's own state - not the verification report. A report can be handed in for a change that
+        # was discarded, and every check in it will pass, because none of them ever touched anything.
+        if change.state == "discarded":
+            refused = unobserved(change_id, plan_id,
+                                 "the change was discarded, so nothing ran that a postflight could observe")
+            self.audit.record(event="postflight", change=change_id, plan=plan_id, state=change.state,
+                              outcome=refused.outcome.value, reason=refused.reason, review=refused.review_id)
+            return {**refused.to_dict(), "next": "there is nothing to observe; plan the work again"}
+        record = self.preflight().get_by_plan(plan_id)
+        plan = ChangePlan.from_dict(record["plan_document"])
+        if plan.id != plan_id:
+            raise OpsError(f"the preflight record for {plan_id} carries a different plan")
+        result = judge(self.reviews, change_id=change_id, plan_id=plan_id, objective=plan.objective,
+                       post_checks=tuple(plan.post_checks), rollback=plan.rollback,
+                       verification=verification)
+        # The state travels with the judgement: a `confirmed` recorded against a change that was still
+        # `pending` is a fact about the audit trail, and the trail is what an operator later reads.
+        self.audit.record(event="postflight", change=change_id, plan=plan_id, state=change.state,
+                          outcome=result.outcome.value, reason=result.reason, review=result.review_id)
+        return {**result.to_dict(), "next": result.next_action()}
+
     def _evidence_state(self, evidence_ids: Sequence[str],
                         change_id: str = "") -> tuple[tuple[str, ...], str, float]:
         """Re-read and re-check every bundle a decision rests on, and answer with what is true now.
