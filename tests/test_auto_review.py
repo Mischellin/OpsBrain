@@ -153,9 +153,78 @@ def test_runner_exception_becomes_a_failed_status_not_a_pass() -> None:
 
 
 def test_live_runner_refuses_to_start_when_disabled() -> None:
-    reviewer = CodexReviewer(RunnerSettings(runner="codex", command=("codex", "exec", "{prompt}")))
+    reviewer = CodexReviewer(RunnerSettings(runner="codex", command=("codex", "exec", "{prompt}"),
+                                            sandbox=("sandbox-exec", "-p", "deny")))
     with pytest.raises(ReviewerError, match="live runner is disabled"):
         reviewer.review(request_for())
+
+
+def test_live_runner_refuses_to_start_without_a_real_sandbox() -> None:
+    """`cwd` is not a sandbox: it neither makes a directory read-only nor hides the operator's HOME."""
+    reviewer = CodexReviewer(RunnerSettings(runner="codex", command=("codex", "exec", "{prompt}"), live=True))
+    with pytest.raises(ReviewerError, match="is not a sandbox"):
+        reviewer.review(request_for())
+
+
+def test_the_sandbox_wrapper_wraps_the_command(tmp_path: Path) -> None:
+    seen: dict[str, Any] = {}
+
+    def capture(argv: list[str], **kwargs: Any) -> Any:
+        seen["argv"] = argv
+        seen["env"] = kwargs["env"]
+        from opsbrain.result import Result
+
+        return Result(0, json.dumps(response_document(Verdict.PASS)))
+
+    settings = RunnerSettings(runner="codex", command=("codex", "exec", "{prompt}"), live=True,
+                              snapshot_dir=str(tmp_path), scratch_home=str(tmp_path), model="m",
+                              sandbox=("sandbox-exec", "-p", "(deny default)"))
+    assert run_review(CodexReviewer(settings, runner=capture), request_for()).is_pass is True
+    assert seen["argv"][:2] == ["sandbox-exec", "-p"], "the wrapper must come first, or it confines nothing"
+    assert "codex" in seen["argv"]
+
+
+def test_the_reviewer_does_not_inherit_the_operators_home(tmp_path: Path) -> None:
+    settings = RunnerSettings(runner="codex", command=("codex", "exec", "{prompt}"), live=True,
+                              snapshot_dir=str(tmp_path), scratch_home=str(tmp_path / "scratch"),
+                              model="m", sandbox=("bwrap",))
+    env = settings.safe_env()
+    assert env["HOME"] == str(tmp_path / "scratch")
+    assert env["XDG_CONFIG_HOME"].startswith(str(tmp_path / "scratch"))
+
+
+def test_a_jsonl_event_stream_still_yields_the_verdict(tmp_path: Path) -> None:
+    """`codex exec --json` prints a stream of events, not one document."""
+    events = "\n".join(json.dumps(event) for event in [
+        {"type": "thread.started", "thread_id": "t-1"},
+        {"type": "item.completed", "text": "thinking about it"},
+        {"type": "item.completed", "text": json.dumps(response_document(Verdict.PASS, model="m"))},
+    ])
+
+    def capture(argv: list[str], **kwargs: Any) -> Any:
+        from opsbrain.result import Result
+
+        return Result(0, events)
+
+    settings = RunnerSettings(runner="codex", command=("codex", "exec", "--json", "{prompt}"), live=True,
+                              snapshot_dir=str(tmp_path), model="m", sandbox=("bwrap",))
+    assert run_review(CodexReviewer(settings, runner=capture), request_for()).is_pass is True
+
+
+def test_a_jsonl_stream_whose_last_event_refuses_is_not_promoted_to_a_pass(tmp_path: Path) -> None:
+    events = "\n".join(json.dumps(event) for event in [
+        {"type": "item.completed", "text": json.dumps(response_document(Verdict.DENY))},
+    ])
+
+    def capture(argv: list[str], **kwargs: Any) -> Any:
+        from opsbrain.result import Result
+
+        return Result(0, events)
+
+    settings = RunnerSettings(runner="codex", command=("codex", "exec", "--json", "{prompt}"), live=True,
+                              snapshot_dir=str(tmp_path), model="m", sandbox=("bwrap",))
+    result = run_review(CodexReviewer(settings, runner=capture), request_for())
+    assert result.verdict is Verdict.DENY and result.is_pass is False
 
 
 def test_live_runner_scrubs_credentials_from_the_environment() -> None:
@@ -172,7 +241,7 @@ def test_live_runner_captures_a_timeout_as_a_failure(tmp_path: Path) -> None:
         raise subprocess.TimeoutExpired(argv, 300)
 
     settings = RunnerSettings(runner="codex", command=("codex", "exec", "{prompt}"), live=True,
-                              snapshot_dir=str(tmp_path), model="m")
+                              snapshot_dir=str(tmp_path), model="m", sandbox=("bwrap",))
     result = run_review(CodexReviewer(settings, runner=slow), request_for())
     assert result.status is RunnerStatus.RUNNER_ERROR
     assert "timed out" in result.note
@@ -191,10 +260,12 @@ def test_live_runner_writes_the_request_private_and_returns_its_output(tmp_path:
         return Result(0, json.dumps(response_document(Verdict.PASS)))
 
     settings = RunnerSettings(runner="codex", command=("codex", "exec", "--model", "{model}", "{prompt}"),
-                              live=True, snapshot_dir=str(tmp_path), model="test-model")
+                              live=True, snapshot_dir=str(tmp_path), model="test-model",
+                              sandbox=("bwrap",), scratch_home=str(tmp_path))
     result = run_review(CodexReviewer(settings, runner=capture), request_for())
     assert result.is_pass is True
     assert seen["argv"][-1].endswith(".request.json")
+    assert seen["argv"][0] == "bwrap"
     assert "test-model" in seen["argv"], "the model placeholder must be filled from config, not from the model"
     written = Path(seen["argv"][-1])
     assert written.stat().st_mode & 0o077 == 0, "the request file must not be world readable"
@@ -260,15 +331,71 @@ def test_call_budget_stops_before_spending(tmp_path: Path) -> None:
     assert len(runner.requests) == 2, "the third review must not have reached the runner"
 
 
-def test_spend_budget_stops_before_spending(tmp_path: Path) -> None:
+def test_spend_budget_is_a_ceiling_not_a_suggestion(tmp_path: Path) -> None:
+    """A call that could exceed the ceiling is refused *before* it runs, not discovered after it."""
     runner = FakeReviewer()
     runner.default = response_document(Verdict.PASS, input_tokens=1_000_000, output_tokens=0)
+    # One call's worst case (context + output limits) is ~$0.0425, so a smaller budget must refuse it.
     reviews = service(tmp_path, runner, review={"budget_usd": 0.01})
-    first = reviews.review(request_for(objective="one"))
-    assert first.status is RunnerStatus.OK
-    second = reviews.review(request_for(objective="two"))
-    assert second.status is RunnerStatus.BUDGET_EXCEEDED
-    assert second.is_pass is False
+    refused = reviews.review(request_for(objective="one"))
+    assert refused.status is RunnerStatus.BUDGET_EXCEEDED
+    assert refused.is_pass is False
+    assert runner.requests == [], "a refused reservation must not reach the runner"
+
+    roomy = service(tmp_path / "roomy", FakeReviewer(), review={"budget_usd": 1.0})
+    assert roomy.review(request_for(objective="one")).status is RunnerStatus.OK
+
+
+def test_restart_does_not_hand_out_a_fresh_budget(tmp_path: Path) -> None:
+    """The ceiling has to survive a process restart, or it is not a ceiling."""
+    runner = FakeReviewer()
+    reviews = service(tmp_path, runner, review={"max_model_calls": 1})
+    assert reviews.review(request_for(objective="one")).status is RunnerStatus.OK
+    fresh = service(tmp_path, FakeReviewer(), review={"max_model_calls": 1})
+    assert fresh.usage()["model_calls"] == 1, "usage must be recovered from the stored reviews"
+    assert fresh.review(request_for(objective="two")).status is RunnerStatus.BUDGET_EXCEEDED
+
+
+def test_a_caller_supplied_review_id_cannot_reuse_another_subject_s_verdict(tmp_path: Path) -> None:
+    """Cache poisoning: subject B must never be answered from subject A's stored PASS."""
+    runner = FakeReviewer()
+    reviews = service(tmp_path, runner)
+    first = reviews.review(request_for(objective="subject A"))
+    borrowed = reviews.review(request_for(objective="subject B", review_id=first.review_id))
+    assert borrowed.review_id != first.review_id
+    assert len(runner.requests) == 2, "the reviewer must actually be asked about subject B"
+
+
+def test_a_response_without_a_contract_version_is_refused(tmp_path: Path) -> None:
+    runner = FakeReviewer()
+    runner.default = {"status": "OK", "verdict": "PASS"}
+    reviews = service(tmp_path, runner)
+    result = reviews.review(request_for())
+    assert result.status is RunnerStatus.INVALID_RESPONSE
+    assert result.is_pass is False
+
+
+def test_absurd_or_negative_reported_usage_is_refused_rather_than_charged(tmp_path: Path) -> None:
+    for usage in ({"input_tokens": -5}, {"input_tokens": "unknown"}, {"output_tokens": 10**12}):
+        runner = FakeReviewer()
+        runner.default = response_document(Verdict.PASS, **usage)
+        reviews = service(tmp_path / str(abs(hash(str(usage)))), runner)
+        result = reviews.review(request_for())
+        assert result.status is RunnerStatus.INVALID_RESPONSE, usage
+        assert result.is_pass is False, usage
+        assert reviews.usage()["spend_usd"] == 0.0, f"{usage} must not move the budget"
+
+
+def test_a_concurrent_duplicate_does_not_review_twice(tmp_path: Path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    runner = FakeReviewer()
+    reviews = service(tmp_path, runner)
+    request = request_for()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = [future.result() for future in [pool.submit(reviews.review, request) for _ in range(4)]]
+    assert len({result.review_id for result in results}) == 1
+    assert len(runner.requests) == 1, "a duplicate must be refused or served from cache, not reviewed again"
 
 
 def test_service_rejects_a_request_from_another_contract_version(tmp_path: Path) -> None:
@@ -352,3 +479,27 @@ def test_live_smoke_opt_in(tmp_path: Path) -> None:
                               live=True, snapshot_dir=str(tmp_path))
     result = run_review(CodexReviewer(settings), request_for())
     assert result.status is not None, "a live runner still has to answer with a status"
+
+
+# ------------------------------------------------------ live mode cannot be configured without a sandbox
+def test_live_review_cannot_be_configured_without_a_sandbox() -> None:
+    with pytest.raises(ValidationError, match="sandbox"):
+        AutoConfig(enabled=True, review={"live": True, "command": ["codex", "exec", "{prompt}"]})
+
+
+def test_live_review_with_a_sandbox_is_accepted() -> None:
+    auto = AutoConfig(enabled=True, review={"live": True, "command": ["codex", "exec", "--json", "{prompt}"],
+                                            "sandbox": ["bwrap", "--ro-bind", "/usr", "/usr"],
+                                            "scratch_home": "/var/lib/opsbrain/scratch"})
+    assert auto.review.sandbox[0] == "bwrap"
+
+
+def test_a_sandbox_without_live_mode_is_a_configuration_error() -> None:
+    with pytest.raises(ValidationError, match="only matters with"):
+        AutoConfig(enabled=True, review={"sandbox": ["bwrap"]})
+
+
+def test_capability_probe_reports_the_sandbox_it_would_use(tmp_path: Path) -> None:
+    report = probe_capabilities(RunnerSettings(command=("echo",), live=True, sandbox=("bwrap", "--ro-bind", "/")))
+    assert report["sandbox"] == ["bwrap", "--ro-bind", "/"]
+    assert report["sandbox_required"] is True

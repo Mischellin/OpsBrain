@@ -25,11 +25,10 @@ from .review import (
     ReviewRequest,
     ReviewResult,
     RunnerStatus,
-    Subject,
     review_summary,
 )
 from .runners import CodexReviewer, FakeReviewer, RunnerSettings, probe_capabilities, run_review
-from .store import RecordStore
+from .store import RecordStore, atomic_claim, release_claim
 
 if TYPE_CHECKING:  # `config` imports this package; keep the edge one-directional
     from ..config import Config
@@ -43,11 +42,19 @@ Results = list[ReviewResult]
 #: through `budget_usd`; when it is 0 no money limit is enforced at all.
 USD_PER_MILLION_TOKENS = 2.50
 
+#: How long a single-review claim may be held before a crashed holder is treated as gone.
+TTL_S = 900.0
+
+
+def _counter(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
 
 class ReviewService:
     def __init__(self, config: AutoConfig, root: Path, *, reviewer: Reviewer | None = None,
                  reviewer_factory: Any = None):
         self.config = config
+        self.root = root
         self.store = RecordStore(root / "reviews", ("rv",))
         self.reviews = config.review
         self._reviewer = reviewer
@@ -57,6 +64,36 @@ class ReviewService:
         self._tokens_in = 0
         self._tokens_out = 0
         self._spend_usd = 0.0
+        self._per_id: dict[str, threading.Lock] = {}
+        self._recover_usage()
+
+    def _recover_usage(self) -> None:
+        """Rebuild the counters from the stored reviews.
+
+        Without this a restart hands out a fresh `max_model_calls` and a fresh `budget_usd`, and a
+        separately invoked `opsbrain autonomy status` reports zero for work the server already did. The
+        ceilings are only ceilings if they survive a restart.
+        """
+        rows = self.store.list(1_000_000)
+        calls = tokens_in = tokens_out = 0
+        for document in rows:
+            usage = document.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            if document.get("status") == RunnerStatus.OK.value or usage.get("calls"):
+                calls += 1
+            tokens_in += _counter(usage.get("input_tokens"))
+            tokens_out += _counter(usage.get("output_tokens"))
+        with self._lock:
+            self._calls = calls
+            self._tokens_in = tokens_in
+            self._tokens_out = tokens_out
+            self._spend_usd = (tokens_in + tokens_out) / 1_000_000 * USD_PER_MILLION_TOKENS
+
+    def _id_lock(self, review_id: str) -> threading.Lock:
+        """One lock per review id, so parallel redelivery of the same request does not review it twice."""
+        with self._lock:
+            return self._per_id.setdefault(review_id, threading.Lock())
 
     # -- accounting -------------------------------------------------------------------------------
     def usage(self) -> dict[str, Any]:
@@ -66,13 +103,31 @@ class ReviewService:
                     "max_model_calls": self.reviews.max_model_calls,
                     "budget_usd": self.reviews.budget_usd}
 
-    def _reserve(self, subject: Subject) -> None:
-        """Counts a call before it happens. Raises when the budget cannot cover it."""
+    def projected_cost(self, request: ReviewRequest) -> float:
+        """What this request could possibly cost, from the limits rather than from what it later reports.
+
+        A check that only asks whether spend has *already* reached the ceiling admits a call that then
+        overshoots it arbitrarily, which makes `budget_usd` a suggestion instead of a ceiling. The worst
+        case is bounded by what the operator allowed into the context plus the allowed output.
+        """
+        limit = self.reviews.context_chars / 4 + self.reviews.output_chars / 4
+        return limit / 1_000_000 * USD_PER_MILLION_TOKENS
+
+    def _reserve(self, request: ReviewRequest) -> None:
+        """Counts a call before it happens, against both the call count and the projected spend.
+
+        Reserving per attempt, not per request: `run_review` may invoke the reviewer up to
+        `max_retries + 1` times, and a single reservation would let three paid calls pass one check.
+        """
         with self._lock:
             if self._calls >= self.reviews.max_model_calls:
                 raise BudgetExceeded(f"model call budget exhausted ({self.reviews.max_model_calls} calls)")
-            if self.reviews.budget_usd and self._spend_usd >= self.reviews.budget_usd:
-                raise BudgetExceeded(f"spend budget exhausted (${self.reviews.budget_usd:.2f})")
+            if self.reviews.budget_usd:
+                projected = self._spend_usd + self.projected_cost(request)
+                if projected > self.reviews.budget_usd:
+                    raise BudgetExceeded(
+                        f"this call could cost up to ${self.projected_cost(request):.4f} and would take the "
+                        f"total to ${projected:.4f}, over budget_usd=${self.reviews.budget_usd:.2f}")
             self._calls += 1
 
     def _charge(self, result: ReviewResult) -> None:
@@ -104,7 +159,8 @@ class ReviewService:
         return RunnerSettings(runner=review.runner, command=tuple(review.command), model=review.model,
                               auth=review.auth, timeout_s=review.timeout_s, max_parallel=review.max_parallel,
                               max_retries=review.max_retries, max_model_calls=review.max_model_calls,
-                              budget_usd=review.budget_usd, snapshot_dir=review.snapshot_dir, live=review.live)
+                              budget_usd=review.budget_usd, snapshot_dir=review.snapshot_dir,
+                              scratch_home=review.scratch_home, sandbox=tuple(review.sandbox), live=review.live)
 
     def capabilities(self) -> dict[str, Any]:
         return probe_capabilities(self.settings())
@@ -115,10 +171,26 @@ class ReviewService:
         if request.contract_version != CONTRACT_VERSION:
             raise OpsError(f"review request built for contract {request.contract_version!r}, "
                            f"this build speaks {CONTRACT_VERSION!r}")
-        request = request.with_id()
+        # Clip first, then derive the id from what the reviewer would actually see. The other order lets a
+        # redelivery under a wider limit reuse a verdict produced for a clipped context.
         clipped = request.limits.clipped_context(request.context)
         if clipped != request.context:
             request = ReviewRequest(**{**request.__dict__, "context": clipped})
+        request = request.with_id()
+        claim = self.root / "claims" / f"{request.review_id}.claim"
+        # The lock covers the in-process race; the claim file covers two processes (a server and the CLI).
+        # Either alone would still let a duplicate through.
+        with self._id_lock(request.review_id):
+            if atomic_claim(claim, f"pid-{id(self)}", TTL_S) is None:
+                return ReviewResult.failure(request, RunnerStatus.RUNNER_ERROR,
+                                           "another worker is already reviewing this request; "
+                                           "re-issue once it finishes")
+            try:
+                return self._review_claimed(request, claim)
+            finally:
+                release_claim(claim, f"pid-{id(self)}")
+
+    def _review_claimed(self, request: ReviewRequest, claim: Path) -> ReviewResult:
         if self.store.has(request.review_id):
             cached = self.store.get(request.review_id)
             if cached.get("status") == RunnerStatus.OK.value:
@@ -129,13 +201,10 @@ class ReviewService:
                                 rubric_version=cached.get("rubric_version", request.rubric_version),
                                 model=cached.get("model", request.model),
                                 note=cached.get("note", "cached: the review never produced a verdict"))
-        try:
-            self._reserve(request.subject)
-        except BudgetExceeded as exc:
-            result = ReviewResult.failure(request, RunnerStatus.BUDGET_EXCEEDED, str(exc))
-            self._record(request, result)
-            return result
-        result = run_review(self.reviewer(), request, retries=self.reviews.max_retries)
+        # `before_attempt` is the only reservation point: it fires once per invocation, so the first
+        # attempt is charged exactly once and a retry has to pass the budget check too.
+        result = run_review(self.reviewer(), request, retries=self.reviews.max_retries,
+                            before_attempt=lambda: self._reserve(request))
         self._charge(result)
         self._record(request, result)
         return result

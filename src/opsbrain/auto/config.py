@@ -42,14 +42,16 @@ class ReviewConfig(_Model):
     max_model_calls: int = Field(default=40, ge=1, le=10_000)
     budget_usd: float = Field(default=0.0, ge=0, le=10_000)
     snapshot_dir: str = ""
+    scratch_home: str = ""  # HOME handed to the reviewer: empty, never the operator's
+    sandbox: list[str] = Field(default_factory=list)  # enforced wrapper: sandbox-exec / bwrap / firejail
     live: bool = False
     require_allow: bool = True  # `allow` policy rows may not be resolved by the model alone
 
-    @field_validator("command")
+    @field_validator("command", "sandbox")
     @classmethod
-    def _command(cls, value: list[str]) -> list[str]:
+    def _argv(cls, value: list[str]) -> list[str]:
         if any(not part or "\x00" in part for part in value):
-            raise ValueError(f"invalid command: {value!r}")
+            raise ValueError(f"invalid argv: {value!r}")
         return value
 
     @field_validator("auth")
@@ -65,6 +67,13 @@ class ReviewConfig(_Model):
             raise ValueError("auto.review.live=true needs auto.review.command")
         if self.runner == "codex" and not self.command and self.live:
             raise ValueError("runner `codex` needs an explicit command")
+        if self.live and not self.sandbox:
+            # Without an enforced wrapper the reviewer inherits the operator's write access and HOME, which
+            # contradicts the guarantee this module is built on. Refusing here beats a promise in a docstring.
+            raise ValueError("auto.review.live=true needs auto.review.sandbox (sandbox-exec / bwrap / "
+                             "firejail): a working directory does not confine a process")
+        if self.sandbox and not self.live:
+            raise ValueError("auto.review.sandbox only matters with auto.review.live=true")
         return self
 
 

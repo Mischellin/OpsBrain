@@ -65,12 +65,14 @@ auto:
     model: ""                 # filled from config, never from model output
     auth: subscription        # subscription | api - no hidden paid fallback
     live: false               # without this no external binary is ever started
+    sandbox: []               # REQUIRED for live: enforced wrapper, e.g. ["bwrap", "--ro-bind", "/", "/"]
+    scratch_home: ""          # HOME for the reviewer; leave empty to use snapshot_dir
     timeout_s: 300
     max_parallel: 2
     max_retries: 2
     max_model_calls: 40
     budget_usd: 0             # 0 = call limits only
-    snapshot_dir: ""          # read-only directory the reviewer is confined to
+    snapshot_dir: ""          # directory the request is written into
   evidence:
     max_age_s: 900
   decision:

@@ -153,8 +153,12 @@ class ReviewRequest:
     review_id: str = ""
 
     def with_id(self) -> ReviewRequest:
-        if self.review_id:
-            return self
+        """Always re-derive the id from the content.
+
+        A caller-supplied `review_id` is ignored rather than trusted. Honouring it would let a request for
+        subject B present the id of subject A and be answered from A's stored PASS, without the reviewer
+        ever being asked about B.
+        """
         return ReviewRequest(**{**asdict_shallow(self), "review_id": self.stable_id()})
 
     def stable_id(self) -> str:
@@ -163,6 +167,9 @@ class ReviewRequest:
         Derived from the content, not from a random value, so a retry after a timeout reuses the id and
         the store deduplicates instead of double-charging the budget.
         """
+        # The effective context is what the reviewer actually saw, and the limits decide what that is:
+        # hashing the raw context would let a redelivery under a wider limit reuse a verdict that was
+        # produced for a clipped one, silently skipping whatever the wider window would have added.
         fingerprint = digest({
             "contract": self.contract_version,
             "rubric": self.rubric_version,
@@ -170,7 +177,11 @@ class ReviewRequest:
             "subject_ref": self.subject_ref,
             "objective": self.objective,
             "evidence": sorted(self.evidence_refs),
-            "context_hash": hashlib.sha256(self.context.encode()).hexdigest(),
+            "model": self.model,
+            "limits": {"timeout_s": self.limits.timeout_s,
+                       "context_chars": self.limits.context_chars,
+                       "output_chars": self.limits.output_chars},
+            "context_hash": hashlib.sha256(self.limits.clipped_context(self.context).encode()).hexdigest(),
         })
         return f"rv-{fingerprint[:16]}"
 
@@ -271,12 +282,14 @@ class ReviewResult:
 
 
 def parse_review_response(request: ReviewRequest, payload: str) -> ReviewResult:
-    """Strict parse of a runner's answer.
+    """Strict parse of a runner's answer, after pulling the contract document out of any event stream.
 
     Anything unexpected - a wrong contract version, a missing verdict, a stray prefix, an empty body -
     becomes `INVALID_RESPONSE` with no verdict. It never degrades into a pass.
     """
-    text = payload.strip()
+    from .runners import extract_review_payload  # local import: runners imports this module
+
+    text = extract_review_payload(payload).strip()
     if not text:
         return ReviewResult.failure(request, RunnerStatus.INVALID_RESPONSE, "empty response")
     try:
@@ -289,7 +302,11 @@ def parse_review_response(request: ReviewRequest, payload: str) -> ReviewResult:
 def build_result(request: ReviewRequest, document: Any) -> ReviewResult:
     if not isinstance(document, dict):
         return ReviewResult.failure(request, RunnerStatus.INVALID_RESPONSE, "response must be a JSON object")
-    version = document.get("contract_version", CONTRACT_VERSION)
+    version = document.get("contract_version")
+    if not isinstance(version, str) or not version:
+        return ReviewResult.failure(request, RunnerStatus.INVALID_RESPONSE,
+                                    "contract_version is required: a response that does not state which "
+                                    "wire format it speaks has not demonstrated compatibility")
     if version != CONTRACT_VERSION:
         return ReviewResult.failure(request, RunnerStatus.INVALID_RESPONSE,
                                     f"contract version mismatch: got {version!r}, expected {CONTRACT_VERSION!r}")
@@ -318,6 +335,10 @@ def build_result(request: ReviewRequest, document: Any) -> ReviewResult:
         checks = _string_tuple(document.get("next_checks", []), "next_checks")
     except ContractError as exc:
         return ReviewResult.failure(request, RunnerStatus.INVALID_RESPONSE, str(exc))
+    usage = _usage(document)
+    if isinstance(usage, str):
+        return ReviewResult.failure(request, RunnerStatus.INVALID_RESPONSE, usage)
+    input_tokens, output_tokens = usage
     return ReviewResult(
         review_id=request.review_id, subject=request.subject, subject_ref=request.subject_ref,
         status=parsed_status, verdict=Verdict(raw_verdict), contract_version=CONTRACT_VERSION,
@@ -325,9 +346,36 @@ def build_result(request: ReviewRequest, document: Any) -> ReviewResult:
         model=str(document.get("model") or request.model), findings=findings,
         unverified_claims=claims, next_checks=checks,
         usage=ReviewUsage(model=str(document.get("model") or request.model),
-                          input_tokens=int(document.get("input_tokens", 0) or 0),
-                          output_tokens=int(document.get("output_tokens", 0) or 0), calls=1),
+                          input_tokens=input_tokens, output_tokens=output_tokens, calls=1),
     )
+
+
+#: No single answer may claim more than this. A reviewer reporting absurd usage is reporting a bug, and
+#: the budget must not be charged - or credited - on the strength of it.
+MAX_REPORTED_TOKENS = 10_000_000
+
+
+def _usage(document: dict[str, Any]) -> tuple[int, int] | str:
+    """Validated (input, output) token counts, or the reason the answer is unusable.
+
+    Usage arrives from the same untrusted JSON as the verdict, and it is what the monetary budget is
+    computed from, so an unchecked `int()` here is both a crash (`"unknown"`) and a hole (a negative count
+    that *reduces* recorded spend). Both directions have to be closed.
+    """
+    counts: list[int] = []
+    for name in ("input_tokens", "output_tokens"):
+        value = document.get(name, 0)
+        if value is None:
+            counts.append(0)
+            continue
+        if isinstance(value, bool) or not isinstance(value, int):
+            return f"{name} must be an integer, got {type(value).__name__}"
+        if value < 0:
+            return f"{name} must not be negative, got {value}"
+        if value > MAX_REPORTED_TOKENS:
+            return f"{name} is implausibly large: {value}"
+        counts.append(value)
+    return counts[0], counts[1]
 
 
 def _string_tuple(value: Any, name: str) -> tuple[str, ...]:

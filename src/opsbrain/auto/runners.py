@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess  # noqa: S404 - fixed argv, no shell, scrubbed environment
 import time
@@ -24,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from ..result import Result
-from ..util import OpsError, clip
+from ..util import OpsError, clip, compact
 from .review import (
     CONTRACT_VERSION,
     MAX_OUTPUT_CHARS,
@@ -57,13 +58,24 @@ class RunnerSettings:
     max_retries: int = 2
     max_model_calls: int = 40
     budget_usd: float = 0.0  # 0 = no money limit enforced, call/parallel limits still apply
-    snapshot_dir: str = ""  # read-only directory the reviewer is confined to
+    snapshot_dir: str = ""  # directory the request is written into
+    scratch_home: str = ""  # HOME for the reviewer: empty credentials, not the operator's
+    sandbox: tuple[str, ...] = ()  # enforced confinement wrapper (e.g. sandbox-exec, bwrap, firejail)
     live: bool = False  # opt-in: without it no external binary is ever started
 
     def safe_env(self) -> dict[str, str]:
         env = {key: os.environ[key] for key in ENV_ALLOWLIST if key in os.environ}
-        return {key: value for key, value in env.items()
-                if not any(denied in key.upper() for denied in ENV_DENYLIST)}
+        env = {key: value for key, value in env.items()
+               if not any(denied in key.upper() for denied in ENV_DENYLIST)}
+        # The inherited HOME is a way to the operator's ssh keys, cloud config and shell history. Point it
+        # at an empty scratch directory so "read your credentials" is a filesystem decision the sandbox
+        # makes, not something a well-behaved reviewer is trusted not to try.
+        scratch = self.scratch_home or self.snapshot_dir
+        if scratch:
+            home = str(Path(scratch).expanduser())
+            env.update({"HOME": home, "XDG_CONFIG_HOME": f"{home}/.config", "XDG_CACHE_HOME": f"{home}/.cache",
+                        "XDG_DATA_HOME": f"{home}/.local/share"})
+        return env
 
 
 class ReviewerError(OpsError):
@@ -129,16 +141,26 @@ class CodexReviewer:
             raise ReviewerError("live runner is disabled: set auto.review.live=true after configuring the CLI")
         if not self.settings.command:
             raise ReviewerError("auto.review.command is empty: nothing to run")
+        # A working directory confines nothing. It does not make a directory read-only, and it does not
+        # stop the child from writing anywhere the operator can, or from reading the operator's SSH keys
+        # and kubeconfig. Since the whole promise of this module is that the reviewer observes and never
+        # acts, live mode requires an enforced confinement wrapper rather than a `cwd` that merely looks
+        # like one.
+        if not self.settings.sandbox:
+            raise ReviewerError(
+                "auto.review.sandbox is empty: a working directory is not a sandbox. Live review needs an "
+                "enforced wrapper (sandbox-exec / bwrap / firejail) so a prompt-injected reviewer cannot "
+                "write, or read the operator's credentials. See docs/autonomy.md.")
         self.calls += 1
         prompt = self._write_request(request)
         argv = [part.replace("{prompt}", prompt) for part in self.settings.command]
         argv = [part.replace("{model}", self.settings.model) for part in argv]
-        unknown = [part for part in self.settings.command if "{prompt}" not in part and "{model}" not in part]
-        if unknown and not any("{prompt}" in part or "{model}" in part for part in self.settings.command):
+        if not any("{prompt}" in part or "{model}" in part for part in self.settings.command):
             raise ReviewerError("auto.review.command must contain {prompt} or {model}")
         cwd = Path(self.settings.snapshot_dir).expanduser() if self.settings.snapshot_dir else None
         if cwd is not None and not cwd.is_dir():
             raise ReviewerError(f"auto.review.snapshot_dir does not exist: {cwd}")
+        argv = [*self.settings.sandbox, *argv]
         try:
             result: Result = self._run(argv, cwd=cwd, env=self.settings.safe_env(),
                                        timeout=self.settings.timeout_s, input=self._payload(request))
@@ -201,6 +223,8 @@ def probe_capabilities(settings: RunnerSettings) -> dict[str, Any]:
         "auth": settings.auth,
         "live": settings.live,
         "snapshot_dir": settings.snapshot_dir or None,
+        "sandbox": list(settings.sandbox),
+        "sandbox_required": True,
         "supports_prompt_placeholder": any("{prompt}" in part for part in settings.command),
         "model_checked": False,  # a real capability check needs credentials; the operator confirms it
     }
@@ -217,16 +241,78 @@ def self_probe_version(resolved: str) -> str | None:
         "utf-8", errors="replace").strip(), 120) or None
 
 
-def run_review(reviewer: Any, request: ReviewRequest, *, retries: int = 0) -> ReviewResult:
+#: Keys under which a runner's event stream may carry the answer as a nested document.
+_NESTED_KEYS = ("text", "content", "response", "output", "result", "message", "arguments")
+
+
+def extract_review_payload(raw: str) -> str:
+    """Pull the contract document out of whatever the runner printed.
+
+    `codex exec --json` does not print the verdict: it prints a JSONL *stream* of events, and the answer
+    is nested in the last one. Parsing the whole stdout with a single `json.loads` therefore rejects every
+    healthy live run as INVALID_RESPONSE. So: try the whole thing, then the last line, then the last event
+    that carries something which itself parses as a contract document.
+    """
+    text = raw.strip()
+    if not text:
+        return text
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    if fenced:
+        text = fenced.group(1).strip()
+    if _looks_like_contract(text):
+        return text
+    lines = [line for line in text.splitlines() if line.strip()]
+    for line in reversed(lines):
+        if _looks_like_contract(line):
+            return line
+    for line in reversed(lines):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if _looks_like_contract(event):
+            return line
+        for key in _NESTED_KEYS:
+            nested = event.get(key)
+            if isinstance(nested, str) and _looks_like_contract(nested):
+                return nested
+            if isinstance(nested, dict) and _looks_like_contract(nested):
+                return compact(nested)
+    return text
+
+
+def _looks_like_contract(value: Any) -> bool:
+    """True when `value` is already a document this contract could act on."""
+    document: Any = value
+    if isinstance(value, str):
+        try:
+            document = json.loads(value)
+        except ValueError:
+            return False
+    return isinstance(document, dict) and "verdict" in document
+
+
+def run_review(reviewer: Any, request: ReviewRequest, *, retries: int = 0,
+               before_attempt: Any = None) -> ReviewResult:
     """One review attempt with bounded retries.
 
     A retry only ever repeats a *transport* failure. A contract-invalid answer is returned as-is: repeating
     a malformed answer just spends the budget, and the caller must treat it as a blocker. A well-formed
     refusal ends the review immediately - retrying would buy a second opinion nobody asked for.
+
+    `before_attempt` is called before every single invocation, not once per request. A caller that caps
+    spend has to be able to refuse the *second* attempt too, or three paid calls pass one check.
     """
     attempts = max(0, min(int(retries), MAX_RETRIES))
     last: ReviewResult | None = None
     for attempt in range(attempts + 1):
+        if before_attempt is not None:
+            try:
+                before_attempt()
+            except Exception as exc:  # noqa: BLE001 - a refused reservation is a status, not a crash
+                return ReviewResult.failure(request, RunnerStatus.BUDGET_EXCEEDED, str(exc)[:200])
         try:
             payload = reviewer.review(request)
         except ReviewerError as exc:
