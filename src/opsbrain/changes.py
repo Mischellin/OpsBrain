@@ -138,6 +138,20 @@ class ChangeStore:
         self._save(change)
         return change
 
+    def note_repair_cycle(self, change_id: str) -> Change:
+        """Count one repair cycle durably.
+
+        The engine bounds how many times it will answer RETRY for the same change. That bound is only
+        real if the count survives the process: held in memory, it starts at zero on every call and a
+        change whose reviewer keeps timing out is retried forever.
+        """
+        with self._transition(change_id):
+            change = self.get(change_id)
+            change.details = {**change.details,
+                              "repair_cycles": int(change.details.get("repair_cycles", 0) or 0) + 1}
+            self._save(change)
+        return change
+
     def attach_approval(self, change_id: str, approval_id: str) -> Change:
         """Record the engine-issued approval this change will be executed under.
 

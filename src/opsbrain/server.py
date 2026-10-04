@@ -13,7 +13,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from .auto.config import REASON_CODES
+from .auto.config import all_reason_codes
 from .service import OpsBrain
 from .util import OpsError, write_private
 
@@ -194,7 +194,7 @@ def build_server(ops: OpsBrain) -> MCPServer:
             "evidence": lambda: ops.auto.evidence_overview(),
             "bundles": lambda: {"items": ops.auto.evidence_list(limit)},
             "verify_evidence": lambda: ops.auto.verify_evidence(_need(id, "id")),
-            "reasons": lambda: {"reasons": list(REASON_CODES)},
+            "reasons": lambda: {"reasons": list(all_reason_codes())},
             "checks": lambda: {"observation": ops.auto.verify_overview(),
                                "available": ops.auto.verification_checks()},
             "verify-plan": lambda: ops.auto.verify_plan(_need(id, "id")),

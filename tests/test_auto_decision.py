@@ -561,12 +561,18 @@ def test_approvable_means_the_field_said_yes_not_that_nobody_said() -> None:
     assert "approvability is None" in record.detail
 
 
-def test_a_verification_report_from_another_change_is_not_proof_of_this_one() -> None:
-    record = engine().decide(inputs(verification=report(CheckStatus.PASS, change_id="c-someoneelse")),
+def test_a_verification_report_that_names_no_change_is_not_proof_of_anything() -> None:
+    """The engine cannot compare ids: a decision is about a plan, a report belongs to a change.
+
+    `AutoService.decide_change` is the layer that knows both, and it refuses a report for another change
+    before it reaches the engine. What the engine still owes is that a report claiming no change at all is
+    not evidence - and that a report's aggregate status alone is not a substitute for being bound.
+    """
+    record = engine().decide(inputs(verification=report(CheckStatus.PASS, change_id="")),
                              "pl-1", "ah-1", review_ids=("rv-0000abcd",))
     assert record.decision is Decision.BLOCKED_AUTONOMOUSLY
     assert record.reason is Reason.VERIFICATION_UNKNOWN
-    assert "c-someoneelse" in record.detail
+    assert "names no change" in record.detail
 
 
 def test_a_second_reviewer_that_failed_does_not_vanish() -> None:
@@ -658,7 +664,8 @@ def _bundle(ops: Any, tmp_path: Any) -> str:
     return bundle["id"] if isinstance(bundle, dict) else bundle.id
 
 
-def _plan_for_change(target: str = "proxmox", bundle_id: str = ""):
+def _plan_for_change(target: str = "proxmox", bundle_id: str = "",
+                     capability: str = "tofu.apply"):
     """A complete, reviewable plan naming one target.
 
     `changes` cannot be empty - a plan with no changes is not a plan - so the shape here is the real one
@@ -670,7 +677,7 @@ def _plan_for_change(target: str = "proxmox", bundle_id: str = ""):
         objective="restart logrotate on web-1",
         diagnosis="the timer is enabled but its drop-in directory is wrong, so the unit runs with the "
                   "distribution defaults and never rotates",
-        changes=[ProposedChange(capability="ansible.apply", target=target,
+        changes=[ProposedChange(capability=capability, target=target,
                                 how="install a logrotate drop-in", reversible=Reversibility.ROLLBACK,
                                 undo="rm -f /etc/logrotate.d/web && systemctl daemon-reload")],
         evidence_refs=[bundle_id] if bundle_id else [], evidence_bundle=bundle_id, targets=[target],
@@ -814,3 +821,101 @@ def test_an_issued_approval_stays_traceable_to_its_decision(ops, tmp_path) -> No
     assert stored["verification"] == CheckStatus.PASS.value
     assert stored["attempts"] == record.attempts
     assert stored["plan"] == record.plan_id
+
+
+# --------------------------------------------------- the decision path must hold the line on its own facts
+def test_a_reviewed_plan_only_authorises_the_operation_it_proposes(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The target alone is not the operation.
+
+    Checking only that the plan named `proxmox` meant any approvable plan mentioning that target could
+    approve any pending change against it - a reviewed `ansible.apply` plan authorised a `tofu.apply` -
+    and the binding is built entirely from the change, so the reviewed operation never entered it.
+    """
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path), capability="ansible.apply")
+    assert ops.auto.review_plan(plan)["outcome"] == "approvable"
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY"
+    assert "tofu.apply:proxmox" in out["decision"]["detail"]
+
+
+def test_evidence_that_aged_out_blocks_a_later_decision(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """A preflight record remembers which evidence travelled, not whether it is still usable."""
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path))
+    assert ops.auto.review_plan(plan)["outcome"] == "approvable"
+    # The evidence goes away after the review. The id tuple in the preflight record is untouched, so a
+    # decision taken now would still have reported `evidence_fresh` off a reference that resolves to nothing.
+    bundle_id = plan.evidence_bundle
+    (ops.auto.evidence.bundles.root / f"{bundle_id}.json").unlink()
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY"
+    assert out["decision"]["reason"] == "evidence_not_fresh"
+    assert bundle_id in out["decision"]["detail"], "the failing bundle is named, so the operator knows where to look"
+
+
+def test_a_verification_report_for_another_change_is_refused(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The report's identity is checked, not overwritten: forcing it would accept a PASS as proof of this."""
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path))
+    ops.auto.review_plan(plan)
+    document = report(CheckStatus.PASS, change_id="c-other").to_dict()
+    out = ops.auto.decide_change(change.id, plan.id, verification=document)
+    assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY"
+    assert "c-other" in out["decision"]["detail"]
+
+
+def test_a_verification_report_for_this_change_is_accepted(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The other half: the report belongs to the change while the decision is about the plan."""
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path))
+    ops.auto.review_plan(plan)
+    document = report(CheckStatus.PASS, change_id=change.id).to_dict()
+    out = ops.auto.decide_change(change.id, plan.id, verification=document)
+    assert out["decision"]["decision"] == "APPROVE", out
+
+
+def test_repair_cycles_are_counted_durably_so_retry_eventually_blocks(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`attempts` left at its default was 0 on every call, so the repair bound was enforced only in tests.
+
+    A reviewer that keeps timing out returned RETRY forever, because `0 < max_repair_cycles` never stopped
+    being true. The count now lives in the change record, which is the only place a restart cannot lose it.
+    """
+    _autonomous_ops(ops, tmp_path, max_repair_cycles=2)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path))
+    engine = ops.auto.engine()
+    facts = {**{field: getattr(inputs(), field) for field in Inputs.__dataclass_fields__},
+             "review_verdict": "", "review_status": "TIMEOUT", "reviews_passed": 0}
+
+    def attempt() -> Any:
+        """A review that only ever times out, with the count read from the record rather than from memory."""
+        fresh = ops.changes.get(change.id)  # the store owns the copy; a stale one would read 0 forever
+        return Inputs(**{**facts, "attempts": ops.auto._repair_count(fresh)})
+
+    def decide_now() -> Any:
+        return engine.decide(attempt(), plan.id, "", change_id=change.id, review_ids=("rv-0000abcd",))
+
+    assert decide_now().decision is Decision.RETRY, "the first timeout is worth another attempt"
+    ops.changes.note_repair_cycle(change.id)
+    assert ops.auto._repair_count(ops.changes.get(change.id)) == 1
+    assert decide_now().decision is Decision.RETRY, "so is the second, which is the last"
+    ops.changes.note_repair_cycle(change.id)
+    exhausted = decide_now()
+    assert exhausted.decision is Decision.BLOCKED_AUTONOMOUSLY
+    assert exhausted.reason is Reason.RETRIES_EXHAUSTED
+    assert exhausted.attempts == 2

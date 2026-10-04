@@ -484,7 +484,7 @@ class AutoService:
         # Imported here, not at module scope: `config` imports this package, so a top-level import of
         # `Access` closes a cycle.
         from ..config import Access
-        from .decision import Inputs
+        from .decision import Decision, Inputs
 
         self.guard_enabled()
         if self.core is None:
@@ -493,27 +493,53 @@ class AutoService:
         record = self.preflight().get_by_plan(plan_id)
         plan = ChangePlan.from_dict(record["plan_document"])
         result = PreflightResult.from_record(record)
+        # The review covers the operations the plan actually proposes, not merely the target it happens to
+        # name. Checking only the target meant any approvable plan mentioning `proxmox` could authorise any
+        # pending change against `proxmox` - a reviewed `ansible.apply` plan would approve a `tofu.apply`
+        # - and the binding is then built entirely from the change, so the reviewed operation never entered
+        # into it. Capability and target must both match.
+        proposed = {f"{change.capability}:{change.target}"
+                    for change in plan.changes if change.capability and change.target}
+        if proposed and f"{change.capability}:{change.target}" not in proposed:
+            return self._decision_refused(change_id, plan_id,
+                                          f"the plan proposes {', '.join(sorted(proposed))} and not "
+                                          f"{change.capability}:{change.target}", review_id=result.review_id)
         if plan.targets and change.target not in plan.targets:
-            # The review covers the targets the plan names. A change against a target the plan never
-            # mentioned is authorised by a document that did not describe it.
             return self._decision_refused(change_id, plan_id,
                                           f"the plan names {', '.join(plan.targets)} and not "
                                           f"{change.target!r}", review_id=result.review_id)
         access = self.core.require(change.capability, change.target)
-        report = self._report_from(change_id, verification) if verification else None
+        if verification is not None:
+            report = VerificationReport.from_dict(verification)
+            # The report's identity is checked, not overwritten. It belongs to the change, while the
+            # decision is about the plan, and forcing the id to the change here made every document
+            # disagree with the plan it was gathered for. Forcing it would also let a PASS for one change
+            # be read as proof about another.
+            if report.change_id and report.change_id != change_id:
+                return self._decision_refused(change_id, plan_id,
+                                              f"the verification report is for {report.change_id}, not "
+                                              f"{change_id}", review_id=result.review_id)
+        else:
+            report = None
+        # Evidence is re-read and re-checked here rather than trusted from the preflight record. That record
+        # was written when the bundle was fresh; the decision happens later, and by then the bundle may have
+        # aged past `evidence.max_age_s`, gone missing, or been tampered with. Treating a non-empty id tuple
+        # as `evidence_fresh` made all three reach APPROVE.
+        evidence_ids, evidence_reason = self._evidence_state(result.evidence_ids)
         inputs = Inputs(
             mode=self.auto.decision.mode,
             preflight_outcome=result.outcome,
             preflight_reason=result.reason,
             preflight_approvable=result.approvable,
-            evidence_reason="evidence_fresh" if result.evidence_ids else "evidence_missing",
-            evidence_ids=tuple(result.evidence_ids),
+            evidence_reason=evidence_reason,
+            evidence_ids=evidence_ids,
             review_verdict=result.verdict.value if result.verdict else "",
             review_status=result.review_status.value,
             policy_allows=access is not Access.DENY,
             target_in_scope=bool(change.target),
             destructive=bool(change.dangerous),
             verification=report,
+            attempts=self._repair_count(change),
             policy_version=self.auto.decision.policy_version,
         )
         review_ids = (result.review_id,) if result.review_id else ()
@@ -528,6 +554,11 @@ class AutoService:
         self.audit.record(event="decision", change=change_id, decision=decision.decision.value,
                           reason=decision.reason.value, plan=plan_id, review=result.review_id)
         out: dict[str, Any] = {"decision": decision.brief()}
+        if decision.decision is Decision.RETRY:
+            # Counted only after the decision, under the same lock as every other transition, so a crash
+            # between deciding and counting cannot buy a free cycle - and so the count is durable.
+            self.core.changes.note_repair_cycle(change_id)
+            out["decision"] = {**decision.brief(), "attempts": self._repair_count(change)}
         if not decision.approvable:
             return out
         binding = binding_for(change, evidence_ids=result.evidence_ids,
@@ -537,20 +568,54 @@ class AutoService:
         self.core.changes.attach_approval(change_id, approval)
         return {**out, "approval": approval, "next": f"apply change {change_id}; no human step is required"}
 
+    def _evidence_state(self, evidence_ids: Sequence[str]) -> tuple[tuple[str, ...], str]:
+        """Re-read and re-check every bundle a decision rests on, and answer with what is true now.
+
+        A preflight record remembers which evidence travelled with the review; it does not remember
+        whether that evidence is still usable. A bundle can pass its freshness window, go missing, or be
+        replaced, and all three left the id tuple intact - so a decision taken later would still have
+        reported `evidence_fresh` off a reference that no longer resolved to anything.
+        """
+        ids = tuple(evidence_ids)
+        if not ids:
+            return (), "evidence_missing"
+        # The references are returned even when they fail. Dropping them would send the engine down its
+        # "no evidence at all" branch, whose message names no bundle - and the operator's next step is to
+        # look at that bundle.
+        failing: list[str] = []
+        code = "evidence_fresh"
+        for bundle_id in ids:
+            try:
+                bundle = self.evidence.get(bundle_id)
+            except OpsError:
+                failing.append(bundle_id)
+                code = code if code != "evidence_fresh" else "evidence_missing"
+                continue
+            payloads, blocked = self.evidence.load_artifacts(bundle)
+            checks = check_evidence(bundle, payloads, blocked=blocked)
+            found = reason_code(checks)
+            if found != "evidence_fresh":
+                failing.append(bundle_id)
+                code = found if code == "evidence_fresh" else code
+        if not failing:
+            return ids, "evidence_fresh"
+        return ids, f"{code} (unusable: {', '.join(failing)})"
+
+    def _repair_count(self, change: Any) -> int:
+        """How many repair cycles this change has already had, from the record rather than from memory.
+
+        Left at its default, `attempts` was always 0, so every review timeout and every `NEEDS_EVIDENCE`
+        satisfied `attempts < max_repair_cycles` and returned RETRY indefinitely. The bound was enforced
+        only in tests that passed the field by hand.
+        """
+        return int(change.details.get("repair_cycles", 0) or 0)
+
     def _decision_refused(self, change_id: str, plan_id: str, detail: str, *,
                           review_id: str = "") -> dict[str, Any]:
         """A refusal recorded as a decision, so the audit trail has the same shape either way."""
         self.audit.record(event="decision", change=change_id, decision="BLOCKED_AUTONOMOUSLY",
                           reason="plan_changed", plan=plan_id, review=review_id)
         return {"decision": {"decision": "BLOCKED_AUTONOMOUSLY", "reason": "plan_changed", "detail": detail}}
-
-    def _report_from(self, change_id: str, document: dict[str, Any]) -> VerificationReport:
-        """Rebuild a report the caller read back from `verify_change`, bound to this change.
-
-        The id is forced to the change being decided. Taking it from the document would let a PASS for one
-        change be supplied while deciding another - the report would be accepted as proof of this one.
-        """
-        return VerificationReport.from_dict({**document, "change_id": change_id})
 
     def verify_overview(self) -> dict[str, Any]:
         if self.core is None:

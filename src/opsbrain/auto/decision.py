@@ -405,12 +405,19 @@ class ApprovalEngine:
         # ---- what actually happened, not that the command returned
         report = inputs.verification
         if report is not None:
-            # The report has to be about *this* plan. Reading only its aggregate status meant a PASS from
-            # an unrelated earlier change could be supplied while deciding this one.
-            if report.change_id and plan_id and report.change_id != plan_id:
+            # The report has to name *a* change and the caller has to have checked it names *this* one. The
+            # engine cannot do that comparison itself: a decision is about a plan (`pl-…`) while a
+            # verification report belongs to the change it observed (`c-…`), so comparing the two here
+            # rejected every report a caller legitimately gathered - and, worse, the version before it
+            # read only the aggregate status and accepted a PASS from an unrelated change.
+            #
+            # The caller that knows both ids is `AutoService.decide_change`, which refuses a report for
+            # another change before it ever gets here. What remains is that a report claiming no change at
+            # all is not evidence of anything.
+            if not report.change_id:
                 return (Decision.BLOCKED_AUTONOMOUSLY, Reason.VERIFICATION_UNKNOWN,
-                        f"the verification report is for {report.change_id}, not for {plan_id}",
-                        "verify this plan again")
+                        "the verification report names no change, so it is not evidence about this one",
+                        "verify this change again")
             if report.status is CheckStatus.FAIL:
                 return (Decision.DENY, Reason.VERIFICATION_FAILED,
                         f"verification of the applied change failed: {report.brief().get('reason', '')}",
