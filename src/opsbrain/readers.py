@@ -115,6 +115,31 @@ class Readers(Core):
         return out
 
     # ----------------------------------------------------------------------------------------- hosts
+    def _require_all_namespaces(self) -> None:
+        """Refuse a cluster-wide read unless every namespace it would return is explicitly allowed.
+
+        Listing the namespaces first is itself a read, so it is checked against the bare capability - and
+        then each namespace is checked on its own, which is the part that makes a `k8s.read:prod: deny`
+        mean something.
+        """
+        listing = parsers.k8s_rows("namespaces", self._kubectl_json("get", "namespaces"))
+        names = [str(row.get("name", "")) for row in listing if str(row.get("name", ""))]
+        if not names:
+            raise OpsError("cannot read the namespace list, so an all-namespace read is not authorised")
+        for name in names:
+            self.require("k8s.read", name)
+
+    def _authorise_hosts(self, names: list[str]) -> None:
+        """Check `hosts.read` for *every* selected host, not once for the batch.
+
+        A rule like `hosts.read:pve: deny` is keyed on the host, and a batch action that asks only about
+        the bare capability never lets it participate: the denial was configured, and the host was read
+        anyway. Authorising each name before any command goes out is what makes the targeted rule mean
+        something, for explicit lists and for tag-selected batches alike.
+        """
+        for name in names:
+            self.require("hosts.read", name)
+
     def _select_hosts(self, hosts: list[str] | None, tag: str | None, *, kind: str = "linux") -> list[str]:
         if hosts:
             for name in hosts:
@@ -132,22 +157,24 @@ class Readers(Core):
         return dict(zip(names, results, strict=True))
 
     def hosts_list(self) -> dict[str, Any]:
+        """The inventory. Gated like every other host read: it carries addresses, jump chains and tags."""
+        self.require("hosts.read")
         return {"hosts": [{"name": name, "addr": host.address, **({"jump": host.jump} if host.jump else {}),
                            **({"tags": host.tags} if host.tags else {}),
                            **({"services": host.services} if host.services else {})}
                           for name, host in self.config.hosts.items()]}
 
     def hosts_ping(self, hosts: list[str] | None = None, tag: str | None = None) -> dict[str, Any]:
-        self.require("hosts.read")
         names = self._select_hosts(hosts, tag)
+        self._authorise_hosts(names)
         results = self._parallel(names, "true", timeout=25)
         down = {name: clip(result.out.strip().splitlines()[-1] if result.out.strip() else "timeout", 160)
                 for name, result in results.items() if not result.ok}
         return {"up": len(names) - len(down), "total": len(names), "down": down}
 
     def hosts_status(self, hosts: list[str] | None = None, tag: str | None = None) -> dict[str, Any]:
-        self.require("hosts.read")
         names = self._select_hosts(hosts, tag)
+        self._authorise_hosts(names)
         results = self._parallel(names, STATUS_SCRIPT)
         ignore = frozenset(self.config.ignore_failed_units)
         rows: dict[str, Any] = {}
@@ -271,10 +298,17 @@ class Readers(Core):
 
     def k8s_get(self, kind: str, namespace: str | None = None, name: str | None = None,
                 selector: str | None = None) -> dict[str, Any]:
-        self.require("k8s.read", namespace or "")
         if kind not in K8S_KINDS:
             raise OpsError(f"kind must be one of {sorted(K8S_KINDS)}")
         self._names(namespace, name)
+        cluster_wide = not namespace and kind not in ("nodes", "namespaces")
+        if cluster_wide:
+            # `-A` returns objects from namespaces the policy may well deny. Checking the empty target
+            # only proves that `k8s.read:` is allowed, so a per-namespace deny never participated. Either
+            # the operator has allowed every namespace explicitly, or this read does not happen.
+            self._require_all_namespaces()
+        else:
+            self.require("k8s.read", namespace or "")
         args = ["get", K8S_KINDS[kind], *([name] if name else [])]
         args += ["-n", namespace] if namespace else ([] if kind in ("nodes", "namespaces") else ["-A"])
         if selector:

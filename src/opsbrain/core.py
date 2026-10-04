@@ -17,6 +17,7 @@ from .executor import Executor
 from .httpclient import HttpClient
 from .jobs import DONE, Job, JobStore
 from .policy import decide
+from .redact import redact_obj
 from .util import OpsError, clip, compact
 
 Finalizer = Callable[[Job, int, str], dict[str, Any]]
@@ -163,7 +164,11 @@ class Core:
             ok, result = False, {"error": str(exc)}
         except Exception as exc:  # noqa: BLE001 - a tool must answer, never crash the server
             ok, result = False, {"error": f"internal: {type(exc).__name__}: {str(exc)[:300]}"}
-        text = compact(result)
+        # Redacted here, at the one place every result passes through, rather than in each handler. The
+        # package promises that returned output is redacted, and that promise is only true if a handler
+        # that forgets - ansible failure details, k8s event messages, prometheus alert annotations - cannot
+        # leak a credential to the client.
+        text = compact(redact_obj(result))
         limit = self.config.limits.max_chars
         if len(text) > limit:
             meta = self.artifacts.save("result", f"{tool} full result", text)
