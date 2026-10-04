@@ -326,7 +326,12 @@ class Readers(Core):
             # per-namespace rules only afterwards meant a caller denied `k8s.read` outright had already
             # caused `kubectl get namespaces` to run.
             self.require("k8s.read")
-            rows = parsers.k8s_rows(kind, self._kubectl_json("get", "namespaces"))
+            # The selector was validated but never passed on, so this branch answered with every
+            # authorised namespace rather than the ones asked for.
+            args = ["get", "namespaces"]
+            if selector:
+                args += ["-l", selector]
+            rows = parsers.k8s_rows(kind, self._kubectl_json(*args))
             allowed, withheld = [], 0
             for row in rows:
                 row_name = str(row.get("name", ""))

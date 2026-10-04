@@ -403,3 +403,18 @@ def test_every_marker_kind_this_module_emits_survives_a_second_pass() -> None:
         assert redact_text(stored) == stored, f"a {kind} marker was rewritten on the second pass"
         json.loads(redact_text(stored))
     assert redact_obj({"input_tokens": 7})["input_tokens"] == 7
+
+
+def test_a_namespace_listing_honours_the_selector_it_was_given(ops) -> None:  # type: ignore[no-untyped-def]
+    """The selector was validated and then dropped, so the branch answered with every namespace."""
+    from opsbrain.config import Access
+
+    ops.exec.rules.clear()
+    ops.exec.on(r"get namespaces", json.dumps({"items": [
+        {"metadata": {"name": "default"}}, {"metadata": {"name": "prod"}}]}) + "\n")
+    ops.require = _policy(ops, {"k8s.read": Access.ALLOW})
+
+    ops.k8s_get(kind="namespaces", selector="env=prod")
+    scripts = [script for _, script in ops.exec.calls if "get namespaces" in script]
+    assert scripts and all("-l env=prod" in script for script in scripts), (
+        "the selector was accepted and then not used")
