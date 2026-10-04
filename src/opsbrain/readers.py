@@ -115,12 +115,14 @@ class Readers(Core):
         return out
 
     # ----------------------------------------------------------------------------------------- hosts
-    def _require_all_namespaces(self) -> None:
-        """Refuse a cluster-wide read unless every namespace it would return is explicitly allowed.
+    def _require_all_namespaces(self) -> list[str]:
+        """The namespaces a cluster-wide read may cover, each authorised individually.
 
-        Listing the namespaces first is itself a read, so it is checked against the bare capability - and
-        then each namespace is checked on its own, which is the part that makes a `k8s.read:prod: deny`
-        mean something.
+        Returns the authorised list rather than only asserting, because the caller must then read *those*
+        namespaces by name. Authorising a list and afterwards issuing one `-A` read is not the same thing:
+        a namespace created in between is absent from the loop and its objects still come back. Reading the
+        authorised namespaces explicitly is what makes the per-namespace rule mean something at the moment
+        the objects are actually fetched.
         """
         # The bare capability is checked *before* the cluster is read. Checking it afterwards meant a
         # caller the policy denies had already caused `kubectl get namespaces` to run.
@@ -131,6 +133,7 @@ class Readers(Core):
             raise OpsError("cannot read the namespace list, so an all-namespace read is not authorised")
         for name in names:
             self.require("k8s.read", name)
+        return names
 
     def _authorise_hosts(self, names: list[str]) -> None:
         """Check `hosts.read` for *every* selected host, not once for the batch.
@@ -304,19 +307,29 @@ class Readers(Core):
         if kind not in K8S_KINDS:
             raise OpsError(f"kind must be one of {sorted(K8S_KINDS)}")
         self._names(namespace, name)
+        if selector and not _SELECTOR.fullmatch(selector):
+            raise OpsError(f"invalid selector: {selector!r}")
         cluster_wide = not namespace and kind not in ("nodes", "namespaces")
+        names: list[str] = []
         if cluster_wide:
             # `-A` returns objects from namespaces the policy may well deny. Checking the empty target
             # only proves that `k8s.read:` is allowed, so a per-namespace deny never participated. Either
-            # the operator has allowed every namespace explicitly, or this read does not happen.
-            self._require_all_namespaces()
+            # the operator has allowed every namespace explicitly, or this read does not happen - and even
+            # then each authorised namespace is read *by name*, so a namespace created after the check
+            # cannot smuggle its objects into the answer.
+            names = self._require_all_namespaces()
         else:
             self.require("k8s.read", namespace or "")
+        if names:
+            rows: list[Any] = []
+            for scope in names:
+                rows += parsers.k8s_rows(kind, self._kubectl_json(
+                    "get", K8S_KINDS[kind], *( [name] if name else []), "-n", scope,
+                    *(["-l", selector] if selector else [])))
+            return {"kind": kind, "namespaces": list(names), **self.capped(rows, 40)}
         args = ["get", K8S_KINDS[kind], *([name] if name else [])]
         args += ["-n", namespace] if namespace else ([] if kind in ("nodes", "namespaces") else ["-A"])
         if selector:
-            if not _SELECTOR.fullmatch(selector):
-                raise OpsError(f"invalid selector: {selector!r}")
             args += ["-l", selector]
         return {"kind": kind, **self.capped(parsers.k8s_rows(kind, self._kubectl_json(*args)), 40)}
 

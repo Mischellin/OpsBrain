@@ -154,3 +154,54 @@ def test_a_denied_caller_never_causes_a_cluster_read(ops) -> None:  # type: igno
     with pytest.raises(OpsError, match="k8s.read"):
         ops.k8s_get(kind="pods")
     assert not ops.exec.calls, "the cluster was read by a caller the policy denies"
+
+
+def test_a_cluster_wide_read_names_each_namespace_it_covers(ops) -> None:  # type: ignore[no-untyped-def]
+    """Authorising a list and then issuing one `-A` read is not the same as authorising each namespace.
+
+    A namespace created between the two is absent from the authorisation loop and its objects still come
+    back in the answer. So the namespaces that were authorised are the namespaces that get read, by name.
+    """
+    from opsbrain.config import Access
+
+    ops.exec.rules.clear()
+    namespaces = {"items": [{"metadata": {"name": "default"}}, {"metadata": {"name": "prod"}}]}
+    ops.exec.on(r"get namespaces", json.dumps(namespaces) + "\n")
+    for scope in ("default", "prod"):
+        ops.exec.on(rf"-n {scope}",
+                    json.dumps({"items": [{"metadata": {"name": f"pod-{scope}"}}]}) + "\n")
+    ops.require = _policy(ops, {"k8s.read": Access.ALLOW})
+
+    out = ops.k8s_get(kind="pods")
+    assert out["namespaces"] == ["default", "prod"]
+    scripts = [script for _, script in ops.exec.calls if "get pods" in script]
+    assert all("-A" not in script for script in scripts), "no cluster-wide read was issued"
+    assert {script.split("-n ")[1].split()[0] for script in scripts} == {"default", "prod"}
+
+
+def test_a_pass_field_is_not_mistaken_for_a_password(ops) -> None:  # type: ignore[no-untyped-def]
+    """`pass` is the tail of `is_pass` and `passed`, and neither is a credential.
+
+    Redacting a boolean because its name contains a substring left `verify_evidence` unreadable: a client
+    could not tell whether the check succeeded.
+    """
+    from opsbrain.redact import redact_obj
+
+    masked = redact_obj({"is_pass": True, "passed": 3, "bypass": False,
+                         "api_key": "sk-live-1", "password": "hunter2"})
+    assert masked["is_pass"] is True
+    assert masked["passed"] == 3
+    assert masked["bypass"] is False
+    assert masked["api_key"] != "sk-live-1"
+    assert masked["password"] != "hunter2", "a key that is only `pass` is still a password"
+
+
+def test_verification_answers_survive_result_redaction(ops) -> None:  # type: ignore[no-untyped-def]
+    """The failure this caused was invisible at the tool boundary, so it is asserted there."""
+    ops.exec.rules.clear()
+    answer = ops.call("autonomy", {"action": "verify_evidence", "id": "ev-0000abcd"},
+                      lambda: {"status": "PASS", "is_pass": True, "passed": 2, "api_key": "sk-live-9"})
+    body = json.loads(answer if isinstance(answer, str) else json.dumps(answer))
+    assert body["is_pass"] is True
+    assert body["passed"] == 2
+    assert body["api_key"] != "sk-live-9", "the credential is still redacted"

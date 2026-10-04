@@ -70,7 +70,19 @@ def redact_text(text: str) -> str:
     return redact(text)[0]
 
 
-_SENSITIVE_NAME = re.compile(rf"(?i)({_SENSITIVE_KEY})")
+#: A key name that *is itself* a password, however it is spelled. `pass` on its own is ambiguous - it is a
+#: real password field in hand-written YAML, and it is also the tail of `is_pass`, `passed` and
+#: `bypass`. Those are not credentials, and masking a boolean because its name contains a substring is
+#: worse than useless: it turns `verify_evidence` into a string the client cannot read.
+_PASSWORD_NAMES = (
+    "pass", "passwd", "password", "passphrase", "pwd", "pass_word", "passwd_?hash", "pass[-_]?word",
+    "x[-_]?pass", "(?:user|admin|root|db|ftp|ssh|smtp|mail|api|app|service)_pass(?:word|wd)?",
+)
+_PASSWORD_NAME = re.compile(r"(?i)^(?:" + "|".join(_PASSWORD_NAMES) + r")$")
+
+#: The rest of the sensitive vocabulary matches on component boundaries: `auth_token`, `db.api_key` and
+#: `client_secret` are credentials; `tokenizer`, `keynote` and `authorized` are not.
+_SENSITIVE_NAME = re.compile(r"(?i)(?:^|[^a-z0-9])(?:" + _SENSITIVE_KEY + r")(?:[^a-z0-9]|$)")
 
 #: Keys that *look* sensitive and are not. `token` in a budget report is a count, not a credential, and
 #: masking it replaces a number with a string - which silently breaks every client that reports usage,
@@ -79,11 +91,26 @@ _SENSITIVE_NAME = re.compile(rf"(?i)({_SENSITIVE_KEY})")
 _NOT_SECRET_KEYS = frozenset({
     "input_tokens", "output_tokens", "max_tokens", "total_tokens", "tokens", "token_budget",
     "tokens_used", "tokens_remaining", "max_model_calls", "model_calls", "spend_usd", "budget_usd",
+    # Verification and review vocabulary. `passed` / `is_pass` are answers, not secrets, and redacting
+    # them leaves a client unable to tell whether a check succeeded. A key that is *only* `pass` is not
+    # here - that one is a password field, and `_PASSWORD_NAME` matches it whole.
+    "passed", "is_pass", "passes", "passing", "bypass", "bypassed", "password_changed",
 })
 
 
 def _is_sensitive_key(key: str) -> bool:
-    return str(key).strip().casefold() not in _NOT_SECRET_KEYS and bool(_SENSITIVE_NAME.search(str(key)))
+    """Whether a key names a credential. A name is judged whole, not by whether it contains a fragment.
+
+    Substring matching is what made `is_pass` look like a password: the pattern's `pass` alternative
+    matched the tail of an unrelated word. The password family is now matched whole, and the rest only on
+    component boundaries, so a new key has to be genuinely credential-shaped to be masked.
+    """
+    name = str(key).strip()
+    if name.casefold() in _NOT_SECRET_KEYS:
+        return False
+    if _PASSWORD_NAME.match(name):
+        return True
+    return bool(_SENSITIVE_NAME.search(name.casefold()))
 
 
 def redact_obj(value: Any) -> Any:
