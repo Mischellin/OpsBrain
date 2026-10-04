@@ -47,6 +47,7 @@ class StaleReason(StrEnum):
     TARGETS_CHANGED = "targets_changed"
     EVIDENCE_CHANGED = "evidence_changed"
     POLICY_CHANGED = "policy_changed"
+    PROFILE_CHANGED = "profile_changed"
     SUBJECT_CHANGED = "subject_changed"
     UNBOUND = "unbound"
 
@@ -130,7 +131,13 @@ def stale_reasons(binding: ApprovalBinding, current: dict[str, Any]) -> tuple[st
     if not current.get("plan_hash"):
         reasons.append(StaleReason.UNBOUND.value)
     for name, stale in (("plan_hash", StaleReason.PLAN_CHANGED), ("arguments_hash", StaleReason.ARGUMENTS_CHANGED),
-                        ("subject", StaleReason.SUBJECT_CHANGED), ("policy_version", StaleReason.POLICY_CHANGED)):
+                        ("subject", StaleReason.SUBJECT_CHANGED), ("policy_version", StaleReason.POLICY_CHANGED),
+                        # The profile is not decoration: it selects the evidence a change must rest on, the
+                        # preconditions, the allowed targets and whether autonomy may run it at all. An
+                        # operation reclassified from `general` to `secrets` left the plan, the subject and
+                        # the policy-version string untouched, so this comparison never noticed and the
+                        # approval granted under the looser profile stayed spendable under the stricter one.
+                        ("profile", StaleReason.PROFILE_CHANGED)):
         expected = getattr(binding, name)
         # An absent field is a mismatch, not a free pass. Comparing only when the caller supplied a truthy
         # value meant `consume(id, {"plan_hash": expected})` verified one field out of five.
@@ -210,6 +217,12 @@ class ApprovalStore:
                 if existing.state is LeaseState.CONSUMED:
                     raise OpsError(f"approval {approval.id} was already spent; a spent approval is not "
                                    f"replaced, and the change it authorised has already run")
+                if existing.state is LeaseState.REVOKED:
+                    # Revocation is a decision by a person. An automatic retry of the original issuance
+                    # silently undoing it would make the change executable again with nobody having looked
+                    # at it a second time.
+                    raise OpsError(f"approval {approval.id} was revoked ({existing.lease_owner or 'no reason'}); "
+                                   f"a revoked approval is not reissued, and re-reviewing is what undoes it")
                 approval = Approval(binding=binding)
             write_private(path, json.dumps(approval.to_dict(), ensure_ascii=False))
         return approval
@@ -254,6 +267,12 @@ class ApprovalStore:
             if not path.is_file():
                 raise OpsError(f"no approval {approval_id}")
             approval = Approval.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            # Same identity check `get` makes. Spending is the path that matters most, and without it a
+            # binding swapped in under a valid filename would be accepted by any caller whose `current`
+            # happens to match the substituted binding.
+            if approval.binding.id != approval_id:
+                raise OpsError(f"approval {approval_id} does not match its contents "
+                               f"(the file holds {approval.binding.id})")
             if approval.state is LeaseState.REVOKED:
                 raise OpsError(f"approval {approval_id} was revoked")
             if approval.state is LeaseState.CONSUMED:

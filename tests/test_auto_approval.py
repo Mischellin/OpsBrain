@@ -45,6 +45,7 @@ def current(**overrides: Any) -> dict[str, Any]:
     binding = a_binding()
     base: dict[str, Any] = {"plan_hash": binding.plan_hash, "arguments_hash": binding.arguments_hash,
                             "subject": binding.subject, "policy_version": binding.policy_version,
+                            "profile": binding.profile,
                             "targets": list(binding.targets), "evidence_ids": list(binding.evidence_ids)}
     return {**base, **overrides}
 
@@ -392,3 +393,46 @@ def test_a_spent_approval_is_never_replaced_by_a_re_issue(tmp_path: Path) -> Non
     with pytest.raises(OpsError, match="already spent"):
         store.issue(a_binding())
     assert store.get(approval.id).lease_owner == "worker-1", "the spender is still on the record"
+
+
+def test_reclassifying_a_change_under_a_stricter_profile_makes_its_approval_stale(tmp_path: Path) -> None:
+    """The profile selects the evidence, the preconditions, the targets and whether autonomy may run at all.
+
+    Reclassifying from `general` to `secrets` left the plan, the subject and the policy-version string
+    untouched, so a comparison that covered those three never noticed - and the approval granted under the
+    looser profile stayed spendable under the stricter one.
+    """
+    store = ApprovalStore(tmp_path)
+    binding = a_binding(profile="general")
+    store.issue(binding)
+    assert stale_reasons(binding, current(profile="general")) == ()
+    reasons = stale_reasons(binding, current(profile="secrets"))
+    assert StaleReason.PROFILE_CHANGED.value in reasons
+    with pytest.raises(OpsError, match="STALE"):
+        store.consume(binding.id, current(profile="secrets"), owner="w", idempotency_key="k")
+
+
+def test_spending_verifies_that_the_record_is_the_one_named(tmp_path: Path) -> None:
+    """`get` checks the content-addressed identity; spending has to check it too, and that is the path
+    that matters. A binding swapped in under a valid filename would otherwise be accepted by any caller
+    whose `current` matched the substituted binding.
+    """
+    store = ApprovalStore(tmp_path)
+    issued = store.issue(a_binding())
+    other = a_binding(change_id="c-deadbeef", arguments_hash="other-arguments")
+    path = tmp_path / f"{issued.id}.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["binding"] = other.to_dict()
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(OpsError, match="does not match its contents"):
+        store.consume(issued.id, current(), owner="w", idempotency_key="k")
+
+
+def test_an_automatic_retry_does_not_undo_a_revocation(tmp_path: Path) -> None:
+    """Revocation is a decision by a person; a retry of the original issuance must not silently redo it."""
+    store = ApprovalStore(tmp_path)
+    approval = store.issue(a_binding())
+    store.revoke(approval.id, "the target is not ours")
+    with pytest.raises(OpsError, match="was revoked"):
+        store.issue(a_binding())
+    assert store.get(approval.id).state is LeaseState.REVOKED, "the withdrawal stands"
