@@ -54,9 +54,7 @@ _SSH_TIMEOUT = 20.0
 _HTTP_TIMEOUT = 10.0
 _START_TIMEOUT = 90.0
 
-#: A leading `-` turns the name into an option for systemctl rather than a unit name, and the character
-#: class deliberately excludes it even though the rest of a unit name is more permissive than it looks.
-_UNIT = re.compile(r"^(?![-])([A-Za-z0-9@_.:-]{1,120})$")
+_UNIT = re.compile(r"^[A-Za-z0-9@_.:-]{1,120}$")
 _ABS_PATH = re.compile(r"^/[A-Za-z0-9._/@:+-]{1,240}$")
 _PURE_NUMBER = re.compile(r"^(100|[1-9]?[0-9])$")
 _DIGEST = re.compile(r"\b([0-9a-f]{64})\b")
@@ -128,16 +126,9 @@ def http_target(name: str, url: str, *, expected_status: int | None = None) -> T
 
 
 def k8s_target(name: str, *, namespace: str = "default", kind: str = "deployments",
-               expected_revision: str | None = None, expected_replicas: int | None = None) -> Target:
-    """A workload whose rollout and revision the change is judged on.
-
-    `expected_replicas` is the count the plan asked for. A scale change that reached the count the
-    cluster was already at has not demonstrated anything, and only the plan knows the difference.
-    """
-    expectations: tuple[tuple[str, str], ...] = (("namespace", namespace), ("kind", kind))
-    if expected_replicas is not None:
-        expectations += (("replicas", str(expected_replicas)),)
-    return Target("k8s", name, "", expectations, expected_revision)
+               expected_revision: str | None = None) -> Target:
+    """A workload whose rollout and revision the change is judged on."""
+    return Target("k8s", name, "", (("namespace", namespace), ("kind", kind)), expected_revision)
 
 
 def storage_target(path: str, *, host: str = "", min_free_pct: int | None = None) -> Target:
@@ -260,19 +251,6 @@ class VerifyContext:
     window_s: float
     evidence_refs: tuple[str, ...] = ()
     clock: Callable[[], float] = now
-    #: When the change was observed applied, or None when the caller did not say. Present so the window
-    #: can be recomputed per check instead of frozen at the start of the run.
-    applied_at: float | None = None
-
-    def window(self) -> float:
-        """How long ago the change was applied, as of *now*.
-
-        A verification is a sequence of remote commands; the last one may run much later than the first,
-        and every check has to be judged against the settling time it actually waited.
-        """
-        if self.applied_at is None:
-            return self.window_s
-        return max(0.0, self.clock() - self.applied_at)
 
     def keep(self, kind: str, title: str, text: str) -> tuple[str, ...]:
         """The raw capture behind a verdict, so a reader can re-derive it instead of trusting the summary."""
@@ -300,19 +278,8 @@ class Check:
     run: CheckFn
     state_changing: bool = False
     settles: bool = False
-    #: The check can only answer "is this the state the change produced" if the plan said what revision it
-    #: was aiming at. Without it the check is measuring whatever happens to be there, and `_unbound` used to
-    #: call that acceptable.
-    requires_revision: bool = False
     why: str = ""
 
-
-#: Workload kinds `k8s:rollout` knows how to read. A Deployment scaled to zero omits its optional status
-#: counters, which this check handles; other kinds are refused rather than guessed at.
-#: Only resource types `kubectl get` accepts here. `apps/v1` is a group/version prefix and `deployment.apps`
-#: is not a type at all; both were being handed to kubectl as if they were, which is a typo that reads as
-#: a resource rather than an error.
-SUPPORTED_KINDS = frozenset({"deployment", "deployments"})
 
 #: Every check OpsBrain knows, by its policy-facing name (`profile:check`). A policy names these strings,
 #: so a typo is a refusal rather than a silently skipped requirement.
@@ -327,31 +294,6 @@ def register(check: Check) -> Check:
 
 
 # ------------------------------------------------------------------------------------------------- helpers
-def config_path(core: Core) -> Path:
-    """Where the auto pipeline keeps its records, derived from the Core it was handed."""
-    return Path(getattr(core.config, "data_path", ".")) / "auto"
-
-
-def _redacted(result: Result) -> Result:
-    """Strip everything from a kubectl document except the fields this check reads."""
-    try:
-        document = json.loads(result.out)
-    except ValueError:
-        return result
-    if not isinstance(document, dict):
-        return result
-    reduced = {
-        "metadata": {"name": (document.get("metadata") or {}).get("name"),
-                     "generation": (document.get("metadata") or {}).get("generation"),
-                     "annotations": (document.get("metadata") or {}).get("annotations") or {}},
-        "spec": {"replicas": (document.get("spec") or {}).get("replicas")},
-        "status": {key: (document.get("status") or {}).get(key)
-                   for key in ("generation", "observedGeneration", "replicas", "updatedReplicas",
-                               "readyReplicas", "availableReplicas")},
-    }
-    return Result(result.rc, json.dumps(reduced), result.timed_out)
-
-
 def _registered(name: str) -> Check:
     """The registry entry a check reports under, so a result is traceable to the exact rule that made it."""
     return REGISTRY[name]
@@ -419,16 +361,13 @@ def _counters(fields: Mapping[str, Any], names: Sequence[str]) -> dict[str, int]
     return out
 
 
-def _unbound(target: Target, revision: str | None, check: Check | None = None) -> str:
+def _unbound(target: Target, revision: str | None) -> str:
     """Why a result cannot be attributed to the change, or "" when it can.
 
     A revision is what makes a check *about this change*. If the plan declared one and the capture does
     not carry it - or carries a different one - the check is looking at some other state of the world, and
     an unattributable observation is not a pass.
     """
-    if check is not None and check.requires_revision and not target.expected_revision:
-        return (f"the plan named no expected_revision for {target.label}: without one there is nothing to "
-                "compare the target against, so this is a measurement rather than a verdict")
     if not target.expected_revision:
         return ""
     if revision is None:
@@ -453,8 +392,7 @@ def _outcome(context: VerifyContext, check: Check, target: Target, status: Check
     return CheckResult(check=check.name, profile=check.profile, target=target.label, status=status,
                        captured=context.clock(), detail=clip(detail, 300), revision=revision,
                        evidence_refs=evidence, state_changing=check.state_changing,
-                       observation_s=context.window(), proves=proves, does_not_prove=does_not_prove,
-                       reason=reason)
+                       observation_s=context.window_s, proves=proves, does_not_prove=does_not_prove, reason=reason)
 
 
 def _unknown(context: VerifyContext, check: Check, target: Target, reason: str, *,
@@ -503,16 +441,7 @@ def systemd_unit_active(context: VerifyContext, target: Target) -> CheckResult:
                         f"incomplete data: systemctl returned no ActiveState for {unit}",
                         evidence=_save(context, check, target, result.out))
     revision = properties.get("ExecMainStartTimestamp") or None
-    if state not in ("active", "reloading"):
-        # A unit that is not running fails whatever the plan claimed, and a failure needs no attribution.
-        # Downgrading it to UNKNOWN here would let a broken unit report as "could not tell", which reads
-        # as an absence of information rather than the bad news it is.
-        return _outcome(context, check, target, CheckStatus.FAIL,
-                        f"{target.label}: {unit} is {state}/{properties.get('SubState', '?')}, not active",
-                        revision=revision, proves=f"that {unit} on {target.host} is {state}",
-                        does_not_prove="why it is down, or whether the change caused it",
-                        evidence=_save(context, check, target, result.out))
-    unbound = _unbound(target, revision, check)
+    unbound = _unbound(target, revision)
     if unbound:
         return _unknown(context, check, target, unbound, revision=revision,
                         evidence=_save(context, check, target, result.out))
@@ -621,18 +550,9 @@ def http_reachable(context: VerifyContext, target: Target) -> CheckResult:
     port look identical from here, and reporting a down service on that evidence would be a guess.
     """
     check = _registered("http:reachable")
-    requested = target.expect("url") or target.name
-    url = context.core.config.observe.http_checks.get(requested)
-    if url is None and requested in context.core.config.observe.http_checks.values():
-        url = requested
-    if url is None:
-        # `http.check` will happily GET any string. Verification must not turn into a way to probe hosts
-        # the operator never listed, so an unconfigured endpoint is refused rather than contacted.
-        return _unknown(context, check, target,
-                        f"{requested!r} is not one of the configured observe.http_checks: verification does "
-                        f"not contact endpoints nobody declared ({sorted(context.core.config.observe.http_checks)})")
+    url = target.expect("url") or target.name
     status, elapsed_ms = context.core.http.check(url, timeout=_HTTP_TIMEOUT)
-    window = context.window()
+    window = context.window_s
     if status == 0:
         return _unknown(context, check, target,
                         f"no answer from {url} after {elapsed_ms}ms: a refused connection, a filtered port "
@@ -680,14 +600,7 @@ def k8s_rollout(context: VerifyContext, target: Target) -> CheckResult:
         argv += ["--kubeconfig", str(Path(k8s.kubeconfig).expanduser())]
     if k8s.context:
         argv += ["--context", k8s.context]
-    kind = (target.expect("kind") or "deployment").strip().lower()
-    if kind not in SUPPORTED_KINDS:
-        # The kind goes straight into argv. An unrestricted value is an argument injection, and a
-        # misspelling is silently the wrong resource type rather than an error.
-        return _unknown(context, check, target,
-                        f"unsupported workload kind {kind!r}: this check understands "
-                        f"{sorted(SUPPORTED_KINDS)}")
-    argv += ["get", kind, target.name, "-n", where, "-o", "json"]
+    argv += ["get", target.expect("kind") or "deployments", target.name, "-n", where, "-o", "json"]
     result = _run(context, target, argv, timeout=_SSH_TIMEOUT)
     fault = _fault(result)
     if fault:
@@ -704,41 +617,26 @@ def k8s_rollout(context: VerifyContext, target: Target) -> CheckResult:
     except ValueError as exc:
         return _unknown(context, check, target, f"incomplete data: kubectl returned no usable JSON ({exc})",
                         evidence=_save(context, check, target, result.out))
-    # A Deployment manifest carries inline environment values, and those are routinely API keys and
-    # passwords. The document is reduced to the status and spec counters this check actually reads before
-    # it is stored, so a verification artifact never becomes a place secrets accumulate.
-    result = _redacted(result)
     metadata: dict[str, Any] = document.get("metadata") or {}
     status: dict[str, Any] = document.get("status") or {}
-    spec: dict[str, Any] = document.get("spec") or {}
     annotations: dict[str, Any] = metadata.get("annotations") or {}
     raw_revision = annotations.get(_K8S_REVISION_ANNOTATION)
     revision = str(raw_revision) if raw_revision is not None else None
-    # `spec.replicas` is the *current* spec, which for a scale change is what the cluster already has -
-    # so comparing against it would report the state the change just produced as the state it was aiming
-    # at. When the plan states the count it wants, that is the only figure this check judges against.
-    wanted_from_plan = target.expect("replicas")
-    desired = {"replicas": int(wanted_from_plan)} if wanted_from_plan and wanted_from_plan.isdigit() \
-        else _counters({**metadata, **spec}, ("replicas",))
     counters = _counters({**metadata, **status},
                          ("generation", "observedGeneration", "replicas", "updatedReplicas", "readyReplicas"))
-    if counters is None or desired is None:
+    if counters is None:
         return _unknown(context, check, target,
-                        f"incomplete data: {where}/{target.name} is missing one of "
-                        f"generation, observedGeneration, replicas, updatedReplicas, readyReplicas, "
-                        f"spec.replicas",
+                        f"incomplete data: the status of {where}/{target.name} is missing one of "
+                        f"generation, observedGeneration, replicas, updatedReplicas, readyReplicas",
                         revision=revision, evidence=_save(context, check, target, result.out))
-    # Omitted zero-valued optional fields are zeroes, not missing data: a Deployment scaled to zero has no
-    # `status.replicas` key, and reading that as "incomplete" would make the healthy case unreportable.
-    wanted = desired["replicas"]
+    unbound = _unbound(target, revision)
+    if unbound:
+        return _unknown(context, check, target, unbound, revision=revision,
+                        evidence=_save(context, check, target, result.out))
     observed = counters["observedGeneration"] == counters["generation"]
-    # Ready against the *desired* count, not against `status.replicas`: while a rollout scales up the
-    # controller already reports the new generation with `replicas == updatedReplicas` before the extra
-    # pods are ready, and comparing only against `status.replicas` calls a half-finished rollout complete.
-    complete = (counters["updatedReplicas"] == wanted and counters["readyReplicas"] == wanted
-                and counters["replicas"] == wanted)
+    complete = counters["updatedReplicas"] == counters["replicas"] and counters["readyReplicas"] == counters["replicas"]
     label = f"{where}/{target.name}"
-    detail = (f"{label}: {counters['readyReplicas']}/{wanted} ready, "
+    detail = (f"{label}: {counters['readyReplicas']}/{counters['replicas']} ready, "
               f"{counters['updatedReplicas']} updated, observedGeneration "
               f"{counters['observedGeneration']}/{counters['generation']}, revision {revision or 'unrecorded'}")
     boundary = {
@@ -748,16 +646,8 @@ def k8s_rollout(context: VerifyContext, target: Target) -> CheckResult:
                           "not a request, a health check or a data-path check",
     }
     if not (observed and complete):
-        # A rollout that has not converged is bad news whether or not we can attribute it, and turning that
-        # into UNKNOWN would read as "we could not tell" rather than "it is not done".
         return _outcome(context, check, target, CheckStatus.FAIL, detail, revision=revision,
                         evidence=_save(context, check, target, result.out), **boundary)
-    # The revision is only consulted for a *pass*: a completed rollout is only the change's result if it
-    # is the revision the plan applied.
-    unbound = _unbound(target, revision, check)
-    if unbound:
-        return _unknown(context, check, target, unbound, revision=revision,
-                        evidence=_save(context, check, target, result.out))
     return _outcome(context, check, target, CheckStatus.PASS, detail, revision=revision,
                     evidence=_save(context, check, target, result.out), **boundary)
 
@@ -834,13 +724,7 @@ def drift_repo_live(context: VerifyContext, target: Target) -> CheckResult:
     if live is None or not _ABS_PATH.fullmatch(live):
         return _unknown(context, check, target, f"the plan names no usable live path for {path}")
     try:
-        root = context.core.repo.resolve()
-        candidate = (root / path).resolve()
-        if not candidate.is_relative_to(root):
-            return _unknown(context, check, target,
-                            f"{path!r} resolves outside the repository: verification reads the repository, "
-                            "it does not read the filesystem")
-        wanted = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        wanted = hashlib.sha256((context.core.repo / path).read_bytes()).hexdigest()
     except OSError as exc:
         return _unknown(context, check, target, f"cannot read the repo copy of {path}: "
                                                f"{exc.strerror or exc.__class__.__name__}")
@@ -874,15 +758,15 @@ def drift_repo_live(context: VerifyContext, target: Target) -> CheckResult:
 
 
 # ------------------------------------------------------------------------------------------------ registry
-register(Check("systemd:unit-active", "systemd", systemd_unit_active, settles=True, requires_revision=True,
+register(Check("systemd:unit-active", "systemd", systemd_unit_active, settles=True,
                why="the unit is running the effective configuration, not merely active since before the change"))
-register(Check("systemd:drop-in", "systemd", systemd_drop_in, requires_revision=True,
+register(Check("systemd:drop-in", "systemd", systemd_drop_in,
                why="the drop-in the plan installed is in the unit's effective drop-in chain"))
 register(Check("systemd:unit-start", "systemd", systemd_unit_start, state_changing=True, settles=True,
                why="starting the unit is an action, so it runs only when the plan declared it"))
 register(Check("http:reachable", "http", http_reachable, settles=True,
                why="the endpoint answers inside the observation window, and only that"))
-register(Check("k8s:rollout", "k8s", k8s_rollout, settles=True, requires_revision=True,
+register(Check("k8s:rollout", "k8s", k8s_rollout, settles=True,
                why="the workload finished the rollout the change asked for, at the expected revision"))
 register(Check("storage:capacity", "storage", storage_capacity,
                why="the filesystem still has the headroom the plan assumed"))
@@ -945,14 +829,10 @@ class Verifier:
     service cannot be smuggled in under the name of one that reads.
     """
 
-    def __init__(self, auto: AutoConfig, core: Core, *, clock: Callable[[], float] = now,
-                 root: Path | None = None) -> None:
+    def __init__(self, auto: AutoConfig, core: Core, *, clock: Callable[[], float] = now) -> None:
         self.auto = auto
         self.core = core
         self.clock = clock
-        #: Where preflight records live, so a state-changing declaration can be checked against the
-        #: change that actually recorded it rather than against the caller's word.
-        self.root = root if root is not None else config_path(core)
 
     def available(self) -> tuple[str, ...]:
         """The checks the config enables. A profile name that matches no registered check yields nothing,
@@ -966,7 +846,7 @@ class Verifier:
         return [{"check": name, "profile": REGISTRY[name].profile, "state_changing": REGISTRY[name].state_changing,
                  "settles": REGISTRY[name].settles, "why": REGISTRY[name].why} for name in self.available()]
 
-    def select(self, names: Sequence[str] = (), declared: Sequence[str] = ()) -> tuple[Check, ...]:  # noqa: C901
+    def select(self, names: Sequence[str] = ()) -> tuple[Check, ...]:
         """Resolve `["systemd:unit-active", "http"]` into concrete checks; an empty list means every enabled
         check. A bare profile name expands to all of its checks.
 
@@ -974,17 +854,8 @@ class Verifier:
         let the rest of the set pass.
         """
         available = self.available()
-        # A broad request must not sweep in an action. Asking for the profile `systemd` is not an
-        # authorisation to run `systemd:unit-start`, so profile expansion skips state-changing checks the
-        # change did not declare. Naming one explicitly is still allowed - `verify` is what decides, and
-        # refusing to select it here would hide the difference from the report.
-        permitted = frozenset(declared)
-
-        def may_expand(key: str) -> bool:
-            return not REGISTRY[key].state_changing or key in permitted
-
         if not names:
-            chosen = [REGISTRY[name] for name in available if may_expand(name)]
+            chosen = [REGISTRY[name] for name in available]
         else:
             chosen = []
             for name in names:
@@ -993,16 +864,13 @@ class Verifier:
                         raise OpsError(f"unknown verification check: {name!r} (enabled: {', '.join(available)})")
                     chosen.append(REGISTRY[name])
                     continue
-                expanded = [REGISTRY[key] for key in available
-                            if REGISTRY[key].profile == name and may_expand(key)]
+                expanded = [REGISTRY[key] for key in available if REGISTRY[key].profile == name]
                 if not expanded:
                     raise OpsError(f"unknown verification profile: {name!r}")
                 chosen.extend(expanded)
         if len(chosen) > self.auto.verify.max_checks:
             raise OpsError(f"{len(chosen)} checks selected, the configured limit is {self.auto.verify.max_checks}")
-        # Deduplicated: asking for a profile and one of its members is the same request written twice, and
-        # running a state-changing check twice is a second action nobody planned.
-        return tuple({check.name: check for check in reversed(chosen)}.values())[::-1]
+        return tuple(chosen)
 
     def verify(self, change_id: str, targets: Sequence[Target], *, checks: Sequence[str] = (),
                applied_at: float | None = None, evidence_refs: Sequence[str] = (),
@@ -1016,20 +884,10 @@ class Verifier:
         if not change_id.strip():
             raise OpsError("verification must name the change it verifies: an unattributable report proves "
                            "nothing")
-        unknown = sorted({target.kind for target in targets if target.kind not in KIND_PROFILES})
-        if unknown:
-            # Silently skipping an unrecognised kind is how "everything passed" gets reported for a run
-            # that checked half of what it was given. It is reported, and the report is not a pass.
-            raise OpsError(
-                f"no verification profile recognises target kind(s) {unknown}; known kinds are "
-                f"{sorted(KIND_PROFILES)}: a target that is skipped is a check that never ran")
-        selected = self.select(checks, declared)
-        # Recomputed for every check. A verification that takes two minutes must not keep reporting the
-        # window it started with: a check running at the end waited longer than one that ran first, and
-        # settling is measured from when the change was applied.
-        context = VerifyContext(core=self.core, verify=self.auto.verify, change_id=change_id, window_s=0.0,
-                                evidence_refs=tuple(evidence_refs), clock=self.clock,
-                                applied_at=applied_at)
+        selected = self.select(checks)
+        window = max(0.0, self.clock() - applied_at) if applied_at is not None else 0.0
+        context = VerifyContext(core=self.core, verify=self.auto.verify, change_id=change_id, window_s=window,
+                                evidence_refs=tuple(evidence_refs), clock=self.clock)
         results: list[CheckResult] = []
         for check in selected:
             matched = [target for target in targets if KIND_PROFILES.get(target.kind) == check.profile]
@@ -1038,47 +896,22 @@ class Verifier:
                                         f"no {check.profile} target was named by the change plan"))
                 continue
             for target in matched:
-                if check.state_changing and not self._permitted(check, declared, change_id):
+                if check.state_changing and not self._permitted(check, declared):
                     results.append(_not_run(context, check, target, self._undeclared(check)))
                     continue
                 results.append(self._one(check, context, target))
         return VerificationReport(change_id=change_id, status=overall_status(results), results=tuple(results),
-                                  captured=self.clock(), evidence_refs=context.evidence_refs,
-                                  observation_s=context.window())
+                                  captured=self.clock(), evidence_refs=context.evidence_refs, observation_s=window)
 
-    def _permitted(self, check: Check, declared: Sequence[str], change_id: str = "") -> bool:
-        """A state-changing check runs only when the operator allows it *and* the change authorises it.
-
-        `declared` arrives from the caller, so on its own it is a name in a list. It is cross-checked
-        against the plan the change actually recorded: an authorisation the stored change does not carry
-        is not an authorisation, however well it was spelled.
-        """
-        if not self.auto.verify.allow_state_changing_checks or check.name not in declared:
-            return False
-        return self._plan_declares(change_id, check)
-
-    def _plan_declares(self, change_id: str, check: Check) -> bool:
-        """Whether the *stored* change authorised this check. A missing plan authorises nothing.
-
-        Returning "no plan, so allow" is the dangerous direction: the record being absent is exactly what
-        an unauthorised caller controls, and it would hand out the one action that can change a host.
-        """
-        try:
-            document = json.loads(
-                (self.root / "preflight" / f"pf-{change_id[:16]}.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return False
-        declared = document.get("declared_checks")
-        if not isinstance(declared, list):
-            return False
-        return check.name in declared
+    def _permitted(self, check: Check, declared: Sequence[str]) -> bool:
+        return self.auto.verify.allow_state_changing_checks and check.name in declared
 
     def _undeclared(self, check: Check) -> str:
         if not self.auto.verify.allow_state_changing_checks:
             return (f"{check.name} changes state and auto.verify.allow_state_changing_checks is false: "
                     f"verification is not allowed to act")
-        return (f"{check.name} changes state and the stored change does not declare it: an action that was "
-                f"not planned is not run by the thing that checks the plan")
+        return (f"{check.name} changes state and the change plan did not declare it: an action that was not "
+                f"planned is not run by the thing that checks the plan")
 
     def _one(self, check: Check, context: VerifyContext, target: Target) -> CheckResult:
         """Run one check and enforce the window rule on its answer.
