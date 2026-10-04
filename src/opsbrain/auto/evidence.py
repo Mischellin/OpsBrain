@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -129,12 +130,14 @@ class EvidenceLimits:
     max_age_s: float = 900.0
     require_target_identity: bool = True
     require_inventory_hash: bool = True
+    require_observation_time: bool = True
     max_bundle_bytes: int = 1_000_000
 
     @staticmethod
     def from_config(config: EvidenceConfig) -> EvidenceLimits:
         return EvidenceLimits(max_age_s=config.max_age_s, require_target_identity=config.require_target_identity,
                               require_inventory_hash=config.require_inventory_hash,
+                              require_observation_time=config.require_observation_time,
                               max_bundle_bytes=config.max_bundle_bytes)
 
     def to_dict(self) -> dict[str, Any]:
@@ -142,7 +145,9 @@ class EvidenceLimits:
         # keeps the literal), and a digest source that renders the same window as `900` one way and
         # `900.0` the other would make every bundle read back as tampered.
         return {"max_age_s": float(self.max_age_s), "require_target_identity": self.require_target_identity,
-                "require_inventory_hash": self.require_inventory_hash, "max_bundle_bytes": self.max_bundle_bytes}
+                "require_inventory_hash": self.require_inventory_hash,
+                "require_observation_time": self.require_observation_time,
+                "max_bundle_bytes": self.max_bundle_bytes}
 
 
 @dataclass(frozen=True)
@@ -161,11 +166,18 @@ class EvidenceEntry:
     command_id: str
     collector: str
     exit_status: int = 0
+    #: When the probe actually ran. `0` means the caller did not say, and the record then says so rather
+    #: than quietly dating the observation by the moment it reached us - otherwise a reading from last
+    #: night, submitted this morning, is indistinguishable from one taken thirty seconds ago.
+    observed_at: float = 0.0
+    #: When the observation was ingested. Recorded, but never used as the freshness clock.
     captured: float = field(default_factory=now)
     content_hash: str = ""
     bytes: int = 0
     artifact: str = ""
-    provenance: Provenance = Provenance.OBSERVED
+    #: Not OBSERVED by default. The service has to be told this was a probe rather than a retelling;
+    #: a claim that is never labelled is unknown, and unknown is not a source of evidence.
+    provenance: Provenance = Provenance.UNKNOWN
     change_id: str = ""
     content_retained: bool = True
     redactions: int = 0
@@ -176,13 +188,19 @@ class EvidenceEntry:
         """A non-zero exit is a real observation, not a collection failure: it is recorded, not retried away."""
         return self.exit_status == 0
 
+    @property
+    def observation_time_declared(self) -> bool:
+        return self.observed_at > 0
+
     def age_s(self, moment: float) -> float:
-        return max(0.0, moment - self.captured)
+        """How old the reading is, measured from when it was taken."""
+        return max(0.0, moment - (self.observed_at or self.captured))
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "kind": self.kind, "target": self.target, "capability": self.capability,
             "command_id": self.command_id, "collector": self.collector, "exit_status": self.exit_status,
+            "observed_at": round(self.observed_at, 3), "observation_time_declared": self.observed_at > 0,
             "captured": round(self.captured, 3), "content_hash": self.content_hash, "bytes": self.bytes,
             "artifact": self.artifact, "provenance": self.provenance.value, "change_id": self.change_id,
             "content_retained": self.content_retained, "redactions": self.redactions, "note": self.note,
@@ -201,7 +219,8 @@ class EvidenceEntry:
             kind=_text(data.get("kind")), target=_text(data.get("target")),
             capability=_text(data.get("capability")), command_id=_text(data.get("command_id")),
             collector=_text(data.get("collector")), exit_status=_int(data.get("exit_status")),
-            captured=_float(data.get("captured")), content_hash=_text(data.get("content_hash")),
+            observed_at=_float(data.get("observed_at")), captured=_float(data.get("captured")),
+            content_hash=_text(data.get("content_hash")),
             bytes=_int(data.get("bytes")), artifact=_text(data.get("artifact")), provenance=kind,
             change_id=_text(data.get("change_id")), content_retained=bool(data.get("content_retained", True)),
             redactions=_int(data.get("redactions")), note=_text(data.get("note")),
@@ -264,7 +283,7 @@ class EvidenceBundle:
             inventory_hash=inventory_hash, component_versions=dict(sorted((component_versions or {}).items())),
             collector=collector,
         )
-        return EvidenceBundle(**{**draft.__dict__, "id": f"ev-{draft.compute_digest()[:16]}",
+        return EvidenceBundle(**{**draft.__dict__, "id": id_for_digest(draft.compute_digest()),
                                  "digest": draft.compute_digest()})
 
     def as_digest_source(self) -> dict[str, Any]:
@@ -355,6 +374,7 @@ class EvidenceBundle:
         limits = EvidenceLimits(max_age_s=_float(raw_limits.get("max_age_s"), 900.0),
                                 require_target_identity=bool(raw_limits.get("require_target_identity", True)),
                                 require_inventory_hash=bool(raw_limits.get("require_inventory_hash", True)),
+                                require_observation_time=bool(raw_limits.get("require_observation_time", True)),
                                 max_bundle_bytes=_int(raw_limits.get("max_bundle_bytes"), 1_000_000))
         raw_entries = data.get("entries", [])
         if not isinstance(raw_entries, list):
@@ -393,7 +413,13 @@ class Observation:
     exit_status: int = 0
     collector: str = ""
     content: str = ""
-    provenance: Provenance = Provenance.OBSERVED
+    #: When the probe actually ran. `0` means the caller did not say, and the record then says so rather
+    #: than quietly dating the observation by the moment it reached us - otherwise a reading from last
+    #: night, submitted this morning, is indistinguishable from one taken thirty seconds ago.
+    observed_at: float = 0.0
+    #: Not OBSERVED by default. The service has to be told this was a probe rather than a retelling;
+    #: a claim that is never labelled is unknown, and unknown is not a source of evidence.
+    provenance: Provenance = Provenance.UNKNOWN
     change_id: str = ""
     note: str = ""
 
@@ -425,9 +451,20 @@ def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def id_for_digest(digest: str) -> str:
+    """The id a bundle with this digest must have. The only definition, shared by writer and checker."""
+    return f"ev-{digest[:16]}"
+
+
 def metadata_only(kind: str) -> bool:
-    """Whether a check of this kind is answerable from metadata, so its payload must never be collected."""
-    return kind in METADATA_ONLY_KINDS
+    """Whether a check of this kind is answerable from metadata, so its payload must never be collected.
+
+    Matched case-insensitively and after stripping. A set lookup on the raw string means `Secret`,
+    `SECRET` and ` secret ` all sail past the rule that exists to keep secret material out of the
+    record, and the content of a secret is exactly the sort of thing that arrives base64-wrapped and
+    case-shifted on the way in.
+    """
+    return kind.strip().casefold() in METADATA_ONLY_KINDS
 
 
 def check_evidence(bundle: EvidenceBundle, artifacts: Mapping[str, str] | None = None, *,
@@ -445,8 +482,16 @@ def check_evidence(bundle: EvidenceBundle, artifacts: Mapping[str, str] | None =
     unreadable = dict(blocked or {})
     failures: list[Check] = []
 
-    if bundle.digest != bundle.compute_digest():
+    computed = bundle.compute_digest()
+    if bundle.digest != computed:
         failures.append(Check(Reason.EVIDENCE_TAMPERED, "bundle digest does not match its contents"))
+    elif bundle.id != id_for_digest(computed):
+        # Checking the stored digest alone is not integrity: whoever rewrote the record can recompute the
+        # digest they stored. The id is the one value the writer could not have chosen after the fact -
+        # it is what the caller looked up this bundle by, so a mismatch means the record is not the record.
+        failures.append(Check(Reason.EVIDENCE_TAMPERED,
+                              f"bundle id {bundle.id!r} is not the id of its digest: the record was rewritten "
+                              "under a borrowed identity"))
     for artifact_id, why in sorted(unreadable.items()):
         failures.append(Check(Reason.EVIDENCE_TAMPERED, f"artifact {artifact_id}: {why}"))
     if not bundle.observed:
@@ -454,11 +499,24 @@ def check_evidence(bundle: EvidenceBundle, artifacts: Mapping[str, str] | None =
                               "no command evidence in this bundle: a worker claim is not an observation"))
 
     for entry in bundle.entries:
-        if expected_change and entry.change_id and entry.change_id != expected_change:
-            failures.append(Check(Reason.EVIDENCE_FOREIGN_CHANGE,
-                                  f"{entry.command_id} was captured for {entry.change_id}, "
-                                  f"not for {expected_change}"))
-        if entry.target and entry.target not in bundle.targets:
+        if expected_change and entry.change_id != expected_change:
+            # The empty case matters: `entry.change_id and entry.change_id != expected_change` lets an
+            # unbound entry satisfy a check for any change at all, which is how evidence collected before
+            # anyone had planned anything gets cited as support for a plan.
+            if not entry.change_id:
+                failures.append(Check(Reason.EVIDENCE_FOREIGN_CHANGE,
+                                      f"{entry.command_id} is not bound to a change, so it cannot support "
+                                      f"a decision about {expected_change}"))
+            else:
+                failures.append(Check(Reason.EVIDENCE_FOREIGN_CHANGE,
+                                      f"{entry.command_id} was captured for {entry.change_id}, "
+                                      f"not for {expected_change}"))
+        if not entry.target:
+            if bundle.targets:
+                failures.append(Check(Reason.TARGET_NOT_IN_SCOPE,
+                                      f"{entry.command_id} names no target, so it cannot be inside the "
+                                      f"declared scope {list(bundle.targets)}"))
+        elif entry.target not in bundle.targets:
             failures.append(Check(Reason.TARGET_NOT_IN_SCOPE,
                                   f"{entry.command_id} ran against {entry.target!r}, "
                                   f"which is not in the declared target set"))
@@ -466,7 +524,14 @@ def check_evidence(bundle: EvidenceBundle, artifacts: Mapping[str, str] | None =
             failures.append(Check(Reason.EVIDENCE_INCOMPLETE,
                                   f"{entry.command_id} does not identify the host or cluster it ran on"))
         if not entry.artifact:
-            continue  # metadata-only entry or a claim: there is nothing on disk to re-hash
+            # A claim, or a metadata-only entry, has nothing to re-hash - fine. An entry that says it
+            # kept its output but names no artifact has produced no evidence at all, and skipping it
+            # silently is how a bundle with no command output gets reported as fresh.
+            if entry.content_retained and entry.provenance is Provenance.OBSERVED:
+                failures.append(Check(Reason.EVIDENCE_MISSING,
+                                      f"{entry.command_id} claims to have kept its output but names no "
+                                      "artifact: there is nothing to re-read"))
+            continue
         text = artifacts.get(entry.artifact) if artifacts is not None else None
         if text is None:
             failures.append(Check(Reason.EVIDENCE_MISSING,
@@ -479,11 +544,18 @@ def check_evidence(bundle: EvidenceBundle, artifacts: Mapping[str, str] | None =
     if bundle.limits.require_inventory_hash and not bundle.inventory_hash:
         failures.append(Check(Reason.EVIDENCE_INCOMPLETE, "no inventory revision: the bundle is not tied to a state"))
 
-    oldest = min([bundle.created, *(entry.captured for entry in bundle.entries)])
+    # Freshness is measured from when the probe *ran*, not from when its result reached us. A reading
+    # collected yesterday morning and handed over just now is a day old however recently it was submitted.
+    undated = [entry.command_id for entry in bundle.entries if not entry.observation_time_declared]
+    if undated and bundle.limits.require_observation_time:
+        failures.append(Check(Reason.EVIDENCE_INCOMPLETE,
+                              f"no observation time declared for {', '.join(sorted(undated)[:4])}: the "
+                              "freshness window cannot be evaluated from the moment of ingestion alone"))
+    oldest = min([bundle.created, *(entry.observed_at or entry.captured for entry in bundle.entries)])
     age = moment - oldest
     if age > bundle.limits.max_age_s:
         failures.append(Check(Reason.EVIDENCE_STALE,
-                              f"captured {age:.0f}s ago, over the {bundle.limits.max_age_s:.0f}s freshness window"))
+                              f"observed {age:.0f}s ago, over the {bundle.limits.max_age_s:.0f}s freshness window"))
     elif age < 0:
         failures.append(Check(Reason.EVIDENCE_INCOMPLETE, "capture time is in the future: clocks disagree"))
 
@@ -757,27 +829,54 @@ class EvidenceCollector:
             raise EvidenceError("no capabilities are allowed: evidence collection needs a policy first")
         if observation.capability not in self.allowed:
             raise EvidenceError(f"capability {observation.capability!r} is not an allowed probe")
-        note = redact_text(observation.note)[:400]
+        # Framed into one line with the region delimiters removed: the note is the label the
+        # reader sees, and a label that can close the fence undoes the fence.
+        note = _identity_field(observation.note)[:400]
         # Floored for the same reason as the bundle's `created`: the digest covers the persisted document,
         # and flooring keeps a capture from appearing to be in the future.
         moment = _floor_ms(now())
         if metadata_only(observation.kind):
             # The content is never hashed, never stored and never returned: not even its hash, which would
             # be a fingerprint of the secret itself.
-            return EvidenceEntry(kind=observation.kind, target=observation.target,
-                                 capability=observation.capability, command_id=observation.command_id,
-                                 collector=observation.collector or collector, exit_status=observation.exit_status,
-                                 captured=moment, content_hash="", bytes=0, artifact="",
-                                 provenance=observation.provenance,
-                                 change_id=observation.change_id or self.change_id, content_retained=False,
-                                 note=note)
+            return EvidenceEntry(**_identity(observation, collector), exit_status=observation.exit_status,
+                                 observed_at=observation.observed_at, captured=moment, content_hash="", bytes=0,
+                                 artifact="", change_id=_identity_field(observation.change_id, self.change_id),
+                                 content_retained=False, note=note)
         artifact = self.store.save_artifact(observation.content)
-        return EvidenceEntry(kind=observation.kind, target=observation.target, capability=observation.capability,
-                             command_id=observation.command_id, collector=observation.collector or collector,
-                             exit_status=observation.exit_status, captured=moment,
+        return EvidenceEntry(**_identity(observation, collector), exit_status=observation.exit_status,
+                             observed_at=observation.observed_at, captured=moment,
                              content_hash=artifact.content_hash, bytes=artifact.bytes, artifact=artifact.id,
-                             provenance=observation.provenance, change_id=observation.change_id or self.change_id,
+                             change_id=_identity_field(observation.change_id, self.change_id),
                              content_retained=True, redactions=artifact.redactions, note=note)
+
+
+#: The framing text a model reads as structure. Every field that ends up in a label or a header goes
+#: through here: these strings come from the same untrusted worker as the payload, and the payload is
+#: already confined to a marked region - a delimiter in the *label* would close that region just as well.
+_FRAMING = re.compile(r"[\r\n]+")
+
+
+def _identity_field(value: str, fallback: str = "") -> str:
+    """One line, redacted, with the region delimiters defused. Never more than a short label."""
+    text = redact_text(_FRAMING.sub(" ", value or fallback or ""))[:200]
+    return text.replace(BEGIN_MARK, "").replace(END_MARK, "").strip()
+
+
+def _identity(observation: Observation, collector: str) -> dict[str, Any]:
+    """The descriptive fields of an entry, redacted and flattened.
+
+    `target`, `collector` and `command_id` are worker-supplied, are written to disk, and come back through
+    `summary()` and `list()`. Leaving them unredacted means a secret pasted into a hostname reaches the
+    API response having never been near the payload, which is where the redaction story is supposed to hold.
+    """
+    return {
+        "kind": _identity_field(observation.kind, ""),
+        "target": _identity_field(observation.target, ""),
+        "capability": _identity_field(observation.capability, ""),
+        "command_id": _identity_field(observation.command_id, ""),
+        "collector": _identity_field(observation.collector, "") or _identity_field(collector, ""),
+        "provenance": observation.provenance,
+    }
 
 
 def _text(value: Any, default: str = "") -> str:
