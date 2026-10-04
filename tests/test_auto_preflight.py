@@ -748,11 +748,14 @@ def test_a_plan_cannot_have_its_versions_edited_after_construction() -> None:
     shown one set of versions while the stored hash vouches for another - the same defect class the
     evidence bundle had, reproduced by copying the pattern instead of the invariant.
     """
-    plan = good_plan()
+    # A fixed `created`, so the two plans differ only if the edit actually got through. Left to the clock,
+    # the comparison was a coin flip: `plan_hash` covers `created`, and two calls a millisecond apart hash
+    # differently, so this failed intermittently and taught everyone to re-run a red build.
+    plan = good_plan(created=1_700_000_000.0)
     with pytest.raises(TypeError):
         plan.versions["systemd"] = "999"  # type: ignore[index]
     assert "999" not in json.dumps(plan.to_dict())
-    assert plan.plan_hash == good_plan().plan_hash
+    assert plan.plan_hash == good_plan(created=1_700_000_000.0).plan_hash
 
 
 def test_no_frozen_record_in_the_pipeline_carries_a_mutable_mapping() -> None:
