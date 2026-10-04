@@ -164,18 +164,24 @@ class ChangeStore:
     # `Sequence`, not `list`: inside this class body the bare name `list` is `ChangeStore.list`, so a
     # `list[str]` annotation here is not a type at all and mypy is right to say so.
     def record_decision_inputs(self, change_id: str, *, evidence_ids: Sequence[str], policy_version: str,
-                              plan_id: str, decision: str, arguments_hash: str = "") -> Change:
+                              plan_id: str, decision: str, arguments_hash: str = "",
+                              decision_record: dict[str, Any] | None = None) -> Change:
         """Record what the decision engine decided against, so the gate can check it later.
 
         Without this the gate had two options, both bad: trust the binding's own evidence list (which
         proves nothing) or skip the comparison. The recorded values are what `stale_reasons` later
         compares the binding to, so a change edited after the decision reads as stale.
+
+        `decision_record` is the whole record - reason, review references, verification status, attempts,
+        id. Persisting it is what makes the approval traceable after a restart: without it, the only
+        surviving artefact is a binding, and nobody can say afterwards *why* the execution was allowed.
         """
         with self._transition(change_id):
             change = self.get(change_id)
             change.details = {**change.details, "evidence_ids": list(evidence_ids),
                               "policy_version": policy_version, "plan_id": plan_id,
-                              "decision": decision, "arguments_hash": arguments_hash}
+                              "decision": decision, "arguments_hash": arguments_hash,
+                              **({"decision_record": decision_record} if decision_record else {})}
             self._save(change)
         return change
 

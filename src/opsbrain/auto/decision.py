@@ -489,7 +489,7 @@ class ApprovalEngine:
         self.changes.record_decision_inputs(
             binding.change_id, evidence_ids=list(binding.evidence_ids),
             policy_version=binding.policy_version, plan_id=plan_id, decision=record.decision.value,
-            arguments_hash=binding.arguments_hash)
+            arguments_hash=binding.arguments_hash, decision_record=record.to_dict())
         return approval_id
 
     # ----------------------------------------------------------------------------------------- audit

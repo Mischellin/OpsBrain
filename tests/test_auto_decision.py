@@ -792,3 +792,25 @@ def test_an_unreported_review_count_blocks_when_the_profile_requires_more() -> N
     record = strict.decide(inputs(reviews_passed=0), "pl-1", "ah-1", review_ids=("rv-0000abcd",))
     assert record.decision is Decision.BLOCKED_AUTONOMOUSLY
     assert "required" in record.detail
+
+
+def test_an_issued_approval_stays_traceable_to_its_decision(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """After a restart the binding is all that survives, and a binding says nothing about *why*.
+
+    The record - reason, review references, verification status, attempt count, id - is the evidence that
+    explains why the execution was allowed, so it has to outlive the process that made it.
+    """
+    _ops, engine = _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"})
+    record = decide_for(change, by=engine)
+    issue_for(engine, change, bound_for(change), record=record)
+
+    # A fresh reader, as after a restart: nothing but the change store.
+    stored = ops.changes.get(change.id).details["decision_record"]
+    assert stored["id"] == record.id
+    assert stored["reason"] == record.reason.value
+    assert stored["review_refs"] == list(record.review_ids)
+    assert stored["verification"] == CheckStatus.PASS.value
+    assert stored["attempts"] == record.attempts
+    assert stored["plan"] == record.plan_id
