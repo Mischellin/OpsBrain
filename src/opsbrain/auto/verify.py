@@ -204,6 +204,24 @@ class VerificationReport:
     def is_pass(self) -> bool:
         return self.status is CheckStatus.PASS
 
+    @classmethod
+    def from_dict(cls, document: dict[str, Any]) -> VerificationReport:
+        """Rebuild a report from its own `to_dict` shape, as a tool response hands it back.
+
+        `change_id` is honoured as given, so a caller that reads a report back can re-attach it to the
+        change it was about. The decision engine forces the id to the change it is deciding, because
+        binding a report to the right change is the engine's job and not the caller's.
+        """
+        return cls(change_id=str(document.get("change_id", "")),
+                   status=CheckStatus(str(document.get("status", CheckStatus.NOT_RUN.value))),
+                   results=tuple(CheckResult(**{**row, "status": CheckStatus(str(row["status"])),
+                                                "evidence_refs": tuple(row.get("evidence_refs", ())),
+                                                "revision": row.get("revision")})
+                                 for row in document.get("results", ())),
+                   captured=float(document.get("captured", 0.0)),
+                   evidence_refs=tuple(document.get("evidence_refs", ())),
+                   observation_s=float(document.get("observation_s", 0.0)))
+
     def by_status(self) -> dict[str, int]:
         counts: dict[str, int] = {}
         for result in self.results:

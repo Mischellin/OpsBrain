@@ -152,7 +152,7 @@ class ChangeStore:
     # `Sequence`, not `list`: inside this class body the bare name `list` is `ChangeStore.list`, so a
     # `list[str]` annotation here is not a type at all and mypy is right to say so.
     def record_decision_inputs(self, change_id: str, *, evidence_ids: Sequence[str], policy_version: str,
-                              plan_id: str, decision: str) -> Change:
+                              plan_id: str, decision: str, arguments_hash: str = "") -> Change:
         """Record what the decision engine decided against, so the gate can check it later.
 
         Without this the gate had two options, both bad: trust the binding's own evidence list (which
@@ -163,7 +163,7 @@ class ChangeStore:
             change = self.get(change_id)
             change.details = {**change.details, "evidence_ids": list(evidence_ids),
                               "policy_version": policy_version, "plan_id": plan_id,
-                              "decision": decision}
+                              "decision": decision, "arguments_hash": arguments_hash}
             self._save(change)
         return change
 

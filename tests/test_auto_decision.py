@@ -319,17 +319,26 @@ def test_the_engine_has_no_way_to_be_persuaded() -> None:
 # ===================================================================== the gate: the executor may not skip the engine
 def _autonomous_ops(ops: Any, tmp_path: Any, **decision: Any) -> tuple[Any, ApprovalEngine]:
     """An `OpsBrain` whose pipeline is on and autonomous, so the gate is actually installed."""
-    from opsbrain.auto.approval import ApprovalStore
-    from opsbrain.auto.decision import ApprovalEngine
+    from opsbrain.auto.approval import ApprovalStore  # noqa: F401  (used by the standalone tests)
+    from opsbrain.auto.runners import FakeReviewer
+    from opsbrain.auto.service import AutoService
 
-    auto = type(ops.config.auto)(enabled=True, autonomy_token=TOKEN,
+    # runner `codex` with a stub reviewer injected: the default runner is named `fake`, and the stub guard
+    # refuses to let a fake stand in for a paid reviewer. Naming it `codex` is what lets the pipeline be
+    # exercised without spending a token.
+    auto = type(ops.config.auto)(enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
                                  decision={"mode": "autonomous", **decision})
     # `Config` is frozen too, so the pipeline is switched on by building a new one rather than by
     # assigning into it - which is also what an operator does when they edit the YAML.
     ops.config = ops.config.model_copy(update={"auto": auto})
-    # One engine for both the gate and the issuing side: two ApprovalStores would each be looking at a
-    # different directory, and the gate would refuse an approval it cannot see.
-    engine = ApprovalEngine(auto, ApprovalStore(tmp_path / "approvals"))
+    # `Core` built the service and installed the gate from the *old* config, so both have to be rebuilt.
+    # Leaving the old gate in place would have it answer from a config where the pipeline is switched
+    # off, and the apply at the end of the end-to-end test would stop at the human prompt.
+    ops.auto = AutoService(ops.config, reviewer=FakeReviewer())
+    ops.auto.core = ops  # `Core` does this at construction; the rebuilt service needs it told
+    # The service owns one engine and one approval store, and the gate is the same object that issues -
+    # two engines over two directories would have the gate refuse an approval it cannot see.
+    engine = ops.auto.engine()
     engine.install(ops.changes)
     return ops, engine
 
@@ -479,8 +488,7 @@ def test_an_engine_that_was_never_installed_refuses_to_issue(tmp_path: Any) -> N
 
 def test_manual_mode_leaves_the_human_path_working(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
     """The gate must not make the two-gate manual workflow impossible - that is the operator's escape hatch."""
-    from opsbrain.auto.approval import ApprovalStore
-    from opsbrain.auto.decision import ApprovalEngine
+    from opsbrain.auto.approval import ApprovalStore  # noqa: F401  (used by the standalone tests)
 
     ApprovalEngine(ops.config.auto, ApprovalStore(tmp_path / "approvals")).install(ops.changes)
     change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1")
@@ -610,3 +618,91 @@ def test_an_engine_approved_destructive_change_applies_without_a_human_flag(ops,
     ops.exec.on(r"tofu apply", "@@OPSBRAIN-PLAN-MISMATCH " + "ab" * 32 + "@@\n", rc=78)
     out = ops.tofu_apply(change.id)
     assert out["plan_changed"] is True, "the destructive check was satisfied by the engine's approval"
+
+
+# ---------------------------------------------------------------------------- the end-to-end criterion
+def _bundle(ops: Any, tmp_path: Any) -> str:
+    """A real evidence bundle, collected through the service.
+
+    The engine refuses a decision that cites no evidence, and preflight calls an `ev-` reference nobody can
+    resolve a structural gap. Both are correct, so the end-to-end path has to carry actual observations
+    rather than a plausible-looking id.
+    """
+    from opsbrain.auto.evidence import Observation, Provenance
+    from opsbrain.util import now
+
+    bundle = ops.auto.collect_evidence(
+        "restart logrotate on web-1",
+        [Observation(kind="log", target="web-1", capability="log.journal",
+                     command_id="log.journal@web-1", collector="ssh:ops@10.0.0.42",
+                     content="logrotate.timer: active (running)\n",
+                     provenance=Provenance.OBSERVED, observed_at=now())],
+        allowed=("log.journal",), targets=["web-1"], inventory_hash="inv-9f8e7d6c5b4a3928")
+    return bundle["id"] if isinstance(bundle, dict) else bundle.id
+
+
+def _plan_for_change(target: str = "proxmox", bundle_id: str = ""):
+    """A complete, reviewable plan naming one target.
+
+    `changes` cannot be empty - a plan with no changes is not a plan - so the shape here is the real one
+    the pipeline sees, only with a single target so the refusal test can name a different one.
+    """
+    from opsbrain.auto.plan import ChangePlan, ProposedChange, Reversibility
+
+    return ChangePlan.build(
+        objective="restart logrotate on web-1",
+        diagnosis="the timer is enabled but its drop-in directory is wrong, so the unit runs with the "
+                  "distribution defaults and never rotates",
+        changes=[ProposedChange(capability="ansible.apply", target=target,
+                                how="install a logrotate drop-in", reversible=Reversibility.ROLLBACK,
+                                undo="rm -f /etc/logrotate.d/web && systemctl daemon-reload")],
+        evidence_refs=[bundle_id] if bundle_id else [], evidence_bundle=bundle_id, targets=[target],
+        versions={"systemd": "252"},
+        post_checks=["systemctl show logrotate.service -p FragmentPath,DropInPaths"],
+        preconditions=["web-1 is reachable"], rollback="systemctl revert logrotate",
+        created=1_700_000_000.0)
+
+
+def test_a_decided_change_applies_without_any_human_step(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The whole point, end to end: plan → review → preflight → decision → approval → apply.
+
+    Nothing here calls `opsbrain approve`. The engine decides, issues, and the executor's gate accepts the
+    approval it issued - which is the only arrangement in which "autonomous" means anything.
+    """
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path))
+    reviewed = ops.auto.review_plan(plan)
+    assert reviewed["outcome"] == "approvable", {"note": reviewed.get("note"),
+                                                 "gaps": reviewed.get("structural_gaps")}
+    decided = ops.auto.decide_change(change.id, plan.id)
+    assert decided["decision"]["decision"] == "APPROVE", decided
+    assert decided.get("approval", "").startswith("ap-")
+
+    ops.exec.on(r"tofu apply", "Apply complete! Resources: 0 added, 1 changed, 0 destroyed.\n"
+                                "@@OPSBRAIN-POSTPLAN 0@@\n")
+    applied = ops.tofu_apply(change.id)
+    assert applied["ok"] is True, applied
+
+
+def test_a_change_against_a_target_the_plan_never_named_is_refused(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The review covers the targets the plan names, and nothing else."""
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "prod", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path))
+    ops.auto.review_plan(plan)
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY"
+    assert "prod" in out["decision"]["detail"]
+
+
+def test_a_change_with_no_reviewed_plan_cannot_be_decided(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Deciding needs something to decide about. Silence is not consent."""
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1")
+    with pytest.raises(OpsError, match="no preflight record"):
+        ops.auto.decide_change(change.id, "pl-nonexistent")

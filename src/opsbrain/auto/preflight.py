@@ -99,6 +99,35 @@ class PreflightResult:
     def approvable(self) -> bool:
         return self.outcome is Outcome.APPROVABLE and not self.structural_gaps
 
+    @classmethod
+    def from_record(cls, record: dict[str, Any]) -> PreflightResult:
+        """Rebuild a result from its own stored `to_dict` shape.
+
+        The stored document names things for the reader - `plan`, `review` - while the dataclass names them
+        for the constructor. Assembling the dataclass from the document by matching field names picks up
+        nothing and then fails on the two required fields, which is a confusing way to learn that the two
+        vocabularies differ.
+        """
+        return cls(
+            plan_id=str(record.get("plan", "")),
+            outcome=Outcome(str(record.get("outcome", Outcome.INCOMPLETE.value))),
+            reason=str(record.get("reason", "")),
+            review_id=str(record.get("review", "")),
+            review_status=RunnerStatus(str(record.get("review_status", RunnerStatus.OK.value))),
+            verdict=Verdict(record["verdict"]) if record.get("verdict") else None,
+            findings=tuple(record.get("findings", ())),
+            unverified_claims=tuple(record.get("unverified_claims", ())),
+            requested_probes=tuple(record.get("requested_probes", ())),
+            state_changing_probes=tuple(record.get("state_changing_probes", ())),
+            structural_gaps=tuple(record.get("structural_gaps", ())),
+            declared_checks=tuple(record.get("declared_checks", ())),
+            evidence_ids=tuple(record.get("evidence_ids", ())),
+            arguments_hash=str(record.get("arguments_hash", "")),
+            plan_hash=str(record.get("plan_hash", "")),
+            created=float(record.get("created", 0.0)),
+            note=str(record.get("note", "")),
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "plan": self.plan_id,

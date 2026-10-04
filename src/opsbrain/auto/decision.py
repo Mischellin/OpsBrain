@@ -218,10 +218,14 @@ class ApprovalEngine:
         change edited after the decision is stale on both counts.
         """
         recorded = list(change.details.get("evidence_ids") or ())
+        # Derived from the change's own `args` whenever it has any. Preferring a recorded value would make
+        # an approval survive an edit to the change: the record would keep asserting the arguments the
+        # decision was about while the change described something else. The recorded value is the fallback
+        # for a change with no arguments of its own.
+        derived = digest({key: value for key, value in sorted(change.args.items())}) if change.args else ""
         return {
             "plan_hash": change.hash,
-            "arguments_hash": digest({key: value for key, value in sorted(change.args.items())})
-            if change.args else "",
+            "arguments_hash": derived or str(change.details.get("arguments_hash") or ""),
             "subject": f"{change.capability}:{change.target}",
             "targets": [change.target],
             "evidence_ids": recorded,
@@ -456,7 +460,8 @@ class ApprovalEngine:
         approval_id = self.approvals.issue(binding).id
         self.changes.record_decision_inputs(
             binding.change_id, evidence_ids=list(binding.evidence_ids),
-            policy_version=binding.policy_version, plan_id=plan_id, decision=record.decision.value)
+            policy_version=binding.policy_version, plan_id=plan_id, decision=record.decision.value,
+            arguments_hash=binding.arguments_hash)
         return approval_id
 
     # ----------------------------------------------------------------------------------------- audit

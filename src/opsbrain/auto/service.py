@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..audit import AuditLog
 from ..util import OpsError, new_id
-from .approval import ApprovalStore
+from .approval import ApprovalStore, binding_for
 from .config import AutoConfig
 from .decision import ApprovalEngine
 from .evidence import EvidenceBundle, EvidenceCollector, EvidenceStore, Observation, check_evidence, passed, reason_code
@@ -462,6 +462,95 @@ class AutoService:
         self.audit.record(event="verified", change=change_id, status=report.status.value,
                           checks=len(report.results), observation_s=round(report.observation_s, 3))
         return report.brief()
+
+    def decide_change(self, change_id: str, plan_id: str, *,
+                      verification: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Ask the engine about one pending change, and issue the approval if it says yes.
+
+        This is the step that makes the autonomous path reachable at all. Everything before it - the
+        review, the preflight, the evidence - produces facts; without something that gathers them and asks
+        the deterministic engine, the gate in front of the executor has nothing to accept and every
+        operation goes to a human.
+
+        Both ids are named explicitly. The change store and the preflight store key different things and
+        do not link them, so guessing which plan a change belongs to would mean deciding about a document
+        nobody named.
+
+        Every `Inputs` field is gathered from stored state, not from the caller. A caller-supplied
+        `policy_allows` or `review_verdict` would be the caller deciding on the engine's behalf, which is
+        the one thing the engine exists to prevent. What the caller may add is the verification report,
+        because the checks can only be run after something has been applied.
+        """
+        # Imported here, not at module scope: `config` imports this package, so a top-level import of
+        # `Access` closes a cycle.
+        from ..config import Access
+        from .decision import Inputs
+
+        self.guard_enabled()
+        if self.core is None:
+            raise OpsError("deciding needs a Core; build OpsBrain, not AutoService alone")
+        change = self.core.changes.get(change_id)
+        record = self.preflight().get_by_plan(plan_id)
+        plan = ChangePlan.from_dict(record["plan_document"])
+        result = PreflightResult.from_record(record)
+        if plan.targets and change.target not in plan.targets:
+            # The review covers the targets the plan names. A change against a target the plan never
+            # mentioned is authorised by a document that did not describe it.
+            return self._decision_refused(change_id, plan_id,
+                                          f"the plan names {', '.join(plan.targets)} and not "
+                                          f"{change.target!r}", review_id=result.review_id)
+        access = self.core.require(change.capability, change.target)
+        report = self._report_from(change_id, verification) if verification else None
+        inputs = Inputs(
+            mode=self.auto.decision.mode,
+            preflight_outcome=result.outcome,
+            preflight_reason=result.reason,
+            preflight_approvable=result.approvable,
+            evidence_reason="evidence_fresh" if result.evidence_ids else "evidence_missing",
+            evidence_ids=tuple(result.evidence_ids),
+            review_verdict=result.verdict.value if result.verdict else "",
+            review_status=result.review_status.value,
+            policy_allows=access is not Access.DENY,
+            target_in_scope=bool(change.target),
+            destructive=bool(change.dangerous),
+            verification=report,
+            policy_version=self.auto.decision.policy_version,
+        )
+        review_ids = (result.review_id,) if result.review_id else ()
+        # The change record is the authority for what an approval covers, so it is what both the record
+        # and the binding name. The plan's own `arguments_hash` travels in the record for audit; the two
+        # vocabularies are different, and pretending they are one would let them silently disagree.
+        from ..changes import digest as _digest
+
+        arguments = _digest({key: value for key, value in sorted(change.args.items())}) if change.args else ""
+        decision = self.engine().decide(inputs, plan_id, arguments, change_id=change_id,
+                                        review_ids=review_ids)
+        self.audit.record(event="decision", change=change_id, decision=decision.decision.value,
+                          reason=decision.reason.value, plan=plan_id, review=result.review_id)
+        out: dict[str, Any] = {"decision": decision.brief()}
+        if not decision.approvable:
+            return out
+        binding = binding_for(change, evidence_ids=result.evidence_ids,
+                              policy_version=self.auto.decision.policy_version,
+                              arguments_hash=arguments)
+        approval = self.engine().issue(plan_id, arguments, binding, record=decision)
+        self.core.changes.attach_approval(change_id, approval)
+        return {**out, "approval": approval, "next": f"apply change {change_id}; no human step is required"}
+
+    def _decision_refused(self, change_id: str, plan_id: str, detail: str, *,
+                          review_id: str = "") -> dict[str, Any]:
+        """A refusal recorded as a decision, so the audit trail has the same shape either way."""
+        self.audit.record(event="decision", change=change_id, decision="BLOCKED_AUTONOMOUSLY",
+                          reason="plan_changed", plan=plan_id, review=review_id)
+        return {"decision": {"decision": "BLOCKED_AUTONOMOUSLY", "reason": "plan_changed", "detail": detail}}
+
+    def _report_from(self, change_id: str, document: dict[str, Any]) -> VerificationReport:
+        """Rebuild a report the caller read back from `verify_change`, bound to this change.
+
+        The id is forced to the change being decided. Taking it from the document would let a PASS for one
+        change be supplied while deciding another - the report would be accepted as proof of this one.
+        """
+        return VerificationReport.from_dict({**document, "change_id": change_id})
 
     def verify_overview(self) -> dict[str, Any]:
         if self.core is None:

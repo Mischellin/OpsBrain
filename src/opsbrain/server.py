@@ -173,9 +173,9 @@ def build_server(ops: OpsBrain) -> MCPServer:
     @server.tool()
     def autonomy(action: Literal[  # noqa: A002
         "status", "capabilities", "reviews", "evidence", "bundles", "verify_evidence", "reasons", "checks",
-        "verify-plan"
-    ] = "status", limit: int = 20, id: str | None = None) -> str:
-        """Autonomous pipeline, read-only.
+        "verify-plan", "decide"
+    ] = "status", limit: int = 20, id: str | None = None, plan: str | None = None) -> str:
+        """Autonomous pipeline, read-only, except `decide`.
 
         status: switches, mode, budget, evidence and verification overview
         capabilities: is the reviewer runnable; never claims a model it could not check
@@ -184,8 +184,10 @@ def build_server(ops: OpsBrain) -> MCPServer:
         reasons: every reason code the pipeline can emit
         checks: what verification can demand, each with its own statement of purpose
         verify-plan: verify a change from the targets its own plan declared
+        decide: ask the engine about a pending change and, on APPROVE, issue the approval it authorises.
+            Needs `id` (the change) and `plan` (the reviewed plan); the apply then needs no human step.
         """
-        return ops.call("autonomy", {"action": action, "id": id}, lambda: _dispatch(action, {
+        return ops.call("autonomy", {"action": action, "id": id, "plan": plan}, lambda: _dispatch(action, {
             "status": ops.auto.overview,
             "capabilities": lambda: ops.auto.reviews.capabilities(),
             "reviews": lambda: {"items": ops.auto.reviews.list(limit)},
@@ -195,7 +197,8 @@ def build_server(ops: OpsBrain) -> MCPServer:
             "reasons": lambda: {"reasons": list(REASON_CODES)},
             "checks": lambda: {"observation": ops.auto.verify_overview(),
                                "available": ops.auto.verification_checks()},
-            "verify-plan": lambda: ops.auto.verify_plan(_need(id, "id"))}))
+            "verify-plan": lambda: ops.auto.verify_plan(_need(id, "id")),
+            "decide": lambda: ops.auto.decide_change(_need(id, "id"), _need(plan, "plan"))}))
 
     return server
 

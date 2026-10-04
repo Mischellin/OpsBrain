@@ -470,11 +470,18 @@ def _locked(path: Path) -> Iterator[None]:
 
 def binding_for(change: Any, *, evidence_ids: Sequence[str] = (), policy_version: str,
                 profile: str = "general", expires_s: float = 3600.0,
+                arguments_hash: str | None = None,
                 evidence_expires_in_s: float | None = None) -> ApprovalBinding:
     """Build the binding for an existing `Change`, so a caller cannot quietly leave a field empty.
 
     Every one of the five inputs is taken from the change record itself rather than from the caller: a
     binding assembled from arguments the caller supplies is a binding the caller chose.
+
+    `arguments_hash` is the one exception, and it exists because the change store and the plan store do not
+    speak the same vocabulary. A decision is made about a *plan*, whose arguments hash the review saw; the
+    binding covers a *change*, whose `args` is a dictionary the two would have to agree on a definition of.
+    When the caller has a reviewed plan's hash, that is the value both sides must use, and it is recorded
+    on the change at issuance so the gate checks against it later.
 
     `evidence_expires_in_s` caps the approval at the moment its own evidence goes stale. The defaults put
     the two an order of magnitude apart - evidence fresh for 900s, an approval good for 3600s - so without
@@ -489,7 +496,8 @@ def binding_for(change: Any, *, evidence_ids: Sequence[str] = (), policy_version
         raise OpsError(f"binding_for needs a Change with `args` and `expires`, not {type(change).__name__}; "
                        f"an approval binds the change record, not a reviewed plan - a plan is what the "
                        f"decision is made about, and the change is what the approval covers")
-    arguments = digest({key: value for key, value in sorted(change.args.items())}) if change.args else ""
+    derived = digest({key: value for key, value in sorted(change.args.items())}) if change.args else ""
+    arguments = derived if arguments_hash is None else arguments_hash
     # The binding inherits the change's own age instead of restarting at "now". An approval that outlives
     # the plan it approves is a fresh hour of authority for a plan a human looked at days ago.
     if change.expired:
