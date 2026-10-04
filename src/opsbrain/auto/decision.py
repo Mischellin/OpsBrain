@@ -206,13 +206,14 @@ class ApprovalEngine:
         # The engine's *current* configured version, not the one the binding carries. Supplying the
         # binding's own value makes the comparison equal by construction, so an approval issued under v1
         # stayed executable forever after the policy moved to v2.
-        reasons = stale_reasons(approval.binding, self._current_for(change, self.config.decision.policy_version))
+        reasons = stale_reasons(approval.binding, self._current_for(
+            change, self.config.decision.policy_version, self.config.decision.default_profile))
         if reasons:
             raise OpsError(f"approval {approval.id} is STALE ({', '.join(reasons)})")
         return True
 
     @staticmethod
-    def _current_for(change: Any, policy_version: str) -> dict[str, Any]:
+    def _current_for(change: Any, policy_version: str, profile: str) -> dict[str, Any]:
         """The change's own facts, as the approval must be checked against them.
 
         Derived from the record, never from the binding: comparing `binding.evidence_ids` with
@@ -234,6 +235,10 @@ class ApprovalEngine:
             "targets": [change.target],
             "evidence_ids": recorded,
             "policy_version": policy_version,
+            # The profile currently in force, not the one the binding carries - the same reason as the
+            # policy version. Without it the comparison is equal by construction and a reclassification
+            # from `general` to a stricter profile would leave the approval spendable.
+            "profile": profile,
         }
 
     def autonomous(self) -> bool:
