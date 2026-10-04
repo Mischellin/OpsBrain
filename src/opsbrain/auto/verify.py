@@ -503,7 +503,16 @@ def systemd_unit_active(context: VerifyContext, target: Target) -> CheckResult:
                         f"incomplete data: systemctl returned no ActiveState for {unit}",
                         evidence=_save(context, check, target, result.out))
     revision = properties.get("ExecMainStartTimestamp") or None
-    unbound = _unbound(target, revision)
+    if state not in ("active", "reloading"):
+        # A unit that is not running fails whatever the plan claimed, and a failure needs no attribution.
+        # Downgrading it to UNKNOWN here would let a broken unit report as "could not tell", which reads
+        # as an absence of information rather than the bad news it is.
+        return _outcome(context, check, target, CheckStatus.FAIL,
+                        f"{target.label}: {unit} is {state}/{properties.get('SubState', '?')}, not active",
+                        revision=revision, proves=f"that {unit} on {target.host} is {state}",
+                        does_not_prove="why it is down, or whether the change caused it",
+                        evidence=_save(context, check, target, result.out))
+    unbound = _unbound(target, revision, check)
     if unbound:
         return _unknown(context, check, target, unbound, revision=revision,
                         evidence=_save(context, check, target, result.out))
@@ -719,10 +728,6 @@ def k8s_rollout(context: VerifyContext, target: Target) -> CheckResult:
                         f"generation, observedGeneration, replicas, updatedReplicas, readyReplicas, "
                         f"spec.replicas",
                         revision=revision, evidence=_save(context, check, target, result.out))
-    unbound = _unbound(target, revision, check)
-    if unbound:
-        return _unknown(context, check, target, unbound, revision=revision,
-                        evidence=_save(context, check, target, result.out))
     # Omitted zero-valued optional fields are zeroes, not missing data: a Deployment scaled to zero has no
     # `status.replicas` key, and reading that as "incomplete" would make the healthy case unreportable.
     wanted = desired["replicas"]
@@ -743,8 +748,16 @@ def k8s_rollout(context: VerifyContext, target: Target) -> CheckResult:
                           "not a request, a health check or a data-path check",
     }
     if not (observed and complete):
+        # A rollout that has not converged is bad news whether or not we can attribute it, and turning that
+        # into UNKNOWN would read as "we could not tell" rather than "it is not done".
         return _outcome(context, check, target, CheckStatus.FAIL, detail, revision=revision,
                         evidence=_save(context, check, target, result.out), **boundary)
+    # The revision is only consulted for a *pass*: a completed rollout is only the change's result if it
+    # is the revision the plan applied.
+    unbound = _unbound(target, revision, check)
+    if unbound:
+        return _unknown(context, check, target, unbound, revision=revision,
+                        evidence=_save(context, check, target, result.out))
     return _outcome(context, check, target, CheckStatus.PASS, detail, revision=revision,
                     evidence=_save(context, check, target, result.out), **boundary)
 
@@ -861,15 +874,15 @@ def drift_repo_live(context: VerifyContext, target: Target) -> CheckResult:
 
 
 # ------------------------------------------------------------------------------------------------ registry
-register(Check("systemd:unit-active", "systemd", systemd_unit_active, settles=True,
+register(Check("systemd:unit-active", "systemd", systemd_unit_active, settles=True, requires_revision=True,
                why="the unit is running the effective configuration, not merely active since before the change"))
-register(Check("systemd:drop-in", "systemd", systemd_drop_in,
+register(Check("systemd:drop-in", "systemd", systemd_drop_in, requires_revision=True,
                why="the drop-in the plan installed is in the unit's effective drop-in chain"))
 register(Check("systemd:unit-start", "systemd", systemd_unit_start, state_changing=True, settles=True,
                why="starting the unit is an action, so it runs only when the plan declared it"))
 register(Check("http:reachable", "http", http_reachable, settles=True,
                why="the endpoint answers inside the observation window, and only that"))
-register(Check("k8s:rollout", "k8s", k8s_rollout, settles=True,
+register(Check("k8s:rollout", "k8s", k8s_rollout, settles=True, requires_revision=True,
                why="the workload finished the rollout the change asked for, at the expected revision"))
 register(Check("storage:capacity", "storage", storage_capacity,
                why="the filesystem still has the headroom the plan assumed"))
@@ -1042,16 +1055,19 @@ class Verifier:
         """
         if not self.auto.verify.allow_state_changing_checks or check.name not in declared:
             return False
-        permitted = self._plan_declares(change_id, check)
-        return permitted is not False
+        return self._plan_declares(change_id, check)
 
-    def _plan_declares(self, change_id: str, check: Check) -> bool | None:
-        """`None` when there is no stored plan to compare against - the operator's allowlist stands alone."""
+    def _plan_declares(self, change_id: str, check: Check) -> bool:
+        """Whether the *stored* change authorised this check. A missing plan authorises nothing.
+
+        Returning "no plan, so allow" is the dangerous direction: the record being absent is exactly what
+        an unauthorised caller controls, and it would hand out the one action that can change a host.
+        """
         try:
             document = json.loads(
                 (self.root / "preflight" / f"pf-{change_id[:16]}.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return None
+            return False
         declared = document.get("declared_checks")
         if not isinstance(declared, list):
             return False
