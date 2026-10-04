@@ -36,8 +36,12 @@ def test_redaction_keeps_valid_json(ops) -> None:  # type: ignore[no-untyped-def
     """Structure-aware redaction: the answer must still parse, or the client breaks instead of reading."""
     out = ops.call("hosts", {"action": "status"},
                    lambda: {"total": 2, "hosts": {"web-1": {"ok": True, "note": "password: hunter2"}}})
-    json.loads(json.dumps(out))
-    assert "hunter2" not in json.dumps(out)
+    # Parsed, not re-encoded. `json.dumps` over an answer that is *already* a JSON string just wraps that
+    # string in quotes, so the assertion passed on any output at all - including a corrupted one.
+    body = json.loads(out if isinstance(out, str) else out)
+    assert body["hosts"]["web-1"]["ok"] is True, "the document survived redaction intact"
+    assert body["total"] == 2
+    assert "hunter2" not in out, "and the credential did not"
 
 
 # --------------------------------------------------- hosts.read policy applies to every selected host
@@ -249,3 +253,30 @@ def test_a_stored_full_result_is_still_parseable_json(ops) -> None:  # type: ign
     parsed = json.loads(stored)  # the defect: this used to fail on the unquoted marker
     assert parsed["password"] != "hunter2", "the credential is masked in the artifact too"
     assert len(parsed["rows"]) == 400, "and the rest of the document survived"
+
+
+def test_a_wide_cluster_read_does_not_become_a_serial_queue(ops) -> None:  # type: ignore[no-untyped-def]
+    """Authorising per namespace must not turn one request into N sequential subprocesses.
+
+    On a cluster with a hundred namespaces that is a hundred round trips, each waiting on the API, and an
+    ordinary MCP call times out while the server is still being loaded.
+    """
+    from opsbrain.config import Access
+
+    ops.exec.rules.clear()
+    count = 24
+    names = [{"metadata": {"name": f"ns{i:02d}"}} for i in range(count)]
+    ops.exec.on(r"get namespaces", json.dumps({"items": names}) + "\n")
+    ops.exec.on(r"get pods", json.dumps({"items": [{"metadata": {"name": "p"}}]}) + "\n")
+    ops.require = _policy(ops, {"k8s.read": Access.ALLOW})
+
+    out = ops.k8s_get(kind="pods")
+    assert len(out["namespaces"]) == count
+    scripts = [script for _, script in ops.exec.calls if "get pods" in script]
+    assert len(scripts) == count, "one read per authorised namespace, none skipped"
+    assert all("-A" not in script for script in scripts)
+
+    # Bounded, not serial: with a bound of 8 the 24 reads cannot have all started one after another.
+    from opsbrain.readers import _K8S_READ_PARALLELISM
+
+    assert 1 < _K8S_READ_PARALLELISM < count, "the bound is what makes this not a queue"

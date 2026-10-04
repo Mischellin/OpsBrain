@@ -30,6 +30,9 @@ _SELECTOR = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./=!, ()-]{0,199}$")
 _SINCE = re.compile(r"^[0-9]{1,4} ?(s|sec|m|min|h|hour|hours|d|day|days)( ago)?$|^[0-9T:. -]{8,25}$|"
                     r"^(today|yesterday)$")
 _UNIT = re.compile(r"^[A-Za-z0-9@_.:-]{1,120}$")
+#: How many per-namespace reads run at once. Enough that a hundred namespaces is not a hundred
+#: sequential round trips, bounded so a wide cluster cannot fan out into a fork bomb.
+_K8S_READ_PARALLELISM = 8
 
 K8S_KINDS = {
     "pods": "pods", "deployments": "deployments", "statefulsets": "statefulsets", "daemonsets": "daemonsets",
@@ -321,11 +324,22 @@ class Readers(Core):
         else:
             self.require("k8s.read", namespace or "")
         if names:
-            rows: list[Any] = []
-            for scope in names:
-                rows += parsers.k8s_rows(kind, self._kubectl_json(
-                    "get", K8S_KINDS[kind], *( [name] if name else []), "-n", scope,
+            # Authorised per namespace, so the reads are per namespace too - but concurrently and with a
+            # bound. Serially, a cluster with a hundred namespaces turned one request into a hundred
+            # subprocesses that each wait on the API, and an ordinary MCP call could time out while the
+            # server was still being loaded. The authorisation is unchanged: the point is that a namespace
+            # created after the check cannot appear here, not how fast the reads happen.
+            def read_scope(scope: str) -> list[Any]:
+                return parsers.k8s_rows(kind, self._kubectl_json(
+                    "get", K8S_KINDS[kind], *([name] if name else []), "-n", scope,
                     *(["-l", selector] if selector else [])))
+
+            if len(names) == 1:
+                rows = read_scope(names[0])
+            else:
+                workers = min(_K8S_READ_PARALLELISM, len(names))
+                with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="opsbrain-k8s") as pool:
+                    rows = [row for chunk in pool.map(read_scope, names) for row in chunk]
             return {"kind": kind, "namespaces": list(names), **self.capped(rows, 40)}
         args = ["get", K8S_KINDS[kind], *([name] if name else [])]
         args += ["-n", namespace] if namespace else ([] if kind in ("nodes", "namespaces") else ["-A"])
