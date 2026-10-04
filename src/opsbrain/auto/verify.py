@@ -54,7 +54,9 @@ _SSH_TIMEOUT = 20.0
 _HTTP_TIMEOUT = 10.0
 _START_TIMEOUT = 90.0
 
-_UNIT = re.compile(r"^[A-Za-z0-9@_.:-]{1,120}$")
+#: A leading `-` turns the name into an option for systemctl rather than a unit name, and the character
+#: class deliberately excludes it even though the rest of a unit name is more permissive than it looks.
+_UNIT = re.compile(r"^(?![-])([A-Za-z0-9@_.:-]{1,120})$")
 _ABS_PATH = re.compile(r"^/[A-Za-z0-9._/@:+-]{1,240}$")
 _PURE_NUMBER = re.compile(r"^(100|[1-9]?[0-9])$")
 _DIGEST = re.compile(r"\b([0-9a-f]{64})\b")
@@ -287,7 +289,10 @@ class Check:
 
 #: Workload kinds `k8s:rollout` knows how to read. A Deployment scaled to zero omits its optional status
 #: counters, which this check handles; other kinds are refused rather than guessed at.
-SUPPORTED_KINDS = frozenset({"deployment", "deployments", "apps/v1", "deployment.apps"})
+#: Only resource types `kubectl get` accepts here. `apps/v1` is a group/version prefix and `deployment.apps`
+#: is not a type at all; both were being handed to kubectl as if they were, which is a typo that reads as
+#: a resource rather than an error.
+SUPPORTED_KINDS = frozenset({"deployment", "deployments"})
 
 #: Every check OpsBrain knows, by its policy-facing name (`profile:check`). A policy names these strings,
 #: so a typo is a refusal rather than a silently skipped requirement.
@@ -305,6 +310,26 @@ def register(check: Check) -> Check:
 def config_path(core: Core) -> Path:
     """Where the auto pipeline keeps its records, derived from the Core it was handed."""
     return Path(getattr(core.config, "data_path", ".")) / "auto"
+
+
+def _redacted(result: Result) -> Result:
+    """Strip everything from a kubectl document except the fields this check reads."""
+    try:
+        document = json.loads(result.out)
+    except ValueError:
+        return result
+    if not isinstance(document, dict):
+        return result
+    reduced = {
+        "metadata": {"name": (document.get("metadata") or {}).get("name"),
+                     "generation": (document.get("metadata") or {}).get("generation"),
+                     "annotations": (document.get("metadata") or {}).get("annotations") or {}},
+        "spec": {"replicas": (document.get("spec") or {}).get("replicas")},
+        "status": {key: (document.get("status") or {}).get(key)
+                   for key in ("generation", "observedGeneration", "replicas", "updatedReplicas",
+                               "readyReplicas", "availableReplicas")},
+    }
+    return Result(result.rc, json.dumps(reduced), result.timed_out)
 
 
 def _registered(name: str) -> Check:
@@ -649,6 +674,10 @@ def k8s_rollout(context: VerifyContext, target: Target) -> CheckResult:
     except ValueError as exc:
         return _unknown(context, check, target, f"incomplete data: kubectl returned no usable JSON ({exc})",
                         evidence=_save(context, check, target, result.out))
+    # A Deployment manifest carries inline environment values, and those are routinely API keys and
+    # passwords. The document is reduced to the status and spec counters this check actually reads before
+    # it is stored, so a verification artifact never becomes a place secrets accumulate.
+    result = _redacted(result)
     metadata: dict[str, Any] = document.get("metadata") or {}
     status: dict[str, Any] = document.get("status") or {}
     spec: dict[str, Any] = document.get("spec") or {}
@@ -898,7 +927,7 @@ class Verifier:
         return [{"check": name, "profile": REGISTRY[name].profile, "state_changing": REGISTRY[name].state_changing,
                  "settles": REGISTRY[name].settles, "why": REGISTRY[name].why} for name in self.available()]
 
-    def select(self, names: Sequence[str] = ()) -> tuple[Check, ...]:
+    def select(self, names: Sequence[str] = ()) -> tuple[Check, ...]:  # noqa: C901
         """Resolve `["systemd:unit-active", "http"]` into concrete checks; an empty list means every enabled
         check. A bare profile name expands to all of its checks.
 
@@ -922,7 +951,9 @@ class Verifier:
                 chosen.extend(expanded)
         if len(chosen) > self.auto.verify.max_checks:
             raise OpsError(f"{len(chosen)} checks selected, the configured limit is {self.auto.verify.max_checks}")
-        return tuple(chosen)
+        # Deduplicated: asking for a profile and one of its members is the same request written twice, and
+        # running a state-changing check twice is a second action nobody planned.
+        return tuple({check.name: check for check in reversed(chosen)}.values())[::-1]
 
     def verify(self, change_id: str, targets: Sequence[Target], *, checks: Sequence[str] = (),
                applied_at: float | None = None, evidence_refs: Sequence[str] = (),

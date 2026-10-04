@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any
 
 import pytest
@@ -688,3 +689,59 @@ def test_verifying_through_a_disabled_service_is_refused(tmp_path: Any) -> None:
                              auto=AutoConfig(enabled=False)))
     with pytest.raises(OpsError, match="disabled"):
         auto.verify_change("c-11111111", [unit_target("web-1", "logrotate.service")])
+
+
+# ============================== P1 round 2 on #17: findings against the verification fixes themselves
+def test_an_option_like_unit_name_is_refused(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    """`-` turns the name into an option for systemctl, and shlex.quote does not change that."""
+    fake.on(r"systemctl show", show())
+    report = verifier(ops).verify("chg-1", [unit_target(HOST, "--now")], checks=["systemd:unit-active"],
+                               applied_at=1_000.0)
+    assert report.is_pass is False
+    assert "invalid unit name" in report.results[0].reason
+    assert not any("systemctl" in script for _, script in fake.calls), "nothing was executed"
+
+
+@pytest.mark.parametrize("kind", ["deployment", "deployments"])
+def test_a_real_resource_type_reaches_kubectl_unchanged(ops, fake, kind) -> None:  # type: ignore[no-untyped-def]
+    fake.on(f"get {re.escape(kind)} api", rollout(revision="7"))
+    verifier(ops).verify("chg-1", [k8s_target("api", kind=kind, expected_revision="7")],
+                        checks=["k8s:rollout"], applied_at=1_000.0)
+    assert any(f"get {kind} api" in script for _, script in fake.calls), \
+        "the resource type the plan asked for is the one kubectl received"
+
+
+@pytest.mark.parametrize("kind", ["apps/v1", "deployment.apps", "deploymnt"])
+def test_an_unsupported_kind_is_refused_before_anything_runs(ops, fake, kind) -> None:  # type: ignore[no-untyped-def]
+    fake.on(r"get ", rollout())
+    report = verifier(ops).verify("chg-1", [k8s_target("api", kind=kind)], checks=["k8s:rollout"],
+                               applied_at=1_000.0)
+    assert report.is_pass is False
+    assert "unsupported workload kind" in report.results[0].reason
+    assert not fake.calls, "nothing was sent to the cluster"
+
+
+def test_a_profile_and_its_member_select_one_check_not_two(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    """`['systemd', 'systemd:unit-start']` is one request written twice, and a state-changing check is an
+    action: running it twice is a second action nobody planned."""
+    fake.on(r"systemctl show", show())
+    fake.on(r"systemctl start", "")
+    selected = verifier(ops).select(["systemd", "systemd:unit-start"])
+    assert [check.name for check in selected].count("systemd:unit-start") == 1
+    assert len(verifier(ops).select(["systemd", "systemd:unit-active"])) == len(
+        verifier(ops).select(["systemd"])), "asking for a profile and a member is the same request twice"
+
+
+def test_a_deployment_manifest_is_not_persisted_with_its_environment(ops, fake, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Inline env values are routinely credentials, and a verification artifact is not a secrets store."""
+    document = json.loads(rollout(revision="7"))
+    document["spec"]["template"] = {"spec": {"containers": [
+        {"name": "api", "env": [{"name": "LICENSE", "value": "ghp_" + "e" * 36}]}]}}
+    fake.on(r"get deployments api", json.dumps(document))
+    report = verifier(ops).verify("chg-1", [k8s_target("api", expected_revision="7")], checks=["k8s:rollout"],
+                               applied_at=1_000.0)
+    stored = "".join(path.read_text(encoding="utf-8", errors="replace")
+                     for path in tmp_path.rglob("*.json") if path.is_file())
+    assert "ghp_" not in stored, "a credential from the manifest reached a stored artifact"
+    assert "e" * 36 not in stored
+    assert report.status is not None
