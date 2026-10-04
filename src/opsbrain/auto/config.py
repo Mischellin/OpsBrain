@@ -29,10 +29,19 @@ DECISION_REASON_CODES = (
 
 
 def all_reason_codes() -> tuple[str, ...]:
-    """Every code the pipeline can emit, sorted. The one list a caller needs."""
-    from .evidence import Reason
+    """Every code the pipeline can emit, sorted. The one list a caller needs.
 
-    return tuple(sorted({*DECISION_REASON_CODES, *(reason.value for reason in Reason)}))
+    Derived from the enums rather than typed out again: the hand-written `DECISION_REASON_CODES` had drifted
+    from `decision.Reason`, so codes the engine actually emits - `human_approved`,
+    `retryable_runner_failure`, `stale_approval`, `autonomy_off` and the rest - were missing from the list
+    a client uses to handle decisions exhaustively.
+    """
+    from .decision import Reason as DecisionReason
+    from .evidence import Reason as EvidenceReason
+
+    return tuple(sorted({*DECISION_REASON_CODES,
+                         *(reason.value for reason in DecisionReason),
+                         *(reason.value for reason in EvidenceReason)}))
 
 
 #: Kept for callers that only need the decision half; `all_reason_codes` is the complete set.

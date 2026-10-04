@@ -732,3 +732,46 @@ def test_releasing_a_lease_never_deletes_the_next_owners(tmp_path: Path) -> None
     assert read_claim(path)["owner"] == "second"
     assert release_claim(path, "second") is True
     assert read_claim(path) is None
+
+
+def test_a_failed_review_is_not_answered_from_cache_forever(tmp_path: Path) -> None:
+    """`RETRY` has to be able to mean something.
+
+    A runner failure was cached under the request's stable id and returned on every later call, so the
+    engine's "retry the review" re-read the same TIMEOUT each time until the repair budget ran out and the
+    change blocked - without the reviewer ever being asked again. A failure is not an answer, so it does
+    not get to be the cached answer.
+    """
+    runner = FakeReviewer()
+    reviews = service(tmp_path, runner)
+    runner.raise_on.add("evidence bundle contents")
+    first = reviews.review(request_for())
+    assert first.status is RunnerStatus.RUNNER_ERROR
+    after_first = len(runner.requests)  # more than one: the runner retries the call internally
+
+    runner.raise_on.clear()  # the runner recovers; nothing else about the request changed
+    second = reviews.review(request_for())
+    assert second.status is RunnerStatus.OK, "the retry actually reached the reviewer"
+    assert second.verdict is Verdict.PASS
+    assert len(runner.requests) > after_first, "the second call was not answered from the stored failure"
+
+
+def test_a_successful_review_is_still_answered_from_cache(tmp_path: Path) -> None:
+    """The other half: a real verdict must not be re-run and re-bought on every redelivery."""
+    runner = FakeReviewer()
+    reviews = service(tmp_path, runner)
+    first = reviews.review(request_for())
+    second = reviews.review(request_for())
+    assert first.review_id == second.review_id
+    assert len(runner.requests) == 1
+    assert second.verdict is first.verdict
+
+
+def test_every_reason_the_engine_can_emit_is_enumerable(tmp_path: Path) -> None:
+    """A client cannot handle decisions exhaustively against a list that is missing codes."""
+    from opsbrain.auto.config import all_reason_codes
+    from opsbrain.auto.decision import Reason as DecisionReason
+
+    codes = set(all_reason_codes())
+    missing = {reason.value for reason in DecisionReason} - codes
+    assert not missing, f"codes the engine emits but a caller cannot enumerate: {sorted(missing)}"

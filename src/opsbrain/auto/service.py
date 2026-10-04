@@ -224,12 +224,12 @@ class ReviewService:
             cached = self.store.get(request.review_id)
             if cached.get("status") == RunnerStatus.OK.value:
                 return self._rebuild_cached(request, cached)
-            return ReviewResult(review_id=request.review_id, subject=request.subject,
-                                subject_ref=request.subject_ref, status=RunnerStatus(cached["status"]),
-                                verdict=None, contract_version=cached.get("contract_version", CONTRACT_VERSION),
-                                rubric_version=cached.get("rubric_version", request.rubric_version),
-                                model=cached.get("model", request.model),
-                                note=cached.get("note", "cached: the review never produced a verdict"))
+            # A runner failure is not an answer, so it is not a cached answer either. Returning it forever
+            # meant the engine's `RETRY` / "retry the review" could not re-run the reviewer: the very next
+            # call handed back the same TIMEOUT or QUOTA_EXHAUSTED until the repair budget ran out and the
+            # change blocked. The spend is already charged and stays charged - what is retried is the
+            # review, not the billing.
+            self.store.discard(request.review_id)
         # `before_attempt` is the only reservation point: it fires once per invocation, so the first
         # attempt is charged exactly once and a retry has to pass the budget check too.
         result = run_review(self.reviewer(), request, retries=self.reviews.max_retries,
