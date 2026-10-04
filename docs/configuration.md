@@ -37,3 +37,27 @@ policy:
   "k8s.restart:okydoky-dev": allow
   "ansible.apply:proxmox": deny
 ```
+
+## Autonomy (`auto`)
+
+The whole autonomous pipeline is inert unless `auto.enabled` is true. See [autonomy.md](autonomy.md).
+
+| Key | Meaning |
+| --- | --- |
+| `auto.enabled` | master switch; false keeps the manual two-step gate as the only path |
+| `auto.review.runner` | `fake` (deterministic, no tokens) \| `codex` (external CLI) |
+| `auto.review.command` | argv template; `{prompt}` is the request file, `{model}` the configured model. No shell |
+| `auto.review.model` / `auth` | model id; `subscription` \| `api`. No hidden paid fallback |
+| `auto.review.live` | without `true` no external binary is ever started |
+| `auto.review.timeout_s` / `max_parallel` / `max_retries` | per-request transport bounds |
+| `auto.review.max_model_calls` / `budget_usd` | hard ceilings, checked *before* a call is made |
+| `auto.review.snapshot_dir` | read-only directory the reviewer is confined to |
+| `auto.evidence.max_age_s` | freshness window for a bundle |
+| `auto.decision.mode` | `manual` \| `autonomous`. Autonomous additionally requires `autonomy_token` |
+| `auto.decision.max_repair_cycles` / `max_model_calls` / `max_wall_s` / `max_spend_usd` | recovery bounds |
+| `auto.decision.allow_destructive` | autonomous execution of a destroying change; false by default |
+| `auto.decision.emergency_stop` | one switch that blocks every autonomous decision |
+| `auto.decision.default_profile` | which policy profile applies when none is matched |
+| `auto.decision.policy_version` | bumped by the operator; an approval bound to another version is STALE |
+| `auto.profiles[]` | per-profile evidence / precondition / verification / target requirements |
+| `auto.autonomy_token` | presence required for autonomous mode; never read from model output |

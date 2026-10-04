@@ -156,6 +156,36 @@ def cmd_desktop(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_autonomy(args: argparse.Namespace) -> int:
+    """Inspect the autonomous pipeline. Read-only: it never decides and never mutates."""
+    ops = _ops(args)
+    auto = ops.auto
+    if args.action == "status":
+        view = auto.overview()
+        print(f"enabled={view['enabled']} mode={view['mode']} autonomous={view['autonomous']} "
+              f"policy={view['policy_version']}")
+        if view["emergency_stop"]:
+            print("!! emergency_stop is set: every autonomous decision is blocked")
+        budget = view["budget"]
+        print(f"review: runner={view['runner']} live={view['live']} model={view['model'] or '-'} "
+              f"auth={view['auth']}")
+        print(f"budget: calls={budget['model_calls']}/{budget['max_model_calls']} "
+              f"tokens={budget['input_tokens']}+{budget['output_tokens']} spend=${budget['spend_usd']}")
+        return 0 if view["enabled"] else 1
+    if args.action == "capabilities":
+        report = auto.reviews.capabilities()
+        for key, value in sorted(report.items()):
+            print(f"{key}: {value}")
+        return 0 if report.get("ok") else 1
+    if args.action == "reviews":
+        for row in auto.reviews.list(args.limit):
+            print(f"{row.get('review_id'):<20} {row.get('subject'):<15} {row.get('status'):<16} "
+                  f"{row.get('verdict') or '-':<15} {row.get('model') or '-'}")
+        return 0
+    print(f"budget: {json.dumps(auto.reviews.usage(), ensure_ascii=False)}")
+    return 0
+
+
 def cmd_install(args: argparse.Namespace) -> int:
     binary = shutil.which("opsbrain") or "opsbrain"
     print("Claude Desktop:\n  opsbrain desktop install\n")
@@ -192,6 +222,10 @@ def main(argv: list[str] | None = None) -> int:
     doctor.add_argument("--net", action="store_true")
     doctor.set_defaults(handler=cmd_doctor)
     commands.add_parser("stats", help="token savings from the audit log").set_defaults(handler=cmd_stats)
+    autonomy = commands.add_parser("autonomy", help="inspect the autonomous pipeline (read-only)")
+    autonomy.add_argument("action", choices=["status", "capabilities", "reviews", "budget"])
+    autonomy.add_argument("--limit", type=int, default=20)
+    autonomy.set_defaults(handler=cmd_autonomy)
     desktop = commands.add_parser("desktop", help="Claude Desktop extension (.mcpb): build | install | status")
     desktop.add_argument("action", choices=["build", "install", "status"])
     desktop.add_argument("--no-open", action="store_true")

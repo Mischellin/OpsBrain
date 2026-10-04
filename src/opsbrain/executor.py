@@ -13,26 +13,17 @@ import shlex
 import subprocess
 import sys
 from collections.abc import Mapping
-from dataclasses import dataclass
 from pathlib import Path
 
 from .config import Config, HostConfig
+from .result import Result
 from .util import OpsError
+
+__all__ = ["Executor", "Result"]
 
 SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new",
                "-o", "ServerAliveInterval=15"]
 _PASS_ENV = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "SSH_AUTH_SOCK", "TMPDIR")
-
-
-@dataclass(frozen=True)
-class Result:
-    rc: int
-    out: str
-    timed_out: bool = False
-
-    @property
-    def ok(self) -> bool:
-        return self.rc == 0 and not self.timed_out
 
 
 class Executor:

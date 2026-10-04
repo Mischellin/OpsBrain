@@ -4,7 +4,7 @@ import json
 from opsbrain.server import build_server
 
 EXPECTED = {"overview", "docs", "hosts", "tofu", "ansible", "k8s", "network", "drift", "observe", "artifact", "job",
-            "change"}
+            "change", "autonomy"}
 
 
 def test_tool_surface_is_small_and_has_no_shell_or_approve(ops) -> None:  # type: ignore[no-untyped-def]
