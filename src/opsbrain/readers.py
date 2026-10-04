@@ -142,8 +142,16 @@ class Readers(Core):
         names = [str(row.get("name", "")) for row in listing if str(row.get("name", ""))]
         if not names:
             raise OpsError("cannot read the namespace list, so an all-namespace read is not authorised")
+        withheld = 0
         for name in names:
-            self.require("k8s.read", name)
+            if not self.may_read_namespace(name):
+                withheld += 1
+        if withheld:
+            # A count, never the names. `require` raises a message naming the target it refused, and that
+            # message travels back to the caller - disclosing exactly the namespace the rule withholds, by
+            # the back door the listing branch was built to close.
+            raise OpsError(f"an all-namespace read is not authorised: {withheld} namespace(s) are not "
+                           f"covered by policy. Read them by name, or extend the policy.")
         return names
 
     def _authorise_hosts(self, names: list[str]) -> None:
@@ -341,7 +349,9 @@ class Readers(Core):
                     allowed.append(row)
                 else:
                     withheld += 1
-            out = {"kind": kind, "namespaces": [str(r.get("name", "")) for r in allowed],
+            # Capped, like every other listing this module returns, so a wide cluster cannot page an
+            # unbounded answer out of a single call.
+            out = {"kind": kind, "namespaces": [str(r.get("name", "")) for r in allowed[:40]],
                    **self.capped(allowed, 40)}
             if withheld:
                 # A count, not the names. Naming them would put back exactly what the rule withholds.

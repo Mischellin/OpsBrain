@@ -88,8 +88,12 @@ def test_an_all_namespace_read_is_refused_when_a_namespace_is_denied(ops) -> Non
     ops.exec.on(r"get namespaces", json.dumps({"items": [{"metadata": {"name": "prod"}},
                                                         {"metadata": {"name": "kube-system"}}]}) + "\n")
     ops.require = _policy(ops, {"k8s.read:prod": Access.DENY})
-    with pytest.raises(OpsError, match="prod"):
+    with pytest.raises(OpsError, match="not covered by policy") as raised:
         ops.k8s_get(kind="pods")
+    # The refusal says how many namespaces are withheld, never which: naming the target would disclose it
+    # by the back door the namespace-listing branch exists to close.
+    assert "prod" not in str(raised.value)
+    assert "1 namespace(s)" in str(raised.value)
 
 
 def test_an_all_namespace_read_is_allowed_when_every_namespace_is(ops) -> None:  # type: ignore[no-untyped-def]
