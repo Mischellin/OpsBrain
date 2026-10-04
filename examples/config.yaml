@@ -54,3 +54,31 @@ policy:
   "hosts.restart:pve-1": deny
 
 limits: {max_items: 20, max_chars: 6000, change_ttl_s: 3600, default_wait_s: 45}
+
+# Autonomous change pipeline. Off by default: without `enabled: true` every setting below is inert and
+# mutations keep the two-step human gate. See docs/autonomy.md.
+auto:
+  enabled: false
+  review:
+    runner: fake              # fake = deterministic, no tokens (tests) | codex = external CLI
+    command: []               # e.g. ["codex", "exec", "--model", "{model}", "--json", "{prompt}"]
+    model: ""                 # filled from config, never from model output
+    auth: subscription        # subscription | api - no hidden paid fallback
+    live: false               # without this no external binary is ever started
+    sandbox: []               # REQUIRED for live: enforced wrapper, e.g. ["bwrap", "--ro-bind", "/", "/"]
+    scratch_home: ""          # HOME for the reviewer; leave empty to use snapshot_dir
+    timeout_s: 300
+    max_parallel: 2
+    max_retries: 2
+    max_model_calls: 40
+    budget_usd: 0             # 0 = call limits only
+    snapshot_dir: ""          # directory the request is written into
+  evidence:
+    max_age_s: 900
+  decision:
+    mode: manual              # manual | autonomous
+    default_profile: general
+    max_repair_cycles: 3
+    max_wall_s: 1800
+    allow_destructive: false
+    emergency_stop: false
