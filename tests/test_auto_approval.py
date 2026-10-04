@@ -545,3 +545,27 @@ def test_an_expired_record_cannot_be_spent_even_before_its_own_clock_runs_out(tm
     with pytest.raises(OpsError, match="expired, not usable"):
         store.consume(approval.id, current(), owner="worker-1", idempotency_key="job-42")
     assert store.get(approval.id).state is LeaseState.EXPIRED
+
+
+def test_a_non_finite_lifetime_does_not_become_an_approval_valid_forever(tmp_path: Path) -> None:
+    """Every comparison with NaN is false, so a NaN lifetime expires never.
+
+    Both values reach the binding: the constructor takes a float, and Python's JSON decoder accepts a
+    bare `NaN`. A lifetime policy code got wrong, or a record edited on disk, would otherwise be an
+    authorisation that never lapses.
+    """
+    for field, value in (("expires_s", float("nan")), ("created", float("nan")),
+                         ("expires_s", float("inf"))):
+        with pytest.raises(OpsError, match="finite"):
+            a_binding(**{field: value})
+
+
+def test_an_expired_record_written_as_a_bare_nan_is_still_unusable(tmp_path: Path) -> None:
+    """A record already on disk with a NaN lifetime is refused at read, not trusted."""
+    store = ApprovalStore(tmp_path)
+    approval = store.issue(a_binding())
+    path = tmp_path / f"{approval.id}.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    path.write_text(json.dumps(document).replace('"expires_s": 3600.0', '"expires_s": NaN'), encoding="utf-8")
+    with pytest.raises(OpsError, match="finite"):
+        store.get(approval.id)

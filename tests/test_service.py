@@ -320,3 +320,17 @@ def test_a_refusal_still_reports_the_mismatch(ops, fake) -> None:  # type: ignor
     fake.on(r"tofu apply", "@@OPSBRAIN-PLAN-MISMATCH " + "cd" * 32 + "@@\n", rc=78)
     out = ops.tofu_apply(plan["change"])
     assert out["ok"] is False and out["plan_changed"] is True
+
+
+def test_a_plan_with_no_usable_digest_is_removed_not_merely_refused(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    """A saved plan can carry the stack's variable values.
+
+    Refusing to create a change left the file for the age-based sweep, which only runs on the next
+    `tofu plan` - so it stayed until some later plan happened to be a day old, or forever if none did.
+    """
+    fake.on(r"tofu plan", f"Plan: 0 to add, 1 to change, 0 to destroy.\n{JSON_MARK}\n{PLAN_JSON}\n", rc=2)
+    out = ops.tofu_plan()
+    assert "plan digest unreadable" in out["warning"]
+    assert not ops.changes.list(), "no change record was created, so nothing can be approved"
+    removals = [script for _, script in fake.calls if "rm -f" in script and "opsbrain/j-" in script]
+    assert removals, "the unusable plan was removed from the runner"

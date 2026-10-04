@@ -143,13 +143,27 @@ class Operators(Core):
         # offered as approvable, because "no digest" would otherwise mean "no check".
         sha = PLAN_SHA.search(human)
         if not sha:
+            # The plan is unusable - no checksum means nothing to check it against later - and a saved plan
+            # can carry the stack's variable values. Leaving it for the age-based sweep meant it stayed
+            # until some later `tofu plan` happened to be more than a day old, or forever if none did.
+            self._discard_saved_plan(stack, job.meta["plan_file"])
             return {**out, "changes": True, **summary, "dangerous": dangerous,
-                    "warning": "plan digest unreadable: no change was created, plan again"}
+                    "warning": "plan digest unreadable: the saved plan was removed and no change was "
+                               "created, plan again"}
         change = self.changes.create("tofu.apply", stack, line, digest(parsers.tofu_fingerprint(document)),
                                      dangerous=dangerous, args={"plan_file": job.meta["plan_file"]},
                                      details={"resources": summary["resources"], "plan_sha256": sha.group(1)})
         return {**out, "changes": True, **summary, "dangerous": dangerous, "change": change.id,
                 "next": f"tofu action=apply change_id={change.id} (after a human approves it)"}
+
+    def _discard_saved_plan(self, stack: str, plan_file: str) -> None:
+        """Remove a saved plan that will never be applied, so it does not outlive its usefulness."""
+        try:
+            _, config = self._stack(stack)
+        except OpsError:
+            return  # the stack is gone; whatever it left is no longer ours to reach
+        self.exec.run_ssh(config.runner, f"{self._tofu_prefix(config)}command rm -f {shlex.quote(plan_file)}",
+                          timeout=30)
 
     def _plan_apply_script(self, config: Any, plan_file: str, expected_sha: str) -> str:
         """One runner-side script: take an immutable copy of the plan, hash *that*, and apply *that*.

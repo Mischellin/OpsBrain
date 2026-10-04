@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import time
 from collections.abc import Iterator, Sequence
@@ -84,6 +85,10 @@ class ApprovalBinding:
             raise OpsError("an approval must name the change it approves")
         if not self.plan_hash.strip():
             raise OpsError("an approval must carry the hash of the plan it approves")
+        if not math.isfinite(self.expires_s) or self.expires_s <= 0:
+            raise OpsError(f"an approval must have a finite positive lifetime, not {self.expires_s!r}")
+        if not math.isfinite(self.created):
+            raise OpsError(f"an approval must have a finite creation time, not {self.created!r}")
 
     def as_digest_source(self) -> dict[str, Any]:
         return {"contract_version": CONTRACT_VERSION, "change_id": self.change_id, "subject": self.subject,
@@ -101,6 +106,12 @@ class ApprovalBinding:
 
     @property
     def expired(self) -> bool:
+        # A non-finite `created` or `expires_s` makes every comparison with NaN false, so the approval
+        # never expires. Both reach here: the constructor takes a float, and Python's JSON decoder
+        # accepts a bare `NaN`. A lifetime that policy code got wrong, or a record edited on disk, would
+        # otherwise become an authorisation valid forever.
+        if not (math.isfinite(self.created) and math.isfinite(self.expires_s)):
+            return True
         return now() - self.created > self.expires_s
 
     def to_dict(self) -> dict[str, Any]:
