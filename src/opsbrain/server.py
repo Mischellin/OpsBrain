@@ -17,13 +17,36 @@ from .auto.config import all_reason_codes
 from .service import OpsBrain
 from .util import OpsError, write_private
 
-INSTRUCTIONS = (
+_COMMON = (
     "OpsBrain operates the infrastructure with compact answers. Start with `overview`, then `docs action=status` for "
     "the current state. Results are summaries; raw output is an artifact id - read it with `artifact` only when the "
-    "summary is not enough. Long operations return a job id: poll with `job`. Reads are free. Mutations are two-step: "
-    "plan/check returns a change id, a HUMAN approves it in a terminal with `opsbrain approve <id>`, then you call "
-    "apply with change_id. Never ask for or handle credentials. There is no shell tool by design."
+    "summary is not enough. Long operations return a job id: poll with `job`. Reads are free. "
 )
+_TAIL = " Never ask for or handle credentials. There is no shell tool by design."
+
+#: The manual workflow, stated for a server whose gate is not deciding.
+INSTRUCTIONS = _COMMON + (
+    "Mutations are two-step: plan/check returns a change id, a HUMAN approves it in a terminal with "
+    "`opsbrain approve <id>`, then you call apply with change_id." + _TAIL
+)
+
+
+def build_instructions(config: Any) -> str:
+    """The same instructions, with the mutation path the deployment actually has.
+
+    Telling an autonomous deployment that a human must approve is not a harmless simplification: the
+    installed gate rejects a hand-approved change that carries no engine approval, so a client following
+    these instructions takes a path that is guaranteed to fail - and never discovers the `decide` action
+    that would have worked.
+    """
+    if not (config.auto.enabled and config.auto.decision.autonomous):
+        return INSTRUCTIONS
+    return _COMMON + (
+        "Mutations are two-step: plan/check returns a change id, then call `autonomy action=decide` with the "
+        "change id as `id` and the reviewed plan id as `plan`; the decision engine decides, and an APPROVE "
+        "issues the approval the apply then spends - no human step. A REFTRY means run the review again; "
+        "BLOCKED_AUTONOMOUSLY means it stops there and says what is missing." + _TAIL
+    )
 
 
 def _need(value: Any, name: str) -> Any:
@@ -39,7 +62,7 @@ def _dispatch(action: str, table: dict[str, Callable[[], Any]]) -> Any:
 
 
 def build_server(ops: OpsBrain) -> MCPServer:
-    server = MCPServer("opsbrain", instructions=INSTRUCTIONS)
+    server = MCPServer("opsbrain", instructions=build_instructions(ops.config))
 
     @server.tool()
     def overview() -> str:

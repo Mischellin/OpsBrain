@@ -487,6 +487,13 @@ class ApprovalEngine:
             raise OpsError(f"refusing to issue: issuance names plan {plan_id!r} but the decision was "
                            f"made about {record.plan_id!r}")
         if arguments_hash != record.arguments_hash:
+            raise OpsError(f"refusing to issue: issuance names arguments {arguments_hash!r} but the "
+                           f"decision was about {record.arguments_hash!r}")
+        if binding.arguments_hash != record.arguments_hash:
+            # The binding is what gets spent, so its arguments are what a later check re-reads. Comparing
+            # only the `arguments_hash` parameter left a caller free to alter a change's arguments, rebuild
+            # a binding over the altered values, and issue it under an APPROVE made about the original
+            # ones - and the gate then accepted the altered hash, because it matched the binding just issued.
             raise OpsError(f"refusing to issue: the binding carries arguments {binding.arguments_hash!r} "
                            f"but the decision was about {record.arguments_hash!r}")
         if binding.policy_version != record.policy_version:

@@ -578,6 +578,7 @@ class AutoService:
         binding = binding_for(change, evidence_ids=result.evidence_ids,
                               policy_version=self.auto.decision.policy_version,
                               arguments_hash=arguments,
+                              profile=self.auto.decision.default_profile,
                               evidence_expires_in_s=evidence_remaining)
         approval = self.engine().issue(plan_id, arguments, binding, record=decision)
         self.core.changes.attach_approval(change_id, approval)

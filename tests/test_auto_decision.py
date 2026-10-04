@@ -984,3 +984,56 @@ def test_a_retry_reports_the_durable_count_not_the_one_it_loaded_before_counting
     counted = ops.changes.note_repair_cycle(change.id)
     assert ops.auto._repair_count(counted) == 2
     assert "attempts" not in out["decision"] or out["decision"]["attempts"] == 1
+
+
+def test_an_approval_is_bound_to_the_configured_profile(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The gate compares against `default_profile`; a binding left at `general` was always stale.
+
+    Any deployment running a profile other than `general` therefore had every engine-issued approval
+    refused, which is the shape of a feature that works in the default configuration and nowhere else.
+    """
+    _autonomous_ops(ops, tmp_path, default_profile="secrets")
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    ops.auto.review_plan(plan)
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "APPROVE", out["decision"].get("detail", out)
+    # And the gate accepts what was issued, rather than refusing it as `profile_changed`.
+    ops.exec.on(r"tofu apply", "@@OPSBRAIN-PLAN-MISMATCH " + "ab" * 32 + "@@\n", rc=78)
+    assert ops.tofu_apply(change.id)["plan_changed"] is True
+
+
+def test_issue_refuses_a_binding_built_over_altered_arguments(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The comparison looked at the parameter, never at the binding the approval would carry.
+
+    A caller could alter a change's arguments, rebuild a binding over the altered values, and issue it
+    under an APPROVE made about the original ones - and the gate then accepted the altered hash, because it
+    matched the binding that had just been issued.
+    """
+    _ops, engine = _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    record = decide_for(change)
+    altered = bound_for(change, arguments_hash="something-else-entirely")
+    with pytest.raises(OpsError, match="the binding carries arguments"):
+        issue_for(engine, change, altered, record=record)
+
+
+def test_the_instructions_describe_the_path_the_deployment_actually_has(ops) -> None:  # type: ignore[no-untyped-def]
+    """Telling an autonomous server that a human must approve sends the client down a guaranteed failure."""
+    from opsbrain.config import AutoConfig
+    from opsbrain.server import INSTRUCTIONS, build_instructions
+
+    assert "opsbrain approve" in INSTRUCTIONS, "the manual path is still what it says"
+
+    manual = ops.config
+    assert "opsbrain approve" in build_instructions(manual)
+
+    autonomous = manual.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token="K7f2mQx9pR4tVw6nZs1b", decision={"mode": "autonomous"})})
+    text = build_instructions(autonomous)
+    assert "autonomy action=decide" in text, "the action that actually opens the gate is named"
+    assert "opsbrain approve" not in text, "the path that is guaranteed to fail is not"
