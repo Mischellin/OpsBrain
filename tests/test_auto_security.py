@@ -263,10 +263,10 @@ def test_the_engine_names_the_switch_itself_when_the_stop_is_set() -> None:
     that property. Removing the branch changes nothing the service can see - which is exactly why it needs
     a test of its own rather than a mention in a test of the other one.
     """
+    from test_auto_decision import TOKEN, inputs
+
     from opsbrain.auto.config import AutoConfig
     from opsbrain.auto.decision import Decision
-
-    from test_auto_decision import TOKEN, inputs
 
     engine = ApprovalEngineForTest(AutoConfig(enabled=True, autonomy_token=TOKEN, decision={
         "mode": "autonomous", "emergency_stop": True}))
