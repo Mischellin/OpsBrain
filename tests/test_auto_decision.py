@@ -1601,3 +1601,52 @@ def test_tightening_a_profile_makes_the_approvals_it_granted_stale(ops, tmp_path
     assert Store(ops.auto.root / "approvals").get(approval).binding.profile_version == "1"
     with pytest.raises(OpsError, match="profile_version_changed"):
         engine.gate(ops.changes.get(change.id), spend=False)
+
+
+def test_a_risk_class_is_a_floor_the_profile_cannot_go_below() -> None:
+    """`classification` used to be a word in a config file.
+
+    `extra_reviews: 1` on a `critical` profile meant one review, and nothing said that was too few. Now
+    the class states how many reviews it is worth and a configuration asking for fewer is rejected at
+    load time rather than quietly governing less than its own name claims.
+    """
+    from opsbrain.auto.config import PolicyProfileConfig
+
+    assert PolicyProfileConfig(name="general", classification="low", extra_reviews=0).min_reviews == 0
+    with pytest.raises(ValueError, match="requires at least 1 review"):
+        PolicyProfileConfig(name="general", classification="medium", extra_reviews=0)
+    with pytest.raises(ValueError, match="requires at least 2 review"):
+        PolicyProfileConfig(name="general", classification="high", extra_reviews=1)
+    # Exceeding the floor is fine - the profile may be stricter than its class.
+    assert PolicyProfileConfig(name="general", classification="medium", extra_reviews=3).min_reviews == 1
+
+
+def test_a_serious_class_must_state_whether_autonomy_is_allowed() -> None:
+    """`allow_autonomous` defaults to True, and a `critical` profile should not inherit that silently."""
+    from opsbrain.auto.config import PolicyProfileConfig
+
+    with pytest.raises(ValueError, match="allow_autonomous must be stated"):
+        PolicyProfileConfig(name="general", classification="critical", extra_reviews=2)
+    explicit = PolicyProfileConfig(name="general", classification="critical", extra_reviews=2,
+                                   allow_autonomous=False)
+    assert explicit.allow_autonomous is False
+
+
+def test_a_plan_below_its_class_floor_is_refused_even_with_passing_reviews(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The floor is checked at decision time too, not only in the config."""
+    from opsbrain.auto.config import AutoConfig, PolicyProfileConfig
+
+    ops.config = ops.config.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
+        decision={"mode": "autonomous", "default_profile": "secrets"},
+        profiles=[PolicyProfileConfig(name="secrets", classification="medium", extra_reviews=2,
+                                      allowed_targets=["proxmox"], allow_autonomous=True)])})
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id), profile="secrets")
+    ops.auto.review_plan(plan)
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY"
+    assert "2 reviews (medium class, 1 ran)" in out["decision"]["detail"]

@@ -159,6 +159,14 @@ class DecisionConfig(_Model):
         return self.mode == "autonomous" and not self.emergency_stop
 
 
+#: How many independent reviews each risk class is worth. A class that needs two reviews cannot be
+#: configured down to one - that is the whole point of naming it.
+_CLASSIFICATION_REVIEWS: dict[str, int] = {"low": 0, "medium": 1, "high": 2, "critical": 2}
+_CLASSIFICATIONS = tuple(_CLASSIFICATION_REVIEWS)
+#: Classes where "a human can decide" must be written down, not inherited from a default of True.
+_NEEDS_EXPLICIT_AUTONOMY = frozenset({"high", "critical"})
+
+
 class PolicyProfileConfig(_Model):
     """Per-profile requirements. `classification` is derived from config, never from a worker's claim."""
 
@@ -191,9 +199,35 @@ class PolicyProfileConfig(_Model):
     @field_validator("classification")
     @classmethod
     def _class(cls, value: str) -> str:
-        if value not in ("low", "medium", "high", "critical"):
-            raise ValueError("classification must be low | medium | high | critical")
+        if value not in _CLASSIFICATIONS:
+            raise ValueError(f"classification must be one of {list(_CLASSIFICATIONS)}")
         return value
+
+    @model_validator(mode="after")
+    def _classification_is_a_floor(self) -> PolicyProfileConfig:
+        """The risk class sets a *minimum*, and the profile may exceed it but never undercut it.
+
+        A classification that only labelled the profile was a word in a config file: `extra_reviews: 1` on
+        a `critical` profile meant one review, and nothing anywhere said that was too few. Now the class
+        says how many reviews the class is worth, and a configuration that asks for fewer is rejected at
+        load time rather than quietly governing less than its own name claims.
+        """
+        floor = _CLASSIFICATION_REVIEWS[self.classification]
+        if self.extra_reviews < floor:
+            raise ValueError(
+                f"profile {self.name!r} is classified {self.classification!r}, which requires at least "
+                f"{floor} review(s), but extra_reviews is {self.extra_reviews}")
+        if self.classification in _NEEDS_EXPLICIT_AUTONOMY and "allow_autonomous" not in self.model_fields_set:
+            raise ValueError(
+                f"profile {self.name!r} is classified {self.classification!r}, so allow_autonomous must be "
+                f"stated explicitly rather than defaulted: the default is True, and a class this serious "
+                f"should not inherit it silently")
+        return self
+
+    @property
+    def min_reviews(self) -> int:
+        """How many independent reviews this class is worth, whatever the profile asks for."""
+        return _CLASSIFICATION_REVIEWS[self.classification]
 
 
 class VerifyConfig(_Model):

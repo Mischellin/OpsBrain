@@ -717,8 +717,11 @@ class AutoService:
                                ("a precondition", profile.require_preconditions),
                                ("a verification check", profile.require_verification)):
             missing += [f"{kind} {item!r}" for item in required if not self._plan_states(plan, item)]
-        if profile.extra_reviews and len(review_ids) < profile.extra_reviews:
-            missing.append(f"{profile.extra_reviews} reviews (only {len(review_ids)} ran)")
+        # The effective floor, which is the class's - the configured number can only be higher, because
+        # the config layer refuses a profile that asks for less than its own classification is worth.
+        needed = max(profile.extra_reviews, profile.min_reviews)
+        if needed and len(review_ids) < needed:
+            missing.append(f"{needed} reviews ({profile.classification} class, {len(review_ids)} ran)")
         if profile.irreversible and not any(step.irreversible_reason for step in plan.changes):
             missing.append("an irreversible_reason on its steps")
         return ", ".join(missing)
