@@ -98,19 +98,35 @@ _NOT_SECRET_KEYS = frozenset({
 })
 
 
+#: `accessToken` -> `access_Token`. A run of capitals ends the word before it starts, except in the
+#: `HTTPServer` shape, where the last capital belongs to the word that follows.
+_CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def _normalise_key(key: str) -> str:
+    """Fold a key to `lower_snake` so camelCase and snake_case are judged by the same rule.
+
+    Case-folding first and only then looking for separators destroyed the camel-case half: `accessToken`
+    became `accesstoken` and matched nothing, so an opaque credential under that key came back untouched.
+    Splitting on the case boundary first, then folding, keeps `accessToken` and `access_token` the same
+    word while leaving `is_pass` and `isPass` the same non-word.
+    """
+    return _CAMEL.sub("_", str(key).strip()).replace("-", "_").replace(".", "_").casefold()
+
+
 def _is_sensitive_key(key: str) -> bool:
     """Whether a key names a credential. A name is judged whole, not by whether it contains a fragment.
 
     Substring matching is what made `is_pass` look like a password: the pattern's `pass` alternative
-    matched the tail of an unrelated word. The password family is now matched whole, and the rest only on
+    matched the tail of an unrelated word. The password family is matched whole, and the rest only on
     component boundaries, so a new key has to be genuinely credential-shaped to be masked.
     """
-    name = str(key).strip()
-    if name.casefold() in _NOT_SECRET_KEYS:
+    name = _normalise_key(key)
+    if name in _NOT_SECRET_KEYS:
         return False
     if _PASSWORD_NAME.match(name):
         return True
-    return bool(_SENSITIVE_NAME.search(name.casefold()))
+    return bool(_SENSITIVE_NAME.search(name))
 
 
 def redact_obj(value: Any) -> Any:

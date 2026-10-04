@@ -205,3 +205,47 @@ def test_verification_answers_survive_result_redaction(ops) -> None:  # type: ig
     assert body["is_pass"] is True
     assert body["passed"] == 2
     assert body["api_key"] != "sk-live-9", "the credential is still redacted"
+
+
+def test_camel_case_credentials_are_masked_like_their_snake_case_twin(ops) -> None:  # type: ignore[no-untyped-def]
+    """Case-folding before looking for separators destroyed the camel-case half.
+
+    `accessToken` folded to `accesstoken` and matched nothing, and an opaque credential under it evades
+    the format-specific string patterns, so `Core.call` returned it unchanged.
+    """
+    from opsbrain.redact import _is_sensitive_key
+
+    for camel, snake in (("accessToken", "access_token"), ("authToken", "auth_token"),
+                         ("clientSecret", "client_secret"), ("dbPassword", "db_password"),
+                         ("privateKey", "private_key"), ("refreshToken", "refresh_token")):
+        assert _is_sensitive_key(camel), f"{camel} names a credential"
+        assert _is_sensitive_key(camel) == _is_sensitive_key(snake), "camel and snake are one word"
+
+    answer = ops.call("k8s", {"action": "get"}, lambda: {"accessToken": "opaque-credential-value",
+                                                         "isPass": True, "accessLevel": "admin"})
+    body = json.loads(answer if isinstance(answer, str) else json.dumps(answer))
+    assert body["accessToken"] != "opaque-credential-value", "the credential is masked"
+    assert body["isPass"] is True, "a non-secret camel-case neighbour is not collateral damage"
+    assert body["accessLevel"] == "admin"
+
+
+def test_a_stored_full_result_is_still_parseable_json(ops) -> None:  # type: ignore[no-untyped-def]
+    """The text redactor does not recognise a quoted marker as done and unquotes it.
+
+    The artifact the truncated response points at was advertised as the full result, and stopped parsing
+    the moment it contained a masked field.
+    """
+    payload = {"rows": list(range(400)), "password": "hunter2", "note": "x" * 400}
+    # Shrink the limit so the truncation path - the one that stores an artifact - is the one under test.
+    ops.config = ops.config.model_copy(update={
+        "limits": ops.config.limits.model_copy(update={"max_chars": 200})})
+    answer = ops.call("k8s", {"action": "get"}, lambda: payload)
+    body = json.loads(answer if isinstance(answer, str) else json.dumps(answer))
+    assert body["truncated"] is True and "artifact" in body
+
+    # Read the file, not `ArtifactStore.read`: that one clips each line for display, which is a different
+    # question from whether what was stored still parses.
+    stored = (ops.artifacts.root / f"{body['artifact']}.txt").read_text(encoding="utf-8")
+    parsed = json.loads(stored)  # the defect: this used to fail on the unquoted marker
+    assert parsed["password"] != "hunter2", "the credential is masked in the artifact too"
+    assert len(parsed["rows"]) == 400, "and the rest of the document survived"

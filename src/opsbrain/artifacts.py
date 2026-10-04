@@ -33,8 +33,15 @@ class ArtifactStore:
         self.root = root
         self.retention_s = retention_days * 86_400
 
-    def save(self, kind: str, title: str, text: str) -> ArtifactMeta:
-        clean, redactions = redact(text)
+    def save(self, kind: str, title: str, text: str, *, redacted: bool = False) -> ArtifactMeta:
+        """Store `text`. Pass `redacted=True` when the caller has already redacted it.
+
+        Running the text redactor over an already-redacted document is not a no-op: it does not recognise
+        the quoted JSON marker `"password":"[REDACTED:value]"` as done, and rewrites it to a bare
+        unquoted token - so a stored result that was valid JSON stops parsing. The flag says what is true
+        rather than making the caller defend against a second pass.
+        """
+        clean, redactions = (text, 0) if redacted else redact(text)
         meta = ArtifactMeta(new_id("a"), kind, clip(title, 120), now(), len(clean.encode()), clean.count("\n") + 1,
                             redactions)
         write_private(self.root / f"{meta.id}.txt", clean)

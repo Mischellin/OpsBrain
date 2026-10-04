@@ -164,6 +164,10 @@ class Core:
             ok, result = False, {"error": str(exc)}
         except Exception as exc:  # noqa: BLE001 - a tool must answer, never crash the server
             ok, result = False, {"error": f"internal: {type(exc).__name__}: {str(exc)[:300]}"}
+        # Measured before redaction, because the whole point of the redaction is that the two differ.
+        # After it, a large private key collapsed to one marker reported the same length for both, and
+        # `opsbrain stats` showed no saving on exactly the outputs the redaction exists for.
+        unredacted_bytes = len(compact(result))
         # Redacted here, at the one place every result passes through, rather than in each handler. The
         # package promises that returned output is redacted, and that promise is only true if a handler
         # that forgets - ansible failure details, k8s event messages, prometheus alert annotations - cannot
@@ -171,9 +175,12 @@ class Core:
         text = compact(redact_obj(result))
         limit = self.config.limits.max_chars
         if len(text) > limit:
-            meta = self.artifacts.save("result", f"{tool} full result", text)
+            # The artifact is stored already redacted, and re-running the text redactor over it would turn
+            # the quoted marker `"password":"[REDACTED:value]"` into a bare unquoted token - so the
+            # "full result" the id points at would no longer be parseable JSON. It is marked instead.
+            meta = self.artifacts.save("result", f"{tool} full result (redacted)", text, redacted=True)
             text = compact({"truncated": True, "artifact": meta.id, "head": text[:limit]})
         self.audit.record(tool=tool, args={key: value for key, value in arguments.items() if value is not None},
-                          ok=ok, raw_bytes=max(raw_bytes.get(), len(text)), out_bytes=len(text),
+                          ok=ok, raw_bytes=max(raw_bytes.get(), unredacted_bytes), out_bytes=len(text),
                           ms=int((time.monotonic() - started) * 1000))
         return text
