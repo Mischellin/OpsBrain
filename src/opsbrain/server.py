@@ -52,11 +52,19 @@ def build_instructions(config: Any) -> str:
     # the same tuple the action table dispatches on. Prose here that drifts from the table is a client
     # following the instructions into an action that does not exist.
     steps = ", then ".join(f"action={step}" for step in AUTONOMOUS_FLOW)
+    # The apply and the verification sit *between* the decision and the judgement, and they are named
+    # here explicitly. The steps were once listed as review, decide, postflight - which describes a
+    # workflow that never changes anything: a client following it to the letter reaches the postflight
+    # with a change still pending and no report of anything having happened, and is told the change did
+    # what it was supposed to.
     return _COMMON + (
-        f"Mutations need no human step. Call `autonomy` with {steps}, in that order: the plan goes in "
-        "`document` as JSON for the first, the change id in `id` and the reviewed plan id in `plan` for "
-        "the second, the verification report in `document` for the third. An APPROVE issues the approval "
-        "the apply spends; a RETRY means review again; BLOCKED_AUTONOMOUSLY means it stopped and says why."
+        f"Mutations need no human step, in this order. Call `autonomy` with {steps}, and between the "
+        "second and the third run the capability's own apply tool (`tofu` or `ansible` action=apply "
+        "change_id=<id>) to spend the approval, then `autonomy` action=verify-plan with the change id to "
+        "measure what actually happened. The plan goes in `document` as JSON for review-plan, the change "
+        "id in `id` and the reviewed plan id in `plan` for decide, and the verify-plan report in "
+        "`document` for postflight. An APPROVE issues the approval the apply spends; a RETRY means review "
+        "again; BLOCKED_AUTONOMOUSLY means it stopped and says why."
         + _TAIL
     )
 

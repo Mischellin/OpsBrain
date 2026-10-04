@@ -825,8 +825,9 @@ class AutoService:
                               profile_requirements=(self._profile_for(plan).requirements_digest()
                                                     if self._profile_for(plan) else ""),
                               evidence_expires_in_s=evidence_remaining)
+        # The engine records the decision and attaches the approval under the change's own transition, so
+        # there is no second, unsynchronised write here to lose a race against a `discard`.
         approval = self.engine().issue(plan_id, arguments, binding, record=decision)
-        self.core.changes.attach_approval(change_id, approval)
         return {**out, "approval": approval, "next": f"apply change {change_id}; no human step is required"}
 
     def _review_state(self, review_id: str, plan_id: str) -> str | None:
@@ -977,6 +978,14 @@ class AutoService:
 
         self.guard_enabled()
         change = self.core.changes.get(change_id)
+        # The change remembers which plan it was decided under, and the postflight asks whether *that*
+        # plan's goal was met. Taking a caller's `plan_id` at its word let any stored plan be judged
+        # against this change - so the objective, the post-checks and the whole rubric were about
+        # something the change never ran, and the audit entry said otherwise.
+        recorded = str(change.details.get("plan_id") or "")
+        if recorded and plan_id != recorded:
+            raise OpsError(f"change {change_id} was decided under plan {recorded}, not {plan_id}; judging "
+                           f"it against {plan_id} would be assessing one piece of work by another's criteria")
         # A change that was never applied has no outcome to observe, and the one fact that says so is the
         # change's own state - not the verification report. A report can be handed in for a change that
         # was discarded, and every check in it will pass, because none of them ever touched anything.

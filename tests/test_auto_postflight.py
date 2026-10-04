@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from opsbrain.auto import postflight as module
 from opsbrain.auto.config import AutoConfig
 from opsbrain.auto.postflight import POSTFLIGHT_RUBRIC, Outcome, Postflight, postflight
 from opsbrain.auto.review import ReviewRequest, ReviewResult, RunnerStatus, Subject, Verdict
@@ -49,7 +50,13 @@ def service_for(tmp_path: Path, reviewer: Any) -> ReviewService:
 
 
 def passing_report(**overrides: Any) -> dict[str, Any]:
-    return {"change_id": "c-0000a1b2", "status": "PASS", "is_pass": True, "checks": 2,
+    """A report of the shape `verify_plan` returns, naming the change it is about.
+
+    `change_id` is not decoration: a postflight now refuses a report that does not name the change being
+    judged, so a fixture carrying a plausible-but-unrelated id would have been measuring the refusal
+    rather than the thing each test is about.
+    """
+    return {"change_id": "c-1", "status": "PASS", "is_pass": True, "checks": 2,
             "outstanding": [], "evidence_refs": ["ev-aaaaaaaabbbbbbbb"], **overrides}
 
 
@@ -149,3 +156,75 @@ def test_a_record_round_trips(tmp_path: Path) -> None:
     assert document["id"].startswith("pf")
     assert document["outcome"] == "not_met"
     assert json.loads(json.dumps(document)) == document
+
+
+def test_a_report_about_another_change_cannot_confirm_this_one(tmp_path: Path) -> None:
+    """The report is handed in by the caller, so its identity is the only thing tying it to this change.
+
+    `verify_plan` reports against the plan a caller names and the executor's change is a different id for
+    the same object, so both are accepted. A third id is somebody else's facts, and an absent one was
+    never measured against anything in particular - neither is a measurement of this change.
+    """
+    reviewer = ScriptedReviewer(Verdict.PASS)
+    service = service_for(tmp_path, reviewer)
+    stranger = module.postflight(service, change_id="c-1", plan_id="pl-1", objective="o", post_checks=(),
+                                 rollback="", verification=passing_report(change_id="c-someone-else"))
+    assert stranger.outcome is Outcome.UNCLEAR
+    assert not reviewer.seen, "the reviewer was asked to judge on somebody else's observations"
+    assert "not for c-1" in stranger.reason
+
+    anonymous = module.postflight(service, change_id="c-1", plan_id="pl-1", objective="o", post_checks=(),
+                                  rollback="", verification=passing_report(change_id=""))
+    assert anonymous.outcome is Outcome.UNCLEAR
+
+    # The plan id is the same object under its other name, and is accepted.
+    assert module.postflight(service, change_id="c-1", plan_id="c-1", objective="o", post_checks=(),
+                             rollback="", verification=passing_report()).outcome is Outcome.CONFIRMED
+
+
+def test_a_pass_that_carries_a_blocker_is_not_a_confirmation(tmp_path: Path) -> None:
+    """The review contract says a BLOCKER vetoes a pass, and the postflight has to honour that.
+
+    Mapping the raw verdict here told the operator to close a change on the strength of a response that
+    contained its own veto - the one contradiction the rest of the pipeline makes impossible to express.
+    """
+    from opsbrain.auto.review import Finding
+
+    reviewer = ScriptedReviewer(Verdict.PASS, findings=[{"summary": "the unit is masked",
+                                                         "severity": "BLOCKER"}])
+    result = module.postflight(service_for(tmp_path, reviewer), change_id="c-1", plan_id="pl-1",
+                               objective="o", post_checks=(), rollback="", verification=passing_report())
+    assert result.outcome is Outcome.NOT_MET, result.reason
+    assert "BLOCKER" in result.reason, result.reason
+    assert "the unit is masked" in result.findings, result.findings
+    assert Finding is not None
+
+
+def test_the_postflight_names_the_configured_model_so_its_identity_moves_with_it(tmp_path: Path) -> None:
+    """The review id is content-addressed over the model, so an unnamed model is an identity of its own.
+
+    Leaving it at the empty default made every postflight hash the same whatever was configured: switching
+    reviewers and re-running reused the previous model's cached verdict, and a runner that omits its model
+    left the record unattributed.
+    """
+    def for_model(root: Path, model: str) -> Any:
+        service = service_for(root, ScriptedReviewer(Verdict.PASS))
+        # A real `AutoConfig`, not `model_copy(update=...)`: that does not validate, so `review` would be
+        # a plain dict - and a test that read a model out of a dict would be testing the reader's
+        # tolerance rather than the naming.
+        service.config = AutoConfig(enabled=True, review={"runner": "codex", "model": model})
+        return service
+
+    first, second = for_model(tmp_path / "a", "gpt-a"), for_model(tmp_path / "b", "gpt-b")
+    asked: list[str] = []
+    for service in (first, second):
+        result = module.postflight(service, change_id="c-1", plan_id="pl-1", objective="o", post_checks=(),
+                                   rollback="", verification=passing_report())
+        assert result.outcome is Outcome.CONFIRMED, result.reason
+        asked.append(service._reviewer.seen[-1].model)
+    assert asked == ["gpt-a", "gpt-b"], asked
+    assert module.postflight(first, change_id="c-1", plan_id="pl-1", objective="o", post_checks=(),
+                             rollback="", verification=passing_report()).review_id != module.postflight(
+        second, change_id="c-1", plan_id="pl-1", objective="o", post_checks=(),
+        rollback="", verification=passing_report()).review_id, (
+        "the same goal judged by two models is two reviews, not one cached verdict")

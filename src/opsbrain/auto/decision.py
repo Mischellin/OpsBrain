@@ -461,6 +461,16 @@ class ApprovalEngine:
             # A verdict, not a missing review. Treated as "not PASS" above it was caught by the generic
             # branch, which returns BLOCKED_AUTONOMOUSLY - so the retry branch further down could never run
             # and the documented `RETRY` was unreachable for the one verdict that exists to produce it.
+            #
+            # Every ceiling, not just the repair count. The preflight NEEDS_EVIDENCE branch below asks
+            # `_budget_exhausted` first, and this one did not: a deployment that had spent its call
+            # budget, its money or its wall-clock was still told to go and collect more evidence, which is
+            # one more attempt at something the operator already ran out of. `max_repair_cycles` bounds
+            # how many times the loop may go round, not what it may spend going round.
+            exhausted = self._budget_exhausted(inputs)
+            if exhausted:
+                return (Decision.BLOCKED_AUTONOMOUSLY, Reason.RETRIES_EXHAUSTED, exhausted,
+                        "raise the budget deliberately, or a human looks at this")
             if inputs.attempts < self.config.decision.max_repair_cycles:
                 return (Decision.RETRY, Reason.RETRY_BUDGET_LEFT,
                         "the reviewer asked for evidence this plan does not carry", "collect it and review again")
@@ -626,11 +636,23 @@ class ApprovalEngine:
                 f"decision {already} already issued the approval for {binding.change_id}; re-review the "
                 f"plan rather than re-issuing the same decision")
         approval_id = self.approvals.issue(binding).id
-        self.changes.record_decision_inputs(
-            binding.change_id, evidence_ids=list(binding.evidence_ids),
-            policy_version=binding.policy_version, plan_id=plan_id, decision=record.decision.value,
-            arguments_hash=binding.arguments_hash, profile=binding.profile,
-            decision_record=record.to_dict())
+        # The change's own transition re-checks that it is still open, records what was decided and takes
+        # the approval, all under one lock. Checking the state here, publishing, and recording afterwards
+        # left a window in which a `discard` could land: the approval was live, the change carried a
+        # `decision_id` for it, and every later attempt was refused as a replay - for ever, over work that
+        # had only been cancelled. If the change refuses, the approval just published is withdrawn, so a
+        # later legitimate decision is not blocked by this one.
+        try:
+            self.changes.record_and_attach(
+                binding.change_id, approval_id, evidence_ids=list(binding.evidence_ids),
+                policy_version=binding.policy_version, plan_id=plan_id, decision=record.decision.value,
+                arguments_hash=binding.arguments_hash, profile=binding.profile,
+                profile_version=binding.profile_version,
+                profile_requirements=binding.profile_requirements,
+                decision_record=record.to_dict())
+        except OpsError:
+            self.approvals.withdraw(approval_id, binding)
+            raise
         return approval_id
 
     # ----------------------------------------------------------------------------------------- audit

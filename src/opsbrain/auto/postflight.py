@@ -98,13 +98,22 @@ def postflight(reviews: Any, *, change_id: str, plan_id: str, objective: str,
     # `verification` is the deterministic report from OPS-AUTO-07: the ground truth the model reasons over,
     # and its absence caps the answer at `UNCLEAR`.
     measured = _what_was_measured(verification)
-    if not measured:
+    if measured is None:
         # Fail-closed, before the model is asked anything. A judgement made with no measurements is a
         # guess, and a guess that says "confirmed" is the worst possible guess.
         return Postflight(change_id=change_id, plan_id=plan_id, outcome=Outcome.UNCLEAR,
                           reason="nothing measured the outcome, so there is nothing to judge; "
                                  "the checks the plan declared did not run",
                           findings=("the change was applied without a verification report",))
+    if not _measured_here(measured, change_id, plan_id):
+        # The report is supplied by the caller, so its saying `PASS` says nothing on its own - least of
+        # all about *this* change. A report belonging to another change describes another change's facts,
+        # and a report that names no change at all was never measured against anything in particular.
+        about = measured["about"] or "no change in particular"
+        return Postflight(change_id=change_id, plan_id=plan_id, outcome=Outcome.UNCLEAR,
+                          reason=f"the verification report is for {about}, not for {change_id}; a change is "
+                                 "not assessed on somebody else's observations",
+                          findings=("the verification report does not name this change",))
     if measured["status"] != "PASS":
         return Postflight(change_id=change_id, plan_id=plan_id, outcome=Outcome.NOT_MET,
                           reason=f"the checks ran and reported {measured['status']}: "
@@ -115,6 +124,11 @@ def postflight(reviews: Any, *, change_id: str, plan_id: str, objective: str,
         subject=Subject.INFRA_RESULT, subject_ref=change_id,
         objective=f"did this change achieve its goal? goal: {objective}",
         rubric_version=POSTFLIGHT_RUBRIC,
+        # The model is part of the request's content-addressed identity, so leaving it at the empty
+        # default made every postflight hash the same whatever was configured: re-running after switching
+        # reviewers reused the previous model's cached verdict, and a runner that omits its model left the
+        # record unattributed. Preflight names it for the same reason.
+        model=_configured_model(reviews),
         context=_context(objective, post_checks, rollback, measured),
         evidence_refs=tuple(measured["evidence_refs"]))
     try:
@@ -126,6 +140,17 @@ def postflight(reviews: Any, *, change_id: str, plan_id: str, objective: str,
         # A reviewer that failed did not clear the change. That is what `UNCLEAR` is for.
         return Postflight(change_id=change_id, plan_id=plan_id, outcome=Outcome.UNCLEAR,
                           reason=f"the reviewer reported {answer.status.value}: {answer.note or 'no answer'}",
+                          evidence_refs=tuple(measured["evidence_refs"]))
+    if not answer.is_pass:
+        # `PASS` with a BLOCKER finding is not a pass, and the review contract says so in exactly these
+        # words. Mapping the raw verdict here would have told the operator to close the change while the
+        # same response carried a blocker that vetoes its own verdict - the one contradiction the review
+        # contract exists to make impossible to express.
+        blockers = [finding.summary for finding in answer.findings if finding.severity.value.upper() == "BLOCKER"]
+        return Postflight(change_id=change_id, plan_id=plan_id, outcome=Outcome.NOT_MET,
+                          reason=(f"the reviewer answered {answer.verdict.value} and the same answer carries "
+                                  f"{len(blockers)} BLOCKER finding(s); a pass that vetoes itself is not a pass"),
+                          review_id=answer.review_id, model=answer.model, findings=tuple(blockers),
                           evidence_refs=tuple(measured["evidence_refs"]))
     return Postflight(
         change_id=change_id, plan_id=plan_id, outcome=_VERDICT_MAP.get(answer.verdict.value, Outcome.UNCLEAR),
@@ -145,6 +170,23 @@ def unobserved(change_id: str, plan_id: str, reason: str) -> Postflight:
     return Postflight(change_id=change_id, plan_id=plan_id, outcome=Outcome.UNCLEAR, reason=reason)
 
 
+def _configured_model(reviews: Any) -> str:
+    """The model this reviewer is configured to use, or an empty string if there is no configuration.
+
+    `reviews` is typed loosely for the same reason the whole module is: `ReviewService` lives in the module
+    that imports this one. Anything that is not a configured model stays empty rather than guessed, so a
+    stub reviewer produces the same identity as before and only a real configuration changes the hash.
+    """
+    config = getattr(reviews, "config", None)
+    review = getattr(config, "review", None)
+    if isinstance(review, dict):
+        # `Config.model_copy(update=...)` does not validate, so a caller that rebuilt the subsystem that
+        # way leaves `review` as the plain mapping it passed in. Reading the attribute off a dict would
+        # quietly return an empty model - which is the same unnamed-model defect this exists to close.
+        return str(review.get("model", "") or "")
+    return str(getattr(review, "model", "") or "")
+
+
 def _what_was_measured(verification: dict[str, Any] | None) -> dict[str, Any] | None:
     """The facts the judgement rests on, or None when nothing was measured.
 
@@ -159,9 +201,21 @@ def _what_was_measured(verification: dict[str, Any] | None) -> dict[str, Any] | 
     return {
         "status": status.upper(),
         "reason": str(verification.get("reason") or ""),
+        "about": str(verification.get("change_id") or verification.get("change") or ""),
         "outstanding": [str(item.get("check", "")) for item in verification.get("outstanding", ())],
         "evidence_refs": [str(ref) for ref in verification.get("evidence_refs", ())],
     }
+
+
+def _measured_here(measured: dict[str, Any], change_id: str, plan_id: str) -> bool:
+    """Whether these measurements were taken about this change.
+
+    Both identities are accepted because both come out of this pipeline: `verify_plan` reports against the
+    plan a caller names, and the executor's change is a different id for the same object. A report naming
+    neither, or naming a third thing, measured something else - and there is no version of "it probably
+    measured the right one" that this should accept.
+    """
+    return measured["about"] in {change_id, plan_id}
 
 
 def _context(objective: str, post_checks: tuple[str, ...], rollback: str,

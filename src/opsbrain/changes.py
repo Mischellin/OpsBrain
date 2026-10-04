@@ -219,18 +219,60 @@ class ChangeStore:
         surviving artefact is a binding, and nobody can say afterwards *why* the execution was allowed.
         """
         with self._transition(change_id):
-            change = self.get(change_id)
-            change.details = {**change.details, "evidence_ids": list(evidence_ids),
-                              "policy_version": policy_version, "plan_id": plan_id,
-                              "decision": decision, "arguments_hash": arguments_hash,
-                              **({"profile": profile} if profile else {}),
-                              **({"profile_version": profile_version} if profile_version else {}),
-                              **({"profile_requirements": profile_requirements}
-                                 if profile_requirements else {}),
-                              **({"decision_id": (decision_record or {}).get("id")}
-                                 if decision_record and decision_record.get("id") else {}),
-                              **({"decision_record": decision_record} if decision_record else {})}
+            change = self._record_decision_locked(change_id, evidence_ids=evidence_ids,
+                                                  policy_version=policy_version, plan_id=plan_id,
+                                                  decision=decision, arguments_hash=arguments_hash,
+                                                  profile=profile, profile_version=profile_version,
+                                                  profile_requirements=profile_requirements,
+                                                  decision_record=decision_record)
             self._save(change)
+        return change
+
+    def record_and_attach(self, change_id: str, approval_id: str, *, evidence_ids: Sequence[str],
+                          policy_version: str, plan_id: str, decision: str, arguments_hash: str = "",
+                          profile: str = "", profile_version: str = "", profile_requirements: str = "",
+                          decision_record: dict[str, Any] | None = None) -> Change:
+        """Record what was decided *and* attach the approval, inside one transition.
+
+        Two locks with a publish in between is a window. `decide_change` checks that the change is open,
+        the engine publishes the approval, and only then are the decision's inputs written; a `discard`
+        landing in that window left an issued approval with no change left to spend it on, and the change
+        carrying a `decision_id` that corresponded to nothing spendable - so a retry was refused as a
+        replay, for ever, over work that had simply been cancelled.
+
+        So the open-state check, the record and the attachment happen together, and the approval is
+        published only once they have. A change that is no longer open is refused here, and nothing is
+        written at all.
+        """
+        with self._transition(change_id):
+            change = self.get(change_id)
+            if change.state not in (PENDING, APPROVED):
+                raise OpsError(f"change {change_id} is {change.state}; a decision about work that has "
+                               "already run, or was discarded, authorises nothing, and none was recorded")
+            change = self._record_decision_locked(change_id, evidence_ids=evidence_ids,
+                                                  policy_version=policy_version, plan_id=plan_id,
+                                                  decision=decision, arguments_hash=arguments_hash,
+                                                  profile=profile, profile_version=profile_version,
+                                                  profile_requirements=profile_requirements,
+                                                  decision_record=decision_record)
+            change.engine_approval = approval_id
+            self._save(change)
+        return change
+
+    def _record_decision_locked(self, change_id: str, **fields: Any) -> Change:
+        """Write the decision's inputs onto a change. The caller holds the transition lock."""
+        change = self.get(change_id)
+        record = fields.get("decision_record")
+        change.details = {**change.details, "evidence_ids": list(fields["evidence_ids"]),
+                          "policy_version": fields["policy_version"], "plan_id": fields["plan_id"],
+                          "decision": fields["decision"], "arguments_hash": fields["arguments_hash"],
+                          **({"profile": fields["profile"]} if fields.get("profile") else {}),
+                          **({"profile_version": fields["profile_version"]}
+                             if fields.get("profile_version") else {}),
+                          **({"profile_requirements": fields["profile_requirements"]}
+                             if fields.get("profile_requirements") else {}),
+                          **({"decision_id": record["id"]} if record and record.get("id") else {}),
+                          **({"decision_record": record} if record else {})}
         return change
 
     def discard(self, change_id: str) -> Change:

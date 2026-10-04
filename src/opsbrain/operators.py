@@ -402,6 +402,13 @@ class Operators(Core):
 
     def _done_ansible(self, job: Job, rc: int, text: str) -> dict[str, Any]:
         meta = self.artifacts.save(job.kind, job.title, text)
+        if job.kind == "ansible.apply":
+            # The lease is spent when the gate opens, and settled here, where the job's fate is known.
+            # `_settle_lease` was reached from the OpenTofu finaliser only, so every autonomous Ansible
+            # approval stayed `CONSUMED` with `executed=False` for ever: the audit claimed the approval was
+            # never used, and the lease became reclaimable after its TTL - a second apply of a change
+            # whose work had already landed.
+            self._settle_lease(job, rc)
         summary = parsers.ansible_run(text, max_items=self.max_items)
         out: dict[str, Any] = {"playbook": job.meta["playbook"], "limit": job.meta.get("limit"),
                                "artifact": meta.id, **summary}

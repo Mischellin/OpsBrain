@@ -298,6 +298,26 @@ class ApprovalStore:
             write_private(path, json.dumps(approval.to_dict(), ensure_ascii=False))
         return approval
 
+    def withdraw(self, approval_id: str, binding: ApprovalBinding) -> bool:
+        """Remove an approval that was published for a change which then refused to take it.
+
+        Only a record that is still `ISSUED` and carries this exact binding is removed. Anything spent,
+        revoked, or belonging to a different decision is left alone - this exists to undo the *publication*
+        of an approval nobody ended up authorised to spend, not to erase a record of something that ran.
+        Returns whether anything was removed.
+        """
+        path = self._path(approval_id)
+        if not path.is_file():
+            return False
+        try:
+            approval = Approval.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            return False
+        if approval.state is not LeaseState.ISSUED or approval.binding.binding_hash != binding.binding_hash:
+            return False
+        path.unlink()
+        return True
+
     def get(self, approval_id: str) -> Approval:
         path = self._path(approval_id)
         if not path.is_file():

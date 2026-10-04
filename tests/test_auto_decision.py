@@ -2090,3 +2090,109 @@ def test_two_profiles_with_one_name_and_different_rules_are_distinguishable() ->
     assert tight.requirements_digest() != loose.requirements_digest()
     assert tight.requirements_digest() == PolicyProfileConfig(
         name="secrets", allowed_targets=["p"], extra_reviews=2).requirements_digest()
+
+
+def test_a_change_discarded_before_publication_leaves_no_approval_and_stays_decidable(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The state check, the publish and the record have to be one step, not three in a row.
+
+    `decide_change` checked that the change was open, the engine published the approval, and only then
+    were the decision's inputs written. A `discard` landing in that window left a live approval nobody
+    could spend, a change carrying a `decision_id` for it, and every later attempt refused as a replay -
+    for ever, over work that had merely been cancelled.
+    """
+    from opsbrain.auto.approval import ApprovalStore
+
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    ops.auto.review_plan(plan)
+    store = ApprovalStore(ops.auto.root / "approvals")
+
+    # Discard lands after the engine's own open-state check and before the change is written.
+    original = ops.auto.engine().changes.record_and_attach
+    engine_changes = ops.auto.engine().changes
+
+    def discard_between(change_id: str, *args: Any, **kwargs: Any) -> Any:
+        ops.changes.discard(change_id)
+        return original(change_id, *args, **kwargs)
+
+    engine_changes.record_and_attach = discard_between  # type: ignore[method-assign]
+    with pytest.raises(OpsError, match="discarded"):
+        ops.auto.decide_change(change.id, plan.id)
+    assert store.list() == [], "the approval published for a discarded change was withdrawn"
+    assert ops.changes.get(change.id).engine_approval == "", "and the change carries none"
+    assert ops.changes.get(change.id).details.get("decision_id") in (None, ""), (
+        "no decision id is recorded, so a later legitimate decision is not refused as a replay")
+
+
+def test_a_needs_evidence_retry_obeys_every_ceiling_not_just_the_repair_count(tmp_path) -> None:
+    """The preflight branch checks the budget first; the review-verdict branch did not.
+
+    A deployment that had spent its call budget, its money or its wall-clock was still told to go and
+    collect more evidence - one more attempt at something the operator had already run out of.
+    """
+    from opsbrain.auto.decision import Decision as D
+
+    # Five repair cycles left, and the call ceiling already spent: the ceiling is the one that binds.
+    broke = ApprovalEngine(AutoConfig(enabled=True, autonomy_token=TOKEN,
+                                      decision={"mode": "autonomous", "max_repair_cycles": 5},
+                                      review={"max_model_calls": 3}))
+    reviews = ("rv-0000abcd",)
+    out = broke.decide(inputs(review_verdict="NEEDS_EVIDENCE", attempts=0, calls_used=3),
+                       "pl-1", "ah-1", change_id="c-1", review_ids=reviews)
+    assert out.decision is D.BLOCKED_AUTONOMOUSLY, out.detail
+    assert "call ceiling" in out.detail, out.detail
+    # And with budget left it still retries, so the ceiling is what changed and not the verdict.
+    assert broke.decide(inputs(review_verdict="NEEDS_EVIDENCE", attempts=0, calls_used=0),
+                        "pl-1", "ah-1", change_id="c-1", review_ids=reviews).decision is D.RETRY
+
+
+def test_the_instructions_name_the_apply_and_the_verification_between_decide_and_postflight(ops) -> None:  # type: ignore[no-untyped-def]
+    """The advertised flow has to actually change something, or it is a diagram of a workflow.
+
+    The steps were listed as review, decide, postflight. A client following that to the letter reaches
+    the judgement with a change still pending and no report of anything having happened - and is told the
+    change did what it was supposed to. The apply is what spends the approval; the verification is what
+    the judgement reasons over.
+    """
+    from opsbrain.auto.config import AutoConfig
+    from opsbrain.server import build_instructions
+
+    autonomous = ops.config.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token=TOKEN, decision={"mode": "autonomous"})})
+    text = build_instructions(autonomous)
+    assert "action=apply" in text, "nothing in the instructions spends the approval"
+    assert "action=verify-plan" in text, "and nothing measures whether the change worked"
+    # Naming them is not enough on its own: the postflight judges what the verification measured, so the
+    # two have to be placed between the decision and the judgement, and the text has to say where.
+    assert "between the second and the third" in text, text[text.index("action=decide"):][:200]
+
+
+def test_an_autonomous_ansible_apply_settles_its_lease_when_the_job_finishes(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The lease is settled by the job finaliser, and the Ansible one never called it.
+
+    `_settle_lease` was reached from the OpenTofu finaliser only, so every autonomous Ansible approval
+    stayed `CONSUMED` with `executed=False` for ever. The audit then claimed the approval was never used,
+    and the lease became reclaimable after its TTL - a second apply of a change whose work had already
+    landed, with the record saying the first one did nothing.
+    """
+    from opsbrain.auto.approval import ApprovalStore
+
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("ansible.apply", "common", "restart logrotate",
+                                ops._ansible_hash("common", "web", None),
+                                args={"playbook": "common", "limit": "web"}, details={})
+    plan = _plan_for_change(target="common", capability="ansible.apply",
+                            arguments={"playbook": "common", "limit": "web"},
+                            bundle_id=_bundle(ops, tmp_path, change.id))
+    ops.auto.review_plan(plan)
+    approval = ops.auto.decide_change(change.id, plan.id)["approval"]
+    ops.exec.on(r"ansible-playbook", "changed=1 ok=1\\n")
+    assert ops.ansible_apply(change.id)["state"] == "done"
+
+    settled = ApprovalStore(ops.auto.root / "approvals").get(approval)
+    assert settled.outcome.get("executed") is True, (
+        f"the job ran and the record still says the approval was not executed: {settled.outcome}")
+    assert settled.state.value == "consumed", settled.state
