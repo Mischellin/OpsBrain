@@ -18,9 +18,9 @@ Epic: [#3](https://github.com/Mischellin/OpsBrain/issues/3). База — [#2](h
 | 5 | OPS-AUTO-02 — Evidence Bundle | `auto/evidence.py` | [#16](https://github.com/Mischellin/OpsBrain/pull/16) | 228 тестов, 2 круга замечаний закрыто |
 | 8 | OPS-AUTO-07 — проверка фактического состояния | `auto/verify.py` | [#17](https://github.com/Mischellin/OpsBrain/pull/17) | 246 тестов, 4 круга замечаний закрыто |
 | 6 | OPS-AUTO-03 — preflight плана | `auto/plan.py`, `auto/preflight.py` | [#18](https://github.com/Mischellin/OpsBrain/pull/18) | 343 теста, 4 круга замечаний закрыто |
-| 14 | OPS-AUTO-05 — STALE approval, optimistic locking, single-use lease | `auto/approval.py` | [#19](https://github.com/Mischellin/OpsBrain/pull/19) | 398 тестов, 25 находок Codex закрыто |
-| — | три P1 из v1 (P1-фиксы базы) | `redact.py`, `readers.py`, `changes.py`, `operators.py` | [#20](https://github.com/Mischellin/OpsBrain/pull/20) | 418 тестов, 13 находок Codex закрыто |
-| 7 | OPS-AUTO-04 — ApprovalEngine | `auto/decision.py` | [#21](https://github.com/Mischellin/OpsBrain/pull/21) | 504 теста, 44 находки Codex закрыто |
+| 14 | OPS-AUTO-05 — STALE approval, optimistic locking, single-use lease | `auto/approval.py` | [#19](https://github.com/Mischellin/OpsBrain/pull/19) | 400 тестов, 28 находок Codex закрыто |
+| — | три P1 из v1 (P1-фиксы базы) | `redact.py`, `readers.py`, `changes.py`, `operators.py` | [#20](https://github.com/Mischellin/OpsBrain/pull/20) | 420 тестов, 13 находок Codex закрыто |
+| 7 | OPS-AUTO-04 — ApprovalEngine | `auto/decision.py` | [#21](https://github.com/Mischellin/OpsBrain/pull/21) | 512 тестов, 49 находок Codex закрыто |
 | 9 | OPS-AUTO-10 — policy profiles | `auto/profiles.py` | — | не начато |
 | 10 | OPS-AUTO-08 — Codex postflight | `auto/postflight.py` | — | не начато |
 | 11 | OPS-AUTO-06 — canary rollout | `auto/rollout.py` | — | не начато |
@@ -98,7 +98,7 @@ credentials, помечаются как пропущенные, а не выд�
 - [x] Restart/retry не дублирует apply: идемпотентный ретрай отвечает записанным исходом, не входя в тело
       ещё раз, а change остаётся одноразовым.
 - [ ] P1-замечания Codex закрыты во всех открытых PR; на каждом — свежее `@codex review` без P1.
-      (Десять отзывов подряд разобраны полностью: 14 → 9 → 8 → 8 → 4 → 3 → 1 → 3 → 4 находок за круг. Одиннадцатое
+      (Одиннадцать отзывов подряд разобраны полностью: 14 → 9 → 8 → 8 → 4 → 3 → 1 → 3 → 4 → 8 находок за круг. Двенадцатое
       ревью запрошено, вердикт придёт асинхронно. Список находок не объявляется полным, пока не
       пришёл круг без P1.)
 - [ ] Остальные 5 задач (#9, #10, #11, #12, #13) реализованы в том же формате.
