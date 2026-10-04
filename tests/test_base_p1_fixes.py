@@ -232,6 +232,17 @@ def test_camel_case_credentials_are_masked_like_their_snake_case_twin(ops) -> No
     assert body["isPass"] is True, "a non-secret camel-case neighbour is not collateral damage"
     assert body["accessLevel"] == "admin"
 
+    # The same key already squashed, as an upstream payload that emits `accesstoken` would. There is no
+    # separator left in it to be found, and an opaque credential evades the value-pattern checks.
+    squashed = ops.call("k8s", {"action": "get"},
+                        lambda: {"accesstoken": "opaque-credential-value", "refreshtoken": "another-one",
+                                 "tokenizer": "nltk-english", "secretary": "ops"})
+    body = json.loads(squashed if isinstance(squashed, str) else squashed)
+    assert body["accesstoken"] != "opaque-credential-value", "a squashed credential name is still a name"
+    assert body["refreshtoken"] != "another-one"
+    assert body["tokenizer"] == "nltk-english", "and the suffix rule does not take ordinary words with it"
+    assert body["secretary"] == "ops"
+
 
 def test_a_stored_full_result_is_still_parseable_json(ops) -> None:  # type: ignore[no-untyped-def]
     """The text redactor does not recognise a quoted marker as done and unquotes it.

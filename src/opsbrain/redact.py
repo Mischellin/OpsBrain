@@ -84,6 +84,13 @@ _PASSWORD_NAME = re.compile(r"(?i)^(?:" + "|".join(_PASSWORD_NAMES) + r")$")
 #: `client_secret` are credentials; `tokenizer`, `keynote` and `authorized` are not.
 _SENSITIVE_NAME = re.compile(r"(?i)(?:^|[^a-z0-9])(?:" + _SENSITIVE_KEY + r")(?:[^a-z0-9]|$)")
 
+#: ...and on a suffix, because a name can also arrive already squashed: an upstream payload that emits
+#: `accesstoken` or `refreshtoken` carries the credential just as surely, and no separator will ever
+#: appear in it to be found. Restricted to words that cannot be the tail of an ordinary term -
+#: `tokenizer`, `keynote`, `secretary` and `authorized` do not end in any of these, which is the point.
+_SENSITIVE_SUFFIX = re.compile(r"(?:token|tokens|secret|secrets|passphrase|password|passwd|apikey|"
+                               r"privatekey|presharedkey|credential|credentials|dsn)$")
+
 #: Keys that *look* sensitive and are not. `token` in a budget report is a count, not a credential, and
 #: masking it replaces a number with a string - which silently breaks every client that reports usage,
 #: and hides exactly the field an operator is watching. Listed explicitly rather than by narrowing the
@@ -126,7 +133,7 @@ def _is_sensitive_key(key: str) -> bool:
         return False
     if _PASSWORD_NAME.match(name):
         return True
-    return bool(_SENSITIVE_NAME.search(name))
+    return bool(_SENSITIVE_NAME.search(name) or _SENSITIVE_SUFFIX.search(name))
 
 
 def redact_obj(value: Any) -> Any:
