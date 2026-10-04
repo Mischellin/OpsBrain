@@ -28,7 +28,7 @@ _TOKENS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 _URL_AUTH = re.compile(r"\b([a-z][a-z0-9+.-]{1,20}://[^\s:/@]{1,64}):([^\s@/]{1,256})@")
 _SENSITIVE_KEY = (r"pass(?:word|wd|phrase)?|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|"
-                  r"preshared[_-]?key|credentials?|auth[_-]?key|client[_-]?secret|dsn")
+                  r"pre[_-]?shared[_-]?key|credentials?|auth[_-]?key|client[_-]?secret|dsn")
 _KEY_VALUE = re.compile(
     rf"(?i)((?:[A-Za-z0-9_.-]{{0,40}})(?:{_SENSITIVE_KEY})[A-Za-z0-9_.-]{{0,20}}[\"']?\s{{0,3}}[=:][ \t]{{0,40}})"
     r"(\"[^\"\n]{1,512}\"|'[^'\n]{1,512}'|[^\s,;\"']{1,512})")
@@ -99,18 +99,37 @@ _SENSITIVE_NAME = re.compile(r"(?i)(?:^|[^a-z0-9])(?:" + _SENSITIVE_KEY + r")(?:
 _SENSITIVE_SUFFIX = re.compile(r"(?:token|tokens|secret|secrets|passphrase|password|passwd|apikey|"
                                r"privatekey|presharedkey|credential|credentials|dsn)$")
 
-#: Keys that *look* sensitive and are not. `token` in a budget report is a count, not a credential, and
-#: masking it replaces a number with a string - which silently breaks every client that reports usage,
-#: and hides exactly the field an operator is watching. Listed explicitly rather than by narrowing the
-#: pattern, so a genuinely new secret-shaped key is redacted by default.
-_NOT_SECRET_KEYS = frozenset({
+#: Keys that *look* sensitive and are not - but only while the value is the kind of value they promise.
+#: `token` in a budget report is a count, not a credential, and masking it replaces a number with a string:
+#: that silently breaks every client that reports usage, and hides exactly the field an operator is
+#: watching. The exemption is therefore a property of the *value*, never of the name alone: `tokens` is
+#: also what a credential collection is called, and `{"tokens": ["opaque-auth-token"]}` has to stay masked.
+#: Listed explicitly rather than by narrowing the pattern, so a genuinely new secret-shaped key is
+#: redacted by default.
+_NUMERIC_KEYS = frozenset({
     "input_tokens", "output_tokens", "max_tokens", "total_tokens", "tokens", "token_budget",
     "tokens_used", "tokens_remaining", "max_model_calls", "model_calls", "spend_usd", "budget_usd",
-    # Verification and review vocabulary. `passed` / `is_pass` are answers, not secrets, and redacting
-    # them leaves a client unable to tell whether a check succeeded. A key that is *only* `pass` is not
-    # here - that one is a password field, and `_PASSWORD_NAME` matches it whole.
-    "passed", "is_pass", "passes", "passing", "bypass", "bypassed", "password_changed",
 })
+#: Verification and review vocabulary. `passed` / `is_pass` are answers, not secrets, and redacting them
+#: leaves a client unable to tell whether a check succeeded. A key that is *only* `pass` is not here - that
+#: one is a password field, and `_PASSWORD_NAME` matches it whole. These carry a flag or a count.
+_FLAG_KEYS = frozenset({"passed", "is_pass", "passes", "passing", "bypass", "bypassed", "password_changed"})
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _exempt(name: str, value: Any) -> bool:
+    """Whether a key that looks sensitive is vouched for by the *type* of what it holds."""
+    if name in _NUMERIC_KEYS:
+        return _is_number(value)
+    if name in _FLAG_KEYS:
+        return isinstance(value, bool) or _is_number(value)
+    return False
+
+
+_NO_VALUE: Any = object()
 
 
 #: `accessToken` -> `access_Token`. A run of capitals ends the word before it starts, except in the
@@ -129,15 +148,19 @@ def _normalise_key(key: str) -> str:
     return _CAMEL.sub("_", str(key).strip()).replace("-", "_").replace(".", "_").casefold()
 
 
-def _is_sensitive_key(key: str) -> bool:
+def _is_sensitive_key(key: str, value: Any = _NO_VALUE) -> bool:
     """Whether a key names a credential. A name is judged whole, not by whether it contains a fragment.
+
+    With a `value`, a key from the telemetry vocabulary is cleared only when the value is a number (or, for
+    the verification vocabulary, a flag). Asked about the name alone, those names are judged as the name
+    they are and are not cleared.
 
     Substring matching is what made `is_pass` look like a password: the pattern's `pass` alternative
     matched the tail of an unrelated word. The password family is matched whole, and the rest only on
     component boundaries, so a new key has to be genuinely credential-shaped to be masked.
     """
     name = _normalise_key(key)
-    if name in _NOT_SECRET_KEYS:
+    if value is not _NO_VALUE and _exempt(name, value):
         return False
     if _PASSWORD_NAME.match(name):
         return True
@@ -150,7 +173,7 @@ def redact_obj(value: Any) -> Any:
     if isinstance(value, str):
         return redact_text(value)
     if isinstance(value, dict):
-        return {key: (MARK.format(kind="value") if _is_sensitive_key(key) and item not in (None, "")
+        return {key: (MARK.format(kind="value") if _is_sensitive_key(key, item) and item not in (None, "")
                       else redact_obj(item)) for key, item in value.items()}
     if isinstance(value, list | tuple):
         return [redact_obj(item) for item in value]

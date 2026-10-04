@@ -422,3 +422,158 @@ def test_a_namespace_listing_honours_the_selector_it_was_given(ops) -> None:  # 
     scripts = [script for _, script in ops.exec.calls if "get namespaces" in script]
     assert scripts and all("-l env=prod" in script for script in scripts), (
         "the selector was accepted and then not used")
+
+
+# ------------------------------------------------------- round 2: the same guard, on the paths it missed
+def _cluster(ops: Any, *, denied: str = "prod") -> None:
+    """A three-namespace cluster where the policy allows k8s.read but denies one namespace."""
+    ops.exec.rules.clear()
+    ops.exec.on(r"get namespaces", json.dumps({"items": [
+        {"metadata": {"name": "default"}}, {"metadata": {"name": denied}},
+        {"metadata": {"name": "argocd"}}]}) + "\n")
+    ops.exec.on(r"get nodes", json.dumps({"items": []}) + "\n")
+    for scope in ("default", denied, "argocd"):
+        ops.exec.on(rf"get pods -n {scope}\b",
+                    json.dumps({"items": [{"metadata": {"name": f"pod-{scope}", "namespace": scope},
+                                           "status": {"phase": "Running", "containerStatuses": []}}]}) + "\n")
+        ops.exec.on(rf"get events -n {scope}\b", json.dumps({"items": [
+            {"type": "Warning", "reason": f"Failed-{scope}", "message": f"event in {scope}",
+             "involvedObject": {"kind": "Pod", "name": f"pod-{scope}"},
+             "metadata": {"namespace": scope}, "count": 1}]}) + "\n")
+
+
+def test_overview_never_reads_a_denied_namespace(ops) -> None:  # type: ignore[no-untyped-def]
+    """`k8s_overview` ran `get pods -A` after checking only the bare capability.
+
+    Only `k8s_get` had learned the per-namespace rule, so the overview of a cluster whose policy denies
+    `prod` still counted - and named - everything running there.
+    """
+    _cluster(ops)
+    ops.require = _policy(ops, {"k8s.read": Access.ALLOW, "k8s.read:prod": Access.DENY})
+    out = ops.k8s_overview()
+    scripts = [script for _, script in ops.exec.calls]
+    assert all("-A" not in script for script in scripts), "no cluster-wide read was issued"
+    assert not any("-n prod" in script for script in scripts), "the denied namespace was never read"
+    assert out["pods"]["total"] == 2, "default and argocd were counted, prod was not"
+    assert "withheld" in out["pods"]
+    assert "prod" not in json.dumps(out), "and the denied name appears nowhere in the answer"
+
+
+def test_overview_does_not_read_a_denied_argocd_namespace(ops) -> None:  # type: ignore[no-untyped-def]
+    """The Argo CD lookup named its namespace in the command and never asked the policy about it."""
+    _cluster(ops)
+    ops.exec.on(r"get applications\.argoproj\.io -n argocd", json.dumps({"items": []}) + "\n")
+    ops.require = _policy(ops, {"k8s.read": Access.ALLOW, "k8s.read:argocd": Access.DENY})
+    out = ops.k8s_overview()
+    assert out["argo"] == "unavailable"
+    assert not any("applications" in script for _, script in ops.exec.calls), (
+        "the applications of a namespace the policy denies were requested")
+
+
+def test_events_never_read_a_denied_namespace(ops) -> None:  # type: ignore[no-untyped-def]
+    """`k8s_events()` with no namespace ran `get events -A`, carrying event text from every namespace."""
+    _cluster(ops)
+    ops.require = _policy(ops, {"k8s.read": Access.ALLOW, "k8s.read:prod": Access.DENY})
+    out = ops.k8s_events(None)
+    scripts = [script for _, script in ops.exec.calls]
+    assert all("-A" not in script for script in scripts)
+    assert not any("-n prod" in script for script in scripts)
+    text = json.dumps(out)
+    assert "event in prod" not in text and "Failed-prod" not in text
+    assert "event in default" in text, "the namespaces the policy covers are still reported"
+    assert "withheld" in out
+
+    # A namespace named explicitly is still judged against its own rule.
+    with pytest.raises(OpsError, match="prod"):
+        ops.k8s_events("prod")
+
+
+def test_the_inventory_lists_only_hosts_the_policy_covers(ops) -> None:  # type: ignore[no-untyped-def]
+    """`hosts_list` asked about the bare capability, so `hosts.read:pve: deny` never took part.
+
+    The inventory carries the address, the jump chain, the tags and the services of every host.
+    """
+    ops.require = _policy(ops, {"hosts.read": Access.ALLOW, "hosts.read:pve": Access.DENY})
+    out = ops.hosts_list()
+    names = {row["name"] for row in out["hosts"]}
+    assert "pve" not in names and {"ops", "router"} <= names
+    assert out["withheld"] == 1, "a count, never the name"
+    assert "10.0.0.11" not in json.dumps(out), "and the denied host's address is not disclosed"
+
+
+def test_a_named_namespace_is_judged_against_its_own_rule(ops) -> None:  # type: ignore[no-untyped-def]
+    """The listing branch was guarded; the lookup by name fell through to the bare capability.
+
+    `kind=namespaces, name=prod` therefore returned the very object `k8s.read:prod: deny` withholds.
+    `describe` had the same shape, and so did passing the namespace as `namespace` with no name, which
+    kubectl answers by listing every namespace because they are cluster-scoped.
+    """
+    _cluster(ops)
+    ops.exec.on(r"get namespaces prod", json.dumps({"items": [{"metadata": {"name": "prod"}}]}) + "\n")
+    ops.require = _policy(ops, {"k8s.read": Access.ALLOW, "k8s.read:prod": Access.DENY})
+
+    with pytest.raises(OpsError, match="prod"):
+        ops.k8s_get(kind="namespaces", name="prod")
+    with pytest.raises(OpsError, match="prod"):
+        ops.k8s_describe(kind="namespaces", name="prod")
+    assert not any("get namespaces prod" in script or "describe namespace" in script
+                   for _, script in ops.exec.calls), "the denied lookup never reached kubectl"
+
+    out = ops.k8s_get(kind="namespaces", namespace="prod")
+    assert "prod" not in json.dumps(out.get("namespaces", [])) + json.dumps(out.get("items", []))
+    assert out.get("withheld") == 1
+
+    allowed = ops.k8s_get(kind="namespaces", name="default")
+    assert allowed["kind"] == "namespaces", "a namespace the policy covers is still readable by name"
+
+
+def test_a_named_lookup_survives_an_empty_not_found_answer(ops) -> None:  # type: ignore[no-untyped-def]
+    """`kubectl get <kind> <name> --ignore-not-found -o json` prints nothing when the object is absent.
+
+    The empty answer is a success, and treating it as malformed JSON ended the whole cluster-wide lookup at
+    the first namespace that simply did not have the object.
+    """
+    ops.exec.rules.clear()
+    ops.exec.on(r"get namespaces", json.dumps({"items": [
+        {"metadata": {"name": "default"}}, {"metadata": {"name": "web"}}]}) + "\n")
+    ops.exec.on(r"-n default", Result(0, ""))
+    ops.exec.on(r"-n web", json.dumps({"metadata": {"name": "api", "namespace": "web"}}) + "\n")
+    ops.require = _policy(ops, {"k8s.read": Access.ALLOW})
+    out = ops.k8s_get(kind="pods", name="api")
+    assert out["namespaces"] == ["default", "web"]
+    assert "api" in json.dumps(out["items"]), "the namespace that has the object is still reported"
+
+
+def test_camel_case_pre_shared_keys_are_credentials() -> None:
+    """The normaliser puts a separator between `pre` and `shared`, which the patterns did not know."""
+    from opsbrain.redact import _is_sensitive_key, redact_obj
+
+    for key in ("preSharedKey", "pre_shared_key", "pre-shared-key", "presharedkey", "PreSharedKey"):
+        assert _is_sensitive_key(key), f"{key} names a credential"
+        assert redact_obj({key: "opaque-wireguard-value"})[key] != "opaque-wireguard-value"
+
+
+def test_telemetry_is_exempt_by_value_type_not_by_name() -> None:
+    """`tokens` is also what a credential collection is called.
+
+    Exempting the *name* meant `{"tokens": ["opaque-auth-token"]}` passed through unchanged. The exemption
+    is for numbers: the thing a budget report actually holds.
+    """
+    from opsbrain.redact import redact_obj
+
+    kept = redact_obj({"tokens": 12, "input_tokens": 7, "token_budget": 5000.5, "max_tokens": 10,
+                       "spend_usd": 0.04})
+    assert kept == {"tokens": 12, "input_tokens": 7, "token_budget": 5000.5, "max_tokens": 10,
+                    "spend_usd": 0.04}, "numeric accounting survives"
+
+    for key, value in (("tokens", ["opaque-auth-token"]), ("token_budget", "opaque-auth-token"),
+                       ("input_tokens", "opaque-auth-token"), ("tokens", {"ci": "opaque-auth-token"}),
+                       ("tokens", True)):
+        masked = redact_obj({key: value})[key]
+        assert masked != value and "opaque-auth-token" not in json.dumps(masked), (
+            f"{key}={value!r} is not a number and must be masked")
+
+    # The verification vocabulary is exempt for flags and counts, and for nothing else.
+    assert redact_obj({"is_pass": True, "passed": 3, "bypass": False}) == {
+        "is_pass": True, "passed": 3, "bypass": False}
+    assert redact_obj({"password_changed": "hunter2-opaque"})["password_changed"] != "hunter2-opaque"
