@@ -114,3 +114,42 @@ def _policy(ops: Any, rules: dict[str, Access]) -> Any:
             raise OpsError(f"{capability}{':' + target if target else ''} is denied by policy")
 
     return require
+
+
+def test_budget_telemetry_is_not_treated_as_a_credential(ops) -> None:  # type: ignore[no-untyped-def]
+    """`token` in a budget report is a count, and masking it replaces a number with a string.
+
+    That breaks every client that reports usage and hides the field the operator is actually watching.
+    """
+    from opsbrain.config import Access
+
+    answer = ops.call("autonomy", {"action": "status"},
+                      lambda: {"budget": {"input_tokens": 1200, "output_tokens": 340, "spend_usd": 0.04}})
+    budget = json.loads(answer if isinstance(answer, str) else json.dumps(answer))["budget"]
+    assert budget["input_tokens"] == 1200 and isinstance(budget["input_tokens"], int)
+    assert budget["output_tokens"] == 340
+    assert budget["spend_usd"] == 0.04
+
+
+def test_a_real_credential_still_goes_under_an_accounting_looking_name(ops) -> None:  # type: ignore[no-untyped-def]
+    from opsbrain.redact import redact_obj
+
+    masked = redact_obj({"api_key": "sk-live-1", "input_tokens": 7, "nested": {"auth_token": "ghp_" + "x" * 36}})
+    assert masked["api_key"] != "sk-live-1"
+    assert masked["input_tokens"] == 7
+    assert masked["nested"]["auth_token"] != "ghp_" + "x" * 36
+
+
+def test_a_denied_caller_never_causes_a_cluster_read(ops) -> None:  # type: ignore[no-untyped-def]
+    """`require` has to come before the namespace listing, not after it.
+
+    Checking afterwards still means a caller the policy denies already made `kubectl get namespaces` run.
+    """
+    from opsbrain.config import Access
+
+    ops.exec.rules.clear()
+    ops.exec.on(r"get namespaces", json.dumps({"items": []}) + "\n")
+    ops.require = _policy(ops, {"k8s.read": Access.DENY})
+    with pytest.raises(OpsError, match="k8s.read"):
+        ops.k8s_get(kind="pods")
+    assert not ops.exec.calls, "the cluster was read by a caller the policy denies"

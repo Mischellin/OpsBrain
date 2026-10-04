@@ -72,6 +72,19 @@ def redact_text(text: str) -> str:
 
 _SENSITIVE_NAME = re.compile(rf"(?i)({_SENSITIVE_KEY})")
 
+#: Keys that *look* sensitive and are not. `token` in a budget report is a count, not a credential, and
+#: masking it replaces a number with a string - which silently breaks every client that reports usage,
+#: and hides exactly the field an operator is watching. Listed explicitly rather than by narrowing the
+#: pattern, so a genuinely new secret-shaped key is redacted by default.
+_NOT_SECRET_KEYS = frozenset({
+    "input_tokens", "output_tokens", "max_tokens", "total_tokens", "tokens", "token_budget",
+    "tokens_used", "tokens_remaining", "max_model_calls", "model_calls", "spend_usd", "budget_usd",
+})
+
+
+def _is_sensitive_key(key: str) -> bool:
+    return str(key).strip().casefold() not in _NOT_SECRET_KEYS and bool(_SENSITIVE_NAME.search(str(key)))
+
 
 def redact_obj(value: Any) -> Any:
     """Structure-aware variant for data that must stay valid JSON (the audit log): strings are redacted in
@@ -79,7 +92,7 @@ def redact_obj(value: Any) -> Any:
     if isinstance(value, str):
         return redact_text(value)
     if isinstance(value, dict):
-        return {key: (MARK.format(kind="value") if _SENSITIVE_NAME.search(str(key)) and item not in (None, "")
+        return {key: (MARK.format(kind="value") if _is_sensitive_key(key) and item not in (None, "")
                       else redact_obj(item)) for key, item in value.items()}
     if isinstance(value, list | tuple):
         return [redact_obj(item) for item in value]

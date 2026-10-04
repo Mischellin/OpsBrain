@@ -122,6 +122,9 @@ class Readers(Core):
         then each namespace is checked on its own, which is the part that makes a `k8s.read:prod: deny`
         mean something.
         """
+        # The bare capability is checked *before* the cluster is read. Checking it afterwards meant a
+        # caller the policy denies had already caused `kubectl get namespaces` to run.
+        self.require("k8s.read")
         listing = parsers.k8s_rows("namespaces", self._kubectl_json("get", "namespaces"))
         names = [str(row.get("name", "")) for row in listing if str(row.get("name", ""))]
         if not names:
