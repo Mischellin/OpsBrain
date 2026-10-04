@@ -259,6 +259,7 @@ class ApprovalEngine:
         # for a change with no arguments of its own.
         derived = digest({key: value for key, value in sorted(change.args.items())}) if change.args else ""
         return {
+            "change_id": change.id,
             "plan_hash": change.hash,
             "arguments_hash": derived or str(change.details.get("arguments_hash") or ""),
             "subject": f"{change.capability}:{change.target}",

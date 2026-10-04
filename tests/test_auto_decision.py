@@ -463,7 +463,8 @@ def test_a_spent_approval_does_not_open_a_second_run(ops, tmp_path) -> None:  # 
                    "subject": f"{change.capability}:{change.target}", "targets": [change.target],
                    "evidence_ids": ["ev-aaaaaaaabbbbbbbb"], "policy_version": "v1",
                    "profile": bound_for(change).profile,
-                   "profile_version": bound_for(change).profile_version}
+                   "profile_version": bound_for(change).profile_version,
+                   "change_id": bound_for(change).change_id}
     engine.approvals.consume(approval, binding_now, owner="w", idempotency_key="k")
     ops.changes.attach_approval(change.id, approval)
     with pytest.raises(OpsError, match="consumed"):
