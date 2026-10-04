@@ -323,6 +323,8 @@ class AutoService:
             raise OpsError("evidence collection needs an explicit list of allowed capabilities")
         if self._collector is None:
             return EvidenceCollector(self.evidence, self.auto.evidence, allowed=allowed, change_id=change_id)
+        # An injected collector is a test double. Rebound to this request rather than returned as it was
+        # configured earlier, so the per-call allowlist and change binding cannot be quietly bypassed.
         self._collector.allowed = frozenset(allowed)
         self._collector.change_id = change_id
         return self._collector
