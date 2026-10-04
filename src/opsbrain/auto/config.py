@@ -139,6 +139,21 @@ class PolicyProfileConfig(_Model):
         return value
 
 
+class VerifyConfig(_Model):
+    """Bounds and defaults for the deterministic post-change checks.
+
+    A check that cannot be evaluated returns UNKNOWN, never PASS. The defaults below encode that: an
+    observation window is required before a check may claim the system is quiet.
+    """
+
+    observation_s: int = Field(default=30, ge=0, le=3600)
+    require_observation: bool = True
+    max_checks: int = Field(default=20, ge=1, le=200)
+    unknown_is_not_pass: bool = True  # may not be turned off: an unknown target is not a success
+    allow_state_changing_checks: bool = False  # a check that starts something must be in the plan
+    profiles: list[str] = Field(default_factory=lambda: ["systemd", "http", "k8s", "storage", "drift"])
+
+
 class AutoConfig(_Model):
     """The whole autonomous subsystem. Absent or disabled means every other setting is inert."""
 
@@ -146,6 +161,7 @@ class AutoConfig(_Model):
     review: ReviewConfig = Field(default_factory=ReviewConfig)
     evidence: EvidenceConfig = Field(default_factory=EvidenceConfig)
     decision: DecisionConfig = Field(default_factory=DecisionConfig)
+    verify: VerifyConfig = Field(default_factory=VerifyConfig)
     profiles: list[PolicyProfileConfig] = Field(default_factory=list)
     subject_reclassify: bool = True
     autonomy_token: str = ""  # presence required for autonomous mode; never read from the model
