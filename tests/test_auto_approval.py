@@ -465,3 +465,47 @@ def test_one_malformed_record_does_not_take_the_whole_listing_down(tmp_path: Pat
 
     listed = store.list()
     assert [row["id"] for row in listed] == [good.id], "the valid record is still listed"
+
+
+def test_a_shorter_reissue_replaces_a_live_longer_one(tmp_path: Path) -> None:
+    """Lifetime is outside the binding hash, so a re-review under a shorter window has to be applied.
+
+    The stored record had not aged out, so `issue` handed it back unchanged and the approval stayed
+    spendable past the deadline the new decision asked for.
+    """
+    store = ApprovalStore(tmp_path)
+    generous = store.issue(a_binding(expires_s=3600.0))
+    assert generous.binding.expires_s == pytest.approx(3600.0, abs=5)
+    tighter = store.issue(a_binding(expires_s=300.0))
+    assert tighter.id == generous.id, "the same decision keeps its identity"
+    assert store.get(generous.id).binding.expires_s == pytest.approx(300.0, abs=5)
+    assert store.get(generous.id).state is LeaseState.ISSUED, "and the record is still usable"
+
+
+def test_a_longer_reissue_never_widens_a_live_one(tmp_path: Path) -> None:
+    """Tightening is one-way. A longer grant must not resurrect or extend what is already there."""
+    store = ApprovalStore(tmp_path)
+    store.issue(a_binding(expires_s=300.0))
+    same = store.issue(a_binding(expires_s=3600.0))
+    assert same.binding.expires_s == pytest.approx(300.0, abs=5), "the shorter deadline stands"
+
+
+def test_a_shorter_reissue_still_may_not_resurrect_a_spent_approval(tmp_path: Path) -> None:
+    store = ApprovalStore(tmp_path)
+    approval = store.issue(a_binding())
+    store.consume(approval.id, current(), owner="worker-1", idempotency_key="job-42")
+    with pytest.raises(OpsError, match="older than"):
+        store.issue(a_binding(expires_s=1.0))
+    assert store.get(approval.id).state is LeaseState.CONSUMED
+
+
+def test_binding_for_rejects_a_reviewed_plan_with_a_message_that_names_the_right_path() -> None:
+    """`AttributeError` from three frames down reads like a bug here rather than a wrong argument."""
+    from opsbrain.auto.plan import ChangePlan, ProposedChange
+
+    plan = ChangePlan.build(
+        objective="o", diagnosis="d",
+        changes=[ProposedChange(capability="tofu.apply", target="proxmox", how="h", undo="revert it")],
+        rollback="revert it", created=1_700_000_000.0)
+    with pytest.raises(OpsError, match="AutoService.decide_change"):
+        binding_for(plan)

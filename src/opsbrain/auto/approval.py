@@ -206,7 +206,13 @@ class ApprovalStore:
                 existing = Approval.from_dict(json.loads(path.read_text(encoding="utf-8")))
                 if existing.binding.binding_hash != binding.binding_hash:
                     raise OpsError(f"approval id {approval.id} is held by a different binding")
-                if existing.state is LeaseState.ISSUED and not existing.binding.expired:
+                # An incoming binding that expires *sooner* replaces a still-live one, even when the
+                # stored record has not aged out. Lifetime is outside the binding hash - the same decision
+                # keeps the same id - so re-reviewing under a stricter policy or a shorter evidence
+                # window left the older, longer approval standing and spendable past the new deadline.
+                shortens = binding.created + binding.expires_s < existing.binding.created + existing.binding.expires_s
+                if (existing.state is LeaseState.ISSUED and not existing.binding.expired
+                        and not shortens):
                     return existing
                 # The stored record is spent, revoked or simply too old to use. `created` and `expires_s`
                 # are deliberately outside the binding hash - the same decision must keep the same id -
@@ -217,10 +223,11 @@ class ApprovalStore:
                 if existing.state is LeaseState.CONSUMED:
                     raise OpsError(f"approval {approval.id} was already spent; a spent approval is not "
                                    f"replaced, and the change it authorised has already run")
-                if existing.state is LeaseState.REVOKED:
-                    # Revocation is a decision by a person. An automatic retry of the original issuance
+                if existing.state is LeaseState.REVOKED and not shortens:
+                    # Revocation is a decision by a person, and an automatic retry of the original issuance
                     # silently undoing it would make the change executable again with nobody having looked
-                    # at it a second time.
+                    # at it a second time. A genuinely shorter grant is the single exception: it can only
+                    # ever take authority away, never add it.
                     raise OpsError(f"approval {approval.id} was revoked ({existing.lease_owner or 'no reason'}); "
                                    f"a revoked approval is not reissued, and re-reviewing is what undoes it")
                 approval = Approval(binding=binding)
@@ -391,6 +398,13 @@ def binding_for(change: Any, *, evidence_ids: Sequence[str] = (), policy_version
     the cap an approval issued just inside the freshness boundary stays executable for three quarters of
     an hour after the observations behind it stopped describing the world.
     """
+    if not hasattr(change, "args") or not hasattr(change, "expires"):
+        # The autonomous pipeline has its own type and its own path: `AutoService.decide_change` derives
+        # the binding from a `Change` together with the plan it was reviewed against. Reaching here with
+        # anything else raised `AttributeError` from three frames down, which reads like a bug in this
+        # function rather than a wrong argument.
+        raise OpsError(f"binding_for needs a Change with `args` and `expires`, not {type(change).__name__}; "
+                       f"a reviewed ChangePlan is bound through AutoService.decide_change")
     arguments = digest({key: value for key, value in sorted(change.args.items())}) if change.args else ""
     # The binding inherits the change's own age instead of restarting at "now". An approval that outlives
     # the plan it approves is a fresh hour of authority for a plan a human looked at days ago.
