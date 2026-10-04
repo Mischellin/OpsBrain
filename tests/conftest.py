@@ -103,7 +103,7 @@ def config(tmp_path: Path, repo: Path) -> Config:
         "k8s": {"context": "test"},
         "network": {"router": "router", "tracked_export": "network/router.rsc"},
         "observe": {"prometheus_url": "http://prom:9090", "loki_url": "http://loki:3100",
-                    "http_checks": {"site": "https://example.com"}},
+                    "http_checks": {"site": "https://example.com", "healthz": "https://example.com/healthz"}},
         "docs": {"globs": ["docs/**/*.md"], "status_file": "docs/STATUS.md", "memory_file": "docs/ai/memory.md"},
         "drift": {"playbooks": ["common"]},
         "policy": {"k8s.refresh": "allow", "hosts.restart:pve": "deny"},

@@ -45,6 +45,9 @@ INTENDED_DROP_IN = "/etc/systemd/system/logrotate.service.d/10-ops.conf"
 WRONG_DROP_IN = "/etc/logrotate.d/10-ops.conf"
 APPLIED = "Sun 2026-10-04 03:00:00 UTC"
 HEALTH = "https://example.com/healthz"
+#: The name this endpoint is configured under. Verification resolves a plan's URL through
+#: `observe.http_checks`; a bare address nobody declared is refused, not contacted.
+HEALTH_NAME = "healthz"
 
 
 class Clock:
@@ -86,7 +89,7 @@ def rollout(*, revision: str | None = "7", replicas: int = 3, updated: int = 3, 
     status: dict[str, Any] = {"replicas": replicas, "updatedReplicas": updated, "observedGeneration": observed}
     if ready is not None:
         status["readyReplicas"] = ready
-    return json.dumps({"metadata": metadata, "status": status})
+    return json.dumps({"metadata": metadata, "spec": {"replicas": replicas}, "status": status})
 
 
 def status_of(status: CheckStatus) -> CheckResult:
@@ -177,7 +180,7 @@ def test_a_successful_http_probe_records_its_boundary_and_observation_window(ops
     http.codes[HEALTH] = 200
     clock = Clock(1_000.0)
     report = Verifier(AutoConfig(enabled=True), ops, clock=clock).verify(
-        "chg-9", [http_target("site", HEALTH)], checks=["http:reachable"], applied_at=900.0)
+        "chg-9", [http_target(HEALTH_NAME, HEALTH)], checks=["http:reachable"], applied_at=900.0)
 
     assert report.status is CheckStatus.PASS
     result = report.results[0]
@@ -195,25 +198,25 @@ def test_an_http_probe_inside_a_too_short_window_is_unknown_not_pass(ops, http) 
     http.codes[HEALTH] = 200
     clock = Clock(1_010.0)
     early = Verifier(AutoConfig(enabled=True), ops, clock=clock).verify(
-        "chg-9", [http_target("site", HEALTH)], checks=["http:reachable"], applied_at=1_000.0)
+        "chg-9", [http_target(HEALTH_NAME, HEALTH)], checks=["http:reachable"], applied_at=1_000.0)
     assert early.status is CheckStatus.UNKNOWN and early.is_pass is False
     assert "observation window too short" in early.results[0].reason
-    assert early.results[0].detail.startswith("site:") or "site" in early.results[0].detail
+    assert early.results[0].detail.startswith(f"{HEALTH_NAME}:")
 
     clock.at = 1_040.0  # the same endpoint, once the 30s window has passed
     settled = Verifier(AutoConfig(enabled=True), ops, clock=clock).verify(
-        "chg-9", [http_target("site", HEALTH)], checks=["http:reachable"], applied_at=1_000.0)
+        "chg-9", [http_target(HEALTH_NAME, HEALTH)], checks=["http:reachable"], applied_at=1_000.0)
     assert settled.status is CheckStatus.PASS and settled.results[0].observation_s == 40.0
 
     unmoved = Verifier(AutoConfig(enabled=True), ops, clock=Clock(1_000.0)).verify(
-        "chg-9", [http_target("site", HEALTH)], checks=["http:reachable"])
+        "chg-9", [http_target(HEALTH_NAME, HEALTH)], checks=["http:reachable"])
     assert unmoved.status is CheckStatus.UNKNOWN, "a plan that recorded no apply time has no window to claim"
 
 
 def test_an_unreachable_http_endpoint_is_unknown_not_a_failure(ops, http) -> None:  # type: ignore[no-untyped-def]
     """A refused connection and a filtered port look the same from the outside; guessing would be worse."""
     http.codes[HEALTH] = 0
-    report = verifier(ops).verify("chg-9", [http_target("site", HEALTH)], checks=["http:reachable"],
+    report = verifier(ops).verify("chg-9", [http_target(HEALTH_NAME, HEALTH)], checks=["http:reachable"],
                                 applied_at=1_000.0)
     result = report.results[0]
     assert result.status is CheckStatus.UNKNOWN
@@ -223,12 +226,12 @@ def test_an_unreachable_http_endpoint_is_unknown_not_a_failure(ops, http) -> Non
 
 def test_a_failing_http_status_is_a_failure_not_an_unknown(ops, http) -> None:  # type: ignore[no-untyped-def]
     http.codes[HEALTH] = 502
-    report = verifier(ops).verify("chg-9", [http_target("site", HEALTH)], checks=["http:reachable"],
+    report = verifier(ops).verify("chg-9", [http_target(HEALTH_NAME, HEALTH)], checks=["http:reachable"],
                                 applied_at=1_000.0)
     assert report.status is CheckStatus.FAIL
     assert "HTTP 502" in report.results[0].detail
     http.codes[HEALTH] = 200
-    strict = verifier(ops).verify("chg-9", [http_target("site", HEALTH, expected_status=204)],
+    strict = verifier(ops).verify("chg-9", [http_target(HEALTH_NAME, HEALTH, expected_status=204)],
                                  checks=["http:reachable"], applied_at=1_000.0)
     assert strict.status is CheckStatus.FAIL and "the plan expected 204" in strict.results[0].detail
 
@@ -421,7 +424,7 @@ def test_the_overall_status_ranks_fail_over_unknown_over_not_run() -> None:
 
 
 def test_a_required_check_without_a_target_is_not_run(ops) -> None:  # type: ignore[no-untyped-def]
-    report = verifier(ops).verify("chg-1", [http_target("site", HEALTH)], checks=["systemd:unit-active"])
+    report = verifier(ops).verify("chg-1", [http_target(HEALTH_NAME, HEALTH)], checks=["systemd:unit-active"])
     result = report.results[0]
     assert result.status is CheckStatus.NOT_RUN
     assert "no systemd target was named" in result.reason
@@ -469,7 +472,7 @@ def test_a_state_changing_check_is_not_run_unless_the_plan_declared_it(ops, fake
     undeclared = verifier(ops, allow_state_changing_checks=True).verify(
         "chg-1", [the_unit()], checks=["systemd:unit-start"], applied_at=1_000.0)
     assert undeclared.results[0].status is CheckStatus.NOT_RUN
-    assert "the change plan did not declare it" in undeclared.results[0].reason
+    assert "the stored change does not declare it" in undeclared.results[0].reason
     assert not any("systemctl start" in script for _, script in fake.calls)
 
 
@@ -620,7 +623,7 @@ def test_targets_name_what_they_expect_so_a_check_can_refuse_to_guess() -> None:
     assert unit_target(HOST, UNIT).expect("drop_in") is None
     assert k8s_target("web", namespace="prod").expect("namespace") == "prod"
     assert storage_target("/var", min_free_pct=20).expect("min_free_pct") == "20"
-    assert http_target("site", HEALTH).label == "site"
+    assert http_target(HEALTH_NAME, HEALTH).label == HEALTH_NAME
     assert unit_target(HOST, UNIT).label == f"{HOST}/{UNIT}"
     assert Target("unit", UNIT).expected == ()
 
