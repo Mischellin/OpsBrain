@@ -442,7 +442,18 @@ def test_an_unknown_check_name_is_refused_instead_of_skipped(ops) -> None:  # ty
 
 def test_the_check_ceiling_is_enforced(ops) -> None:  # type: ignore[no-untyped-def]
     with pytest.raises(OpsError, match="the configured limit is 2"):
-        verifier(ops, max_checks=2).verify("chg-1", [the_unit()], checks=["systemd"])
+        verifier(ops, max_checks=2).verify("chg-1", [the_unit()],
+                                           checks=["systemd:unit-active", "systemd:drop-in", "drift:repo-live"])
+
+
+def test_a_broad_profile_does_not_sweep_in_an_undeclared_action(ops) -> None:  # type: ignore[no-untyped-def]
+    """Asking for `systemd` is not an authorisation to run `systemd:unit-start`."""
+    broad = [check.name for check in verifier(ops).select(["systemd"])]
+    assert "systemd:unit-start" not in broad
+    declared = [check.name for check in verifier(ops).select(["systemd"], declared=["systemd:unit-start"])]
+    assert "systemd:unit-start" in declared
+    # Naming it explicitly still selects it; `verify` is what decides, so the refusal stays in the report.
+    assert "systemd:unit-start" in [check.name for check in verifier(ops).select(["systemd:unit-start"])]
 
 
 def test_profiles_disabled_in_config_run_nothing(ops) -> None:  # type: ignore[no-untyped-def]
@@ -745,3 +756,38 @@ def test_a_deployment_manifest_is_not_persisted_with_its_environment(ops, fake, 
     assert "ghp_" not in stored, "a credential from the manifest reached a stored artifact"
     assert "e" * 36 not in stored
     assert report.status is not None
+
+
+def test_a_scale_change_is_judged_against_the_count_the_plan_asked_for(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    """`spec.replicas` is what the cluster has now. For a scale change that is the result, not the goal."""
+    fake.on(r"get deployments web", rollout(revision="7", replicas=3, updated=3, ready=3))
+    unchanged = verifier(ops).verify("chg-1", [k8s_target("web", expected_revision="7", expected_replicas=5)],
+                                   checks=["k8s:rollout"], applied_at=1_000.0)
+    assert unchanged.status is CheckStatus.FAIL, "three replicas is not the five the plan asked for"
+    assert "3/5" in unchanged.results[0].detail
+
+    fake.on(r"get deployments web", rollout(revision="7", replicas=5, updated=5, ready=5))
+    achieved = verifier(ops).verify("chg-1", [k8s_target("web", expected_revision="7", expected_replicas=5)],
+                                  checks=["k8s:rollout"], applied_at=1_000.0)
+    assert achieved.status is CheckStatus.PASS
+
+
+def test_the_observation_window_is_recomputed_for_each_check(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    """A run that takes two minutes must not keep reporting the window it started with."""
+    clock = Clock(1_000.0)
+    fake.on(r"systemctl show", show())
+    calls = {"n": 0}
+    original = fake._answer
+
+    def advancing(where: str, script: str) -> Result:  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        if calls["n"] > 1:
+            clock.at += 25  # the second check happens 25s later
+        return original(where, script)
+
+    fake._answer = advancing  # type: ignore[method-assign]
+    report = Verifier(AutoConfig(enabled=True, verify={"observation_s": 20}), ops, clock=clock).verify(
+        "chg-1", [the_unit()], checks=["systemd:unit-active", "systemd:drop-in"], applied_at=995.0)
+    windows = [result.observation_s for result in report.results]
+    assert windows == [5.0, 30.0], f"each check is judged on the time it actually waited: {windows}"
+    assert report.observation_s == windows[-1]

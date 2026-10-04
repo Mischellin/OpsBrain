@@ -128,9 +128,16 @@ def http_target(name: str, url: str, *, expected_status: int | None = None) -> T
 
 
 def k8s_target(name: str, *, namespace: str = "default", kind: str = "deployments",
-               expected_revision: str | None = None) -> Target:
-    """A workload whose rollout and revision the change is judged on."""
-    return Target("k8s", name, "", (("namespace", namespace), ("kind", kind)), expected_revision)
+               expected_revision: str | None = None, expected_replicas: int | None = None) -> Target:
+    """A workload whose rollout and revision the change is judged on.
+
+    `expected_replicas` is the count the plan asked for. A scale change that reached the count the
+    cluster was already at has not demonstrated anything, and only the plan knows the difference.
+    """
+    expectations: tuple[tuple[str, str], ...] = (("namespace", namespace), ("kind", kind))
+    if expected_replicas is not None:
+        expectations += (("replicas", str(expected_replicas)),)
+    return Target("k8s", name, "", expectations, expected_revision)
 
 
 def storage_target(path: str, *, host: str = "", min_free_pct: int | None = None) -> Target:
@@ -253,6 +260,19 @@ class VerifyContext:
     window_s: float
     evidence_refs: tuple[str, ...] = ()
     clock: Callable[[], float] = now
+    #: When the change was observed applied, or None when the caller did not say. Present so the window
+    #: can be recomputed per check instead of frozen at the start of the run.
+    applied_at: float | None = None
+
+    def window(self) -> float:
+        """How long ago the change was applied, as of *now*.
+
+        A verification is a sequence of remote commands; the last one may run much later than the first,
+        and every check has to be judged against the settling time it actually waited.
+        """
+        if self.applied_at is None:
+            return self.window_s
+        return max(0.0, self.clock() - self.applied_at)
 
     def keep(self, kind: str, title: str, text: str) -> tuple[str, ...]:
         """The raw capture behind a verdict, so a reader can re-derive it instead of trusting the summary."""
@@ -433,7 +453,8 @@ def _outcome(context: VerifyContext, check: Check, target: Target, status: Check
     return CheckResult(check=check.name, profile=check.profile, target=target.label, status=status,
                        captured=context.clock(), detail=clip(detail, 300), revision=revision,
                        evidence_refs=evidence, state_changing=check.state_changing,
-                       observation_s=context.window_s, proves=proves, does_not_prove=does_not_prove, reason=reason)
+                       observation_s=context.window(), proves=proves, does_not_prove=does_not_prove,
+                       reason=reason)
 
 
 def _unknown(context: VerifyContext, check: Check, target: Target, reason: str, *,
@@ -602,7 +623,7 @@ def http_reachable(context: VerifyContext, target: Target) -> CheckResult:
                         f"{requested!r} is not one of the configured observe.http_checks: verification does "
                         f"not contact endpoints nobody declared ({sorted(context.core.config.observe.http_checks)})")
     status, elapsed_ms = context.core.http.check(url, timeout=_HTTP_TIMEOUT)
-    window = context.window_s
+    window = context.window()
     if status == 0:
         return _unknown(context, check, target,
                         f"no answer from {url} after {elapsed_ms}ms: a refused connection, a filtered port "
@@ -684,7 +705,12 @@ def k8s_rollout(context: VerifyContext, target: Target) -> CheckResult:
     annotations: dict[str, Any] = metadata.get("annotations") or {}
     raw_revision = annotations.get(_K8S_REVISION_ANNOTATION)
     revision = str(raw_revision) if raw_revision is not None else None
-    desired = _counters({**metadata, **spec}, ("replicas",))
+    # `spec.replicas` is the *current* spec, which for a scale change is what the cluster already has -
+    # so comparing against it would report the state the change just produced as the state it was aiming
+    # at. When the plan states the count it wants, that is the only figure this check judges against.
+    wanted_from_plan = target.expect("replicas")
+    desired = {"replicas": int(wanted_from_plan)} if wanted_from_plan and wanted_from_plan.isdigit() \
+        else _counters({**metadata, **spec}, ("replicas",))
     counters = _counters({**metadata, **status},
                          ("generation", "observedGeneration", "replicas", "updatedReplicas", "readyReplicas"))
     if counters is None or desired is None:
@@ -927,7 +953,7 @@ class Verifier:
         return [{"check": name, "profile": REGISTRY[name].profile, "state_changing": REGISTRY[name].state_changing,
                  "settles": REGISTRY[name].settles, "why": REGISTRY[name].why} for name in self.available()]
 
-    def select(self, names: Sequence[str] = ()) -> tuple[Check, ...]:  # noqa: C901
+    def select(self, names: Sequence[str] = (), declared: Sequence[str] = ()) -> tuple[Check, ...]:  # noqa: C901
         """Resolve `["systemd:unit-active", "http"]` into concrete checks; an empty list means every enabled
         check. A bare profile name expands to all of its checks.
 
@@ -935,8 +961,17 @@ class Verifier:
         let the rest of the set pass.
         """
         available = self.available()
+        # A broad request must not sweep in an action. Asking for the profile `systemd` is not an
+        # authorisation to run `systemd:unit-start`, so profile expansion skips state-changing checks the
+        # change did not declare. Naming one explicitly is still allowed - `verify` is what decides, and
+        # refusing to select it here would hide the difference from the report.
+        permitted = frozenset(declared)
+
+        def may_expand(key: str) -> bool:
+            return not REGISTRY[key].state_changing or key in permitted
+
         if not names:
-            chosen = [REGISTRY[name] for name in available]
+            chosen = [REGISTRY[name] for name in available if may_expand(name)]
         else:
             chosen = []
             for name in names:
@@ -945,7 +980,8 @@ class Verifier:
                         raise OpsError(f"unknown verification check: {name!r} (enabled: {', '.join(available)})")
                     chosen.append(REGISTRY[name])
                     continue
-                expanded = [REGISTRY[key] for key in available if REGISTRY[key].profile == name]
+                expanded = [REGISTRY[key] for key in available
+                            if REGISTRY[key].profile == name and may_expand(key)]
                 if not expanded:
                     raise OpsError(f"unknown verification profile: {name!r}")
                 chosen.extend(expanded)
@@ -974,10 +1010,13 @@ class Verifier:
             raise OpsError(
                 f"no verification profile recognises target kind(s) {unknown}; known kinds are "
                 f"{sorted(KIND_PROFILES)}: a target that is skipped is a check that never ran")
-        selected = self.select(checks)
-        window = max(0.0, self.clock() - applied_at) if applied_at is not None else 0.0
-        context = VerifyContext(core=self.core, verify=self.auto.verify, change_id=change_id, window_s=window,
-                                evidence_refs=tuple(evidence_refs), clock=self.clock)
+        selected = self.select(checks, declared)
+        # Recomputed for every check. A verification that takes two minutes must not keep reporting the
+        # window it started with: a check running at the end waited longer than one that ran first, and
+        # settling is measured from when the change was applied.
+        context = VerifyContext(core=self.core, verify=self.auto.verify, change_id=change_id, window_s=0.0,
+                                evidence_refs=tuple(evidence_refs), clock=self.clock,
+                                applied_at=applied_at)
         results: list[CheckResult] = []
         for check in selected:
             matched = [target for target in targets if KIND_PROFILES.get(target.kind) == check.profile]
@@ -991,7 +1030,8 @@ class Verifier:
                     continue
                 results.append(self._one(check, context, target))
         return VerificationReport(change_id=change_id, status=overall_status(results), results=tuple(results),
-                                  captured=self.clock(), evidence_refs=context.evidence_refs, observation_s=window)
+                                  captured=self.clock(), evidence_refs=context.evidence_refs,
+                                  observation_s=context.window())
 
     def _permitted(self, check: Check, declared: Sequence[str], change_id: str = "") -> bool:
         """A state-changing check runs only when the operator allows it *and* the change authorises it.
