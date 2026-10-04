@@ -38,6 +38,7 @@ class Core:
         self.jobs = JobStore(data / "jobs")
         self.audit = AuditLog(data / "audit.jsonl")
         self.auto = AutoService(config, reviewer=reviewer)
+        self.auto.core = self  # the Verifier needs a Core, and Core builds the AutoService
         self.finalizers: dict[str, Finalizer] = {}
 
     # -- helpers -----------------------------------------------------------------------------------

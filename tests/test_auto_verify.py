@@ -631,3 +631,57 @@ def test_verification_report_is_immutable_so_a_result_cannot_be_edited_after_the
         report.status = CheckStatus.PASS  # type: ignore[misc]
     assert report.boundary() == {"proves": [], "does_not_prove": []}
     assert report.by_status() == {}
+
+
+# ------------------------------------------------------------------------------ wiring into the service
+def _service(tmp_path: Any) -> Any:
+    from opsbrain.auto.service import AutoService
+    from opsbrain.config import Config
+
+    return AutoService(Config(repo=str(tmp_path), data_dir=str(tmp_path / "data"),
+                              auto=AutoConfig(enabled=True)))
+
+
+def test_verification_is_bound_to_a_core_only_by_the_owner(tmp_path: Any) -> None:
+    from opsbrain.util import OpsError
+
+    auto = _service(tmp_path)
+    assert auto.verify_overview() == {"bound": False}
+    with pytest.raises(OpsError, match="needs a Core"):
+        auto.verifier()
+
+
+def test_core_binds_itself_so_verification_is_available(tmp_path: Any) -> None:
+    from opsbrain.config import Config
+    from opsbrain.service import OpsBrain
+
+    ops = OpsBrain(Config(repo=str(tmp_path), data_dir=str(tmp_path / "data"),
+                          auto=AutoConfig(enabled=True)))
+    view = ops.auto.verify_overview()
+    assert view["bound"] is True
+    assert view["observation_s"] == 30
+    assert "systemd:unit-active" in view["available"]
+    assert ops.auto.verification_checks(), "the tool surface must say what it can demand"
+
+
+def test_verification_cannot_act_by_default(tmp_path: Any) -> None:
+    from opsbrain.config import Config
+    from opsbrain.service import OpsBrain
+
+    ops = OpsBrain(Config(repo=str(tmp_path), data_dir=str(tmp_path / "data"),
+                          auto=AutoConfig(enabled=True)))
+    assert ops.auto.verify_overview()["allow_state_changing_checks"] is False
+    acting = [row["check"] for row in ops.auto.verification_checks() if row["state_changing"]]
+    assert acting == ["systemd:unit-start"]
+
+
+def test_verifying_through_a_disabled_service_is_refused(tmp_path: Any) -> None:
+    from opsbrain.auto.service import AutoService
+    from opsbrain.auto.verify import unit_target
+    from opsbrain.config import Config
+    from opsbrain.util import OpsError
+
+    auto = AutoService(Config(repo=str(tmp_path), data_dir=str(tmp_path / "data"),
+                             auto=AutoConfig(enabled=False)))
+    with pytest.raises(OpsError, match="disabled"):
+        auto.verify_change("c-11111111", [unit_target("web-1", "logrotate.service")])
