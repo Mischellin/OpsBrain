@@ -170,13 +170,16 @@ def build_server(ops: OpsBrain) -> MCPServer:
             "discard": lambda: ops.changes.discard(_need(id, "id")).brief()}))
 
     @server.tool()
-    def autonomy(action: str = "status", limit: int = 20) -> str:
+    def autonomy(action: str = "status", limit: int = 20, id: str | None = None) -> str:  # noqa: A002
         """Autonomous pipeline, read-only. action: status (switches, mode, budget) | capabilities (is the
         reviewer runnable; never claims a model it could not check) | reviews (recent verdicts)."""
         return ops.call("autonomy", {"action": action}, lambda: _dispatch(action, {
             "status": ops.auto.overview,
             "capabilities": lambda: ops.auto.reviews.capabilities(),
-            "reviews": lambda: {"items": ops.auto.reviews.list(limit)}}))
+            "reviews": lambda: {"items": ops.auto.reviews.list(limit)},
+            "evidence": lambda: ops.auto.evidence_overview(),
+            "bundles": lambda: {"items": ops.auto.evidence_list(limit)},
+            "verify_evidence": lambda: ops.auto.verify_evidence(_need(id, "id"))}))
 
     return server
 

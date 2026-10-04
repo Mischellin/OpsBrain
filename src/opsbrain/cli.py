@@ -182,6 +182,25 @@ def cmd_autonomy(args: argparse.Namespace) -> int:
             print(f"{row.get('review_id'):<20} {row.get('subject'):<15} {row.get('status'):<16} "
                   f"{row.get('verdict') or '-':<15} {row.get('model') or '-'}")
         return 0
+    if args.action == "evidence":
+        view = auto.evidence_overview()
+        print(f"bundles={view['bundles']} fresh_window_s={view['fresh_window_s']} "
+              f"max_bundle_bytes={view['max_bundle_bytes']}")
+        print(f"require_inventory_hash={view['require_inventory_hash']} "
+              f"require_target_identity={view['require_target_identity']}")
+        return 0
+    if args.action == "bundles":
+        for row in auto.evidence_list(args.limit):
+            print(f"{row.get('id'):<20} {row.get('created'):<18} {(row.get('targets') or [])} {row.get('objective')}")
+        return 0
+    if args.action == "verify":
+        if not args.id:
+            print("usage: opsbrain autonomy verify <bundle-id>", file=sys.stderr)
+            return 2
+        answer = auto.verify_evidence(args.id)
+        for check in answer["checks"]:
+            print(f"[{'ok' if check['ok'] else '!!'}] {check['reason']}: {check['detail']}")
+        return 0 if answer["passed"] else 1
     print(f"budget: {json.dumps(auto.reviews.usage(), ensure_ascii=False)}")
     return 0
 
@@ -223,7 +242,9 @@ def main(argv: list[str] | None = None) -> int:
     doctor.set_defaults(handler=cmd_doctor)
     commands.add_parser("stats", help="token savings from the audit log").set_defaults(handler=cmd_stats)
     autonomy = commands.add_parser("autonomy", help="inspect the autonomous pipeline (read-only)")
-    autonomy.add_argument("action", choices=["status", "capabilities", "reviews", "budget"])
+    autonomy.add_argument("action", choices=["status", "capabilities", "reviews", "budget", "evidence",
+                                            "bundles", "verify"])
+    autonomy.add_argument("id", nargs="?")
     autonomy.add_argument("--limit", type=int, default=20)
     autonomy.set_defaults(handler=cmd_autonomy)
     desktop = commands.add_parser("desktop", help="Claude Desktop extension (.mcpb): build | install | status")

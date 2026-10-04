@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -509,3 +510,67 @@ def test_artifact_reference_is_validated_before_the_filesystem_is_touched(tmp_pa
     assert artifact.id == "ev-0000abcd" and artifact.redactions == 0
     with pytest.raises(EvidenceError, match="invalid artifact reference"):
         EvidenceStore(tmp_path / "auto").read_artifact("ev-0000ABCD")
+
+
+# ------------------------------------------------------------------------------ wiring into the service
+def _config(tmp_path: Path, **auto: Any) -> Any:
+    from opsbrain.config import Config
+
+    return Config(repo=str(tmp_path), data_dir=str(tmp_path / "data"),
+                  auto=AutoConfig(**{"enabled": True, **auto}))
+
+
+def test_the_service_exposes_the_evidence_store_and_collector(tmp_path: Path) -> None:
+    from opsbrain.auto.service import AutoService
+
+    auto = AutoService(_config(tmp_path))
+    assert auto.evidence_overview()["fresh_window_s"] == 900
+    assert auto.evidence_list() == []
+    with pytest.raises(OpsError, match="explicit list of allowed capabilities"):
+        auto.collector(allowed=[])
+
+
+def test_collect_through_the_service_persists_and_answers_without_payload_text(tmp_path: Path) -> None:
+    from opsbrain.auto.service import AutoService
+
+    auto = AutoService(_config(tmp_path))
+    answer = auto.collect_evidence(
+        "fix the unit", [Observation(kind="systemd_unit", target="web-1", capability="hosts.status",
+                                     command_id="is-active-web", content="api_key: sk-" + "c" * 24,
+                                     collector="web-1")],
+        allowed=("hosts.status",), change_id="c-11111111", inventory_hash="inv-1", collector="opsbrain")
+    assert answer["proves_truth"] is False
+    assert "sk-" not in json.dumps(answer)
+    assert answer["id"].startswith("ev-")
+    assert auto.verify_evidence(answer["id"])["passed"] is True
+
+
+def test_verify_through_the_service_reports_the_reason_code(tmp_path: Path) -> None:
+    from opsbrain.auto.service import AutoService
+
+    auto = AutoService(_config(tmp_path))
+    answer = auto.collect_evidence("x", [Observation(kind="k", target="web-1", capability="hosts.status",
+                                                    command_id="c", content="ok", collector="web-1")],
+                                   allowed=("hosts.status",), inventory_hash="inv-1")
+    assert auto.verify_evidence(answer["id"])["reason"] == Reason.EVIDENCE_FRESH.value
+    assert auto.verify_evidence(answer["id"], now_s=time.time() + 100_000)["reason"] == Reason.EVIDENCE_STALE.value
+    assert auto.verify_evidence("ev-0000000000000000")["passed"] is False
+
+
+def test_collecting_through_a_disabled_service_is_refused(tmp_path: Path) -> None:
+    from opsbrain.auto.service import AutoService
+
+    auto = AutoService(_config(tmp_path, **{**{}, "enabled": False}))
+    with pytest.raises(OpsError, match="disabled"):
+        auto.collect_evidence("x", [], allowed=("hosts.status",))
+
+
+def test_a_collected_bundle_is_recorded_in_the_audit_log(tmp_path: Path) -> None:
+    from opsbrain.auto.service import AutoService
+
+    auto = AutoService(_config(tmp_path))
+    auto.collect_evidence("x", [Observation(kind="k", target="web-1", capability="hosts.status",
+                                           command_id="c", content="ok", collector="web-1")],
+                          allowed=("hosts.status",), change_id="c-11111111", inventory_hash="inv-1")
+    events = [entry.get("event") for entry in auto.audit.entries()]
+    assert "evidence_collected" in events
