@@ -22,6 +22,7 @@ from ..audit import AuditLog
 from ..util import OpsError, new_id
 from .config import AutoConfig
 from .evidence import EvidenceBundle, EvidenceCollector, EvidenceStore, Observation, check_evidence, passed, reason_code
+from .ledger import BudgetLedger
 from .plan import ChangePlan
 from .preflight import Outcome, Preflight, PreflightResult
 from .review import (
@@ -68,6 +69,7 @@ class ReviewService:
         self.config = config
         self.root = root
         self.store = RecordStore(root / "reviews", ("rv",))
+        self.ledger = BudgetLedger(root / "budget.jsonl")
         self.reviews = config.review
         self._reviewer = reviewer
         self._factory = reviewer_factory
@@ -86,21 +88,12 @@ class ReviewService:
         separately invoked `opsbrain autonomy status` reports zero for work the server already did. The
         ceilings are only ceilings if they survive a restart.
         """
-        rows = self.store.list(1_000_000)
-        calls = tokens_in = tokens_out = 0
-        for document in rows:
-            usage = document.get("usage")
-            if not isinstance(usage, dict):
-                continue
-            if document.get("status") == RunnerStatus.OK.value or usage.get("calls"):
-                calls += 1
-            tokens_in += _counter(usage.get("input_tokens"))
-            tokens_out += _counter(usage.get("output_tokens"))
+        ledger = self.ledger
         with self._lock:
-            self._calls = calls
-            self._tokens_in = tokens_in
-            self._tokens_out = tokens_out
-            self._spend_usd = (tokens_in + tokens_out) / 1_000_000 * USD_PER_MILLION_TOKENS
+            self._calls = ledger.calls
+            self._tokens_in = ledger.input_tokens
+            self._tokens_out = ledger.output_tokens
+            self._spend_usd = ledger.spend_usd
 
     def _is_stub(self) -> bool:
         """True only for the built-in stub. A test that injects its own fake is a test, and must keep working."""
@@ -135,23 +128,21 @@ class ReviewService:
         Reserving per attempt, not per request: `run_review` may invoke the reviewer up to
         `max_retries + 1` times, and a single reservation would let three paid calls pass one check.
         """
+        admitted, reason = self.ledger.admit(
+            self.projected_cost(request), kind="reserve",
+            max_calls=self.reviews.max_model_calls, max_spend=self.reviews.budget_usd)
         with self._lock:
-            if self._calls >= self.reviews.max_model_calls:
-                raise BudgetExceeded(f"model call budget exhausted ({self.reviews.max_model_calls} calls)")
-            if self.reviews.budget_usd:
-                projected = self._spend_usd + self.projected_cost(request)
-                if projected > self.reviews.budget_usd:
-                    raise BudgetExceeded(
-                        f"this call could cost up to ${self.projected_cost(request):.4f} and would take the "
-                        f"total to ${projected:.4f}, over budget_usd=${self.reviews.budget_usd:.2f}")
-            self._calls += 1
+            self._calls = self.ledger.calls
+            self._spend_usd = self.ledger.spend_usd
+        if not admitted:
+            raise BudgetExceeded(reason)
 
     def _charge(self, result: ReviewResult) -> None:
+        self.ledger.reconcile(0.0, kind="settle", input_tokens=result.usage.input_tokens,
+                              output_tokens=result.usage.output_tokens)
         with self._lock:
-            self._tokens_in += result.usage.input_tokens
-            self._tokens_out += result.usage.output_tokens
-            tokens = result.usage.input_tokens + result.usage.output_tokens
-            self._spend_usd += tokens / 1_000_000 * USD_PER_MILLION_TOKENS
+            self._tokens_in = self.ledger.input_tokens
+            self._tokens_out = self.ledger.output_tokens
 
     def reset_usage(self) -> None:
         with self._lock:
@@ -203,11 +194,14 @@ class ReviewService:
         if clipped != request.context:
             request = ReviewRequest(**{**request.__dict__, "context": clipped})
         request = request.with_id()
+        # The lease has to outlive the whole retry window, or a redelivery arriving while the original
+        # attempt still runs sees a stale claim and starts a second paid review.
+        ttl = self.reviews.timeout_s * (self.reviews.max_retries + 1) + 60.0
         claim = self.root / "claims" / f"{request.review_id}.claim"
         # The lock covers the in-process race; the claim file covers two processes (a server and the CLI).
         # Either alone would still let a duplicate through.
         with self._id_lock(request.review_id):
-            if atomic_claim(claim, f"pid-{id(self)}", TTL_S) is None:
+            if atomic_claim(claim, f"pid-{id(self)}", ttl) is None:
                 return ReviewResult.failure(request, RunnerStatus.RUNNER_ERROR,
                                            "another worker is already reviewing this request; "
                                            "re-issue once it finishes")
