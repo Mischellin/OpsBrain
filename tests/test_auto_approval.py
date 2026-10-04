@@ -114,7 +114,7 @@ def test_an_approval_is_spent_exactly_once(tmp_path: Path) -> None:
     approval = store.issue(a_binding())
     spent = store.consume(approval.id, current())
     assert spent.state is LeaseState.CONSUMED and spent.consumed_at > 0
-    with pytest.raises(OpsError, match="already spent"):
+    with pytest.raises(OpsError, match="already spent|has not finished"):
         store.consume(approval.id, current())
 
 
@@ -158,6 +158,7 @@ def test_a_retry_with_the_same_key_is_answered_rather_than_re_executed(tmp_path:
     store = ApprovalStore(tmp_path)
     approval = store.issue(a_binding())
     first = store.consume(approval.id, current(), owner="worker-1", idempotency_key="job-42")
+    store.record_outcome(approval.id, {"state": "executed", "at": now()})
     again = store.consume(approval.id, current(), owner="worker-2", idempotency_key="job-42")
     assert first.outcome.get("replayed") is None, "the first spend is the real one"
     assert again.state is LeaseState.CONSUMED
@@ -166,6 +167,31 @@ def test_a_retry_with_the_same_key_is_answered_rather_than_re_executed(tmp_path:
     assert again.lease_owner == "worker-1", "the retry was answered by the original spender"
     with pytest.raises(OpsError, match="already spent"):
         store.consume(approval.id, current(), owner="worker-3", idempotency_key="a-different-job")
+
+
+def test_a_lease_taken_but_never_finished_blocks_until_its_ttl_then_is_reclaimed(tmp_path: Path) -> None:
+    """A crash between spending the lease and recording what happened.
+
+    The lease used to be committed as spent before the work ran, so one crash left the change permanently
+    unexecutable and the advertised `ttl_s` was never consulted by anything.
+    """
+    store = ApprovalStore(tmp_path, ttl_s=60.0)
+    approval = store.issue(a_binding())
+    held = store.consume(approval.id, current(), owner="worker-1", idempotency_key="job-42")
+    assert held.outcome["executed"] is False, "taken, not finished"
+
+    for key in ("job-42", "another-job"):
+        with pytest.raises(OpsError, match="has not finished"):
+            store.consume(approval.id, current(), owner="worker-2", idempotency_key=key)
+
+    # Past the TTL the claim is stale, and taking it over is the caller's explicit decision.
+    path = tmp_path / f"{approval.id}.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["consumed_at"] = round(now() - 3600.0, 3)
+    path.write_text(json.dumps(document), encoding="utf-8")
+    reclaimed = store.consume(approval.id, current(), owner="worker-2", idempotency_key="another-job")
+    assert reclaimed.outcome["reclaimed"] is True
+    assert reclaimed.lease_owner == "worker-2", "and the new owner is recorded"
 
 
 def test_execute_once_records_the_outcome(tmp_path: Path) -> None:
@@ -351,7 +377,7 @@ def test_revoking_a_spent_approval_erases_nothing(tmp_path: Path) -> None:
     approval = store.issue(a_binding())
     store.consume(approval.id, current(), owner="worker-1", idempotency_key="job-42")
     store.record_outcome(approval.id, {"state": "executed", "at": 1.0})
-    with pytest.raises(OpsError, match="already spent"):
+    with pytest.raises(OpsError, match="already spent|has not finished"):
         store.revoke(approval.id, "too late")
     kept = store.get(approval.id)
     assert kept.state is LeaseState.CONSUMED
@@ -392,7 +418,7 @@ def test_a_spent_approval_is_never_replaced_by_a_re_issue(tmp_path: Path) -> Non
     store = ApprovalStore(tmp_path)
     approval = store.issue(a_binding())
     store.consume(approval.id, current(), owner="worker-1", idempotency_key="job-42")
-    with pytest.raises(OpsError, match="already spent"):
+    with pytest.raises(OpsError, match="already spent|has not finished"):
         store.issue(a_binding())
     assert store.get(approval.id).lease_owner == "worker-1", "the spender is still on the record"
 
@@ -569,3 +595,18 @@ def test_an_expired_record_written_as_a_bare_nan_is_still_unusable(tmp_path: Pat
     path.write_text(json.dumps(document).replace('"expires_s": 3600.0', '"expires_s": NaN'), encoding="utf-8")
     with pytest.raises(OpsError, match="finite"):
         store.get(approval.id)
+
+
+def test_a_creation_time_ahead_of_the_clock_is_refused(tmp_path: Path) -> None:
+    """Finite and positive is not enough.
+
+    A `created` a little ahead of the local clock computes a negative age, so `expired` is false and a
+    nominal one-hour approval stays usable until that arbitrary future timestamp plus an hour - malformed
+    input silently extending authority rather than failing.
+    """
+    from opsbrain.auto.approval import CLOCK_SKEW_S
+
+    with pytest.raises(OpsError, match="in the future"):
+        a_binding(created=now() + CLOCK_SKEW_S + 60.0)
+    # Ordinary drift between the issuing and the spending process is absorbed, not rejected.
+    assert a_binding(created=now() + 5.0).id

@@ -53,6 +53,11 @@ class StaleReason(StrEnum):
     UNBOUND = "unbound"
 
 
+#: How far ahead of the local clock a creation timestamp may sit. Absorbs ordinary clock drift between
+#: the process that issued the approval and the one spending it, and nothing more.
+CLOCK_SKEW_S = 300.0
+
+
 class LeaseState(StrEnum):
     ISSUED = "issued"
     CONSUMED = "consumed"
@@ -89,6 +94,11 @@ class ApprovalBinding:
             raise OpsError(f"an approval must have a finite positive lifetime, not {self.expires_s!r}")
         if not math.isfinite(self.created):
             raise OpsError(f"an approval must have a finite creation time, not {self.created!r}")
+        if self.created - now() > CLOCK_SKEW_S:
+            # Finite and positive is not enough. A `created` a little ahead of the local clock computes a
+            # negative age, so `expired` is false and a nominal one-hour approval stays usable until that
+            # arbitrary future timestamp plus an hour - malformed input silently extending authority.
+            raise OpsError(f"an approval cannot have been created {self.created - now():.0f}s in the future")
 
     def as_digest_source(self) -> dict[str, Any]:
         return {"contract_version": CONTRACT_VERSION, "change_id": self.change_id, "subject": self.subject,
@@ -296,6 +306,23 @@ class ApprovalStore:
                                f"(the file holds {approval.binding.id})")
             if approval.state is LeaseState.REVOKED:
                 raise OpsError(f"approval {approval_id} was revoked")
+            if approval.state is LeaseState.CONSUMED and not approval.outcome.get("executed", False):
+                # A lease taken but never completed: the worker died between `consume` and
+                # `record_outcome`, so nothing ran to a recorded end. Past its TTL the claim is stale and
+                # is reclaimed, because refusing forever would make the change unexecutable after one
+                # crash. The same key replays the earlier answer; a different key takes the reclaimed lease
+                # over, which is the caller's decision to make explicitly.
+                if now() - float(approval.consumed_at or 0.0) > self.ttl_s:
+                    reclaimed = Approval(
+                        binding=approval.binding, state=LeaseState.CONSUMED, consumed_at=now(),
+                        lease_owner=owner or new_id("lease"),
+                        outcome={**approval.outcome, "reclaimed": True,
+                                 "idempotency_key": idempotency_key or ""})
+                    write_private(path, json.dumps(reclaimed.to_dict(), ensure_ascii=False))
+                    return reclaimed
+                raise OpsError(
+                    f"approval {approval_id} is held by {approval.lease_owner or 'another worker'} and has "
+                    f"not finished; wait {self.ttl_s:.0f}s or take it over with a different idempotency key")
             if approval.state is LeaseState.CONSUMED:
                 if idempotency_key and approval.outcome.get("idempotency_key") == idempotency_key:
                     # Marked as a replay so `execute_once` knows not to enter the work a second time.
@@ -318,7 +345,8 @@ class ApprovalStore:
                                "the plan, arguments, targets, evidence or policy moved since it was granted")
             spent = Approval(binding=approval.binding, state=LeaseState.CONSUMED, consumed_at=now(),
                              lease_owner=owner or new_id("lease"),
-                             outcome={"idempotency_key": idempotency_key} if idempotency_key else {})
+                             outcome={**({"idempotency_key": idempotency_key} if idempotency_key else {}),
+                                      "executed": False})
             write_private(path, json.dumps(spent.to_dict(), ensure_ascii=False))
             return spent
 
@@ -346,13 +374,19 @@ class ApprovalStore:
             return revoked
 
     def record_outcome(self, approval_id: str, outcome: dict[str, Any]) -> None:
+        """Record what the spent lease actually did, which also completes it.
+
+        The completion flag is set here and nowhere else: until it appears, the lease is a claim on an
+        execution that may or may not have happened, and it is reclaimable rather than final.
+        """
         with _locked(self.root / ".approvals.lock"):
             path = self._path(approval_id)
             approval = Approval.from_dict(json.loads(path.read_text(encoding="utf-8")))
             write_private(path, json.dumps(
                 Approval(binding=approval.binding, state=approval.state, consumed_at=approval.consumed_at,
                          lease_owner=approval.lease_owner,
-                         outcome={**approval.outcome, **outcome}).to_dict(), ensure_ascii=False))
+                         outcome={**approval.outcome, **outcome, "executed": True}).to_dict(),
+                ensure_ascii=False))
 
     def _path(self, approval_id: str) -> Path:
         body = approval_id[3:] if approval_id.startswith("ap-") else ""

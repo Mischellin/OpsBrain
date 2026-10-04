@@ -185,21 +185,25 @@ class Operators(Core):
         actually applied, it needs no JSON parser on the runner, and it removes the "first line starting
         with `{`" tolerance a warning above the document used to require.
 
-        What this does not stop: another process running as the same user on the runner can still observe
-        the copy. Against a same-uid adversary on the runner no script-level arrangement helps, and the
-        runner's own isolation is the boundary - stated here so the limit is not mistaken for a guarantee.
+        What this does not stop: a process running as the same user on the runner that can list the
+        directory, or that wins a race against `mktemp`. Against a same-uid adversary no script-level
+        arrangement helps - it can simply read the copy - so the runner's own isolation is the real
+        boundary. Stated here so the limit is not mistaken for a guarantee, and so nobody reads the private
+        directory as proof against an attacker it does not stop.
         """
         binary = shlex.quote(config.binary)
         prefix = self._tofu_prefix(config)
         quoted = shlex.quote(plan_file)
         return (
-            # A name from this shell, not from the request: the point is that a replacer cannot name it in
-            # advance, which is what the original shared path allowed.
-            f"held=.opsbrain/apply-$$-$(date +%s).tfplan; "
-            # Both the temporary copy and the saved plan it came from are removed together, on every exit
-            # path including the refusal. A saved plan left behind holds whatever the stack's variables
-            # were, on the runner, until some later `tofu plan` happened to be more than a day old.
-            f"held_gone() {{ command rm -f $held {quoted}; }}; "
+            # A private directory, not a private *name* in a shared one. `chmod 400` only changes the
+            # inode's mode: a same-uid process could still discover the path in the user-writable
+            # `.opsbrain`, unlink or rename over it after the checksum, and have `tofu apply` run bytes
+            # nobody verified. A `mktemp -d` directory is 0700 with a name this shell generated, so
+            # finding it takes guessing rather than listing. Both files are removed on every exit path
+            # including the refusal, so a saved plan cannot outlive the run either.
+            f"held_dir=$(mktemp -d .opsbrain/apply.XXXXXX) || exit 78; "
+            f"held=$held_dir/plan.tfplan; "
+            f"held_gone() {{ command rm -rf $held_dir; command rm -f {quoted}; }}; "
             f"{prefix}cp -- {quoted} $held 2>/dev/null && chmod 400 $held; "
             f"actual=$(sha256sum $held 2>/dev/null | cut -d' ' -f1); "
             f'if [ -z "$actual" ] || [ "$actual" != {shlex.quote(expected_sha)} ]; then '
