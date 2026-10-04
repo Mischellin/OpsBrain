@@ -52,6 +52,20 @@ class StaleReason(StrEnum):
     UNBOUND = "unbound"
 
 
+def _persisted_created(data: dict[str, Any]) -> float:
+    """The creation time the record actually carries, or nothing.
+
+    Defaulting it to `now()` on every read refreshed a legacy or hand-edited approval for as long as
+    anybody kept looking at it - and because `created` is outside the content-addressed id, the record
+    still matched its own filename, so it stayed spendable indefinitely. A timestamp that is not there
+    is not a fact, and an approval is not the place to invent one.
+    """
+    if "created" not in data or data["created"] is None:
+        raise OpsError("this approval record has no creation time, so its lifetime cannot be known; "
+                       "plan and approve again")
+    return float(data["created"])
+
+
 #: How far ahead of the local clock a creation timestamp may sit. Absorbs ordinary clock drift between
 #: the process that issued the approval and the one spending it, and nothing more.
 CLOCK_SKEW_S = 300.0
@@ -140,7 +154,8 @@ class ApprovalBinding:
             plan_hash=str(data.get("plan_hash", "")), arguments_hash=str(data.get("arguments_hash", "")),
             targets=tuple(data.get("targets", [])), evidence_ids=tuple(data.get("evidence_ids", [])),
             policy_version=str(data.get("policy_version", "")), profile=str(data.get("profile", "general")),
-            expires_s=float(data.get("expires_s", 3600.0)), created=float(data.get("created", now())))
+            expires_s=float(data.get("expires_s", 3600.0)),
+            created=_persisted_created(data))
 
 
 def stale_reasons(binding: ApprovalBinding, current: dict[str, Any]) -> tuple[str, ...]:
@@ -156,7 +171,12 @@ def stale_reasons(binding: ApprovalBinding, current: dict[str, Any]) -> tuple[st
     # compared too. Two records with otherwise identical plan, arguments, subject, targets, evidence,
     # policy and profile are otherwise interchangeable, and an approval issued for one of them could be
     # spent against the other - bypassing that record's own approval or revocation.
-    if str(current.get("change_id") or binding.change_id) != binding.change_id:
+    if "change_id" not in current:
+        # Required, not defaulted. Falling back to the binding's own value made the comparison true by
+        # construction for every caller that omitted it, which is precisely the caller whose change is
+        # not the one the approval was granted for.
+        reasons.append(StaleReason.CHANGE_SWAPPED.value)
+    elif str(current["change_id"]) != binding.change_id:
         reasons.append(StaleReason.CHANGE_SWAPPED.value)
     for name, stale in (("plan_hash", StaleReason.PLAN_CHANGED), ("arguments_hash", StaleReason.ARGUMENTS_CHANGED),
                         ("subject", StaleReason.SUBJECT_CHANGED), ("policy_version", StaleReason.POLICY_CHANGED),
@@ -403,7 +423,12 @@ class ApprovalStore:
             write_private(path, json.dumps(
                 Approval(binding=approval.binding, state=approval.state, consumed_at=approval.consumed_at,
                          lease_owner=approval.lease_owner,
-                         outcome={**approval.outcome, **outcome, "executed": True}).to_dict(),
+                         outcome={**approval.outcome,
+                                  **outcome,
+                                  # The key survives here: dropping it would make a same-key retry look
+                                  # like a second, different job and be refused as one.
+                                  "idempotency_key": approval.outcome.get("idempotency_key", ""),
+                                  "executed": True}).to_dict(),
                 ensure_ascii=False))
 
     def _path(self, approval_id: str) -> Path:

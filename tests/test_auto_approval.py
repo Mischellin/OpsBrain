@@ -45,7 +45,7 @@ def current(**overrides: Any) -> dict[str, Any]:
     binding = a_binding()
     base: dict[str, Any] = {"plan_hash": binding.plan_hash, "arguments_hash": binding.arguments_hash,
                             "subject": binding.subject, "policy_version": binding.policy_version,
-                            "profile": binding.profile,
+                            "profile": binding.profile, "change_id": binding.change_id,
                             "targets": list(binding.targets), "evidence_ids": list(binding.evidence_ids)}
     return {**base, **overrides}
 
@@ -712,3 +712,42 @@ def test_a_takeover_runs_the_same_checks_as_a_first_lease(tmp_path: Path) -> Non
         aged["binding"]["created"] = round(now() - 10_000.0, 3)
         path.write_text(json.dumps(aged), encoding="utf-8")
         store.consume(approval.id, current(), owner="taker", idempotency_key="another-job")
+
+
+def test_a_record_without_a_creation_time_is_not_refreshed_into_a_live_approval(tmp_path: Path) -> None:
+    """`created` defaulted to `now()` on every read, and it is outside the content-addressed id.
+
+    A legacy or hand-edited record therefore matched its own filename and stayed spendable for as long as
+    anybody kept reading it. A timestamp that is not there is not a fact, and an approval is not the place
+    to invent one.
+    """
+    store = ApprovalStore(tmp_path)
+    approval = store.issue(a_binding())
+    path = tmp_path / f"{approval.id}.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["binding"].pop("created")
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(OpsError, match="no creation time"):
+        store.get(approval.id)
+    with pytest.raises(OpsError, match="no creation time"):
+        store.consume(approval.id, current(), owner="w", idempotency_key="k")
+
+
+def test_a_missing_change_id_is_a_mismatch_not_a_skip(tmp_path: Path) -> None:
+    """Falling back to the binding's own value made the comparison true by construction."""
+    store = ApprovalStore(tmp_path)
+    approval = store.issue(a_binding())
+    without = {key: value for key, value in current().items() if key != "change_id"}
+    assert StaleReason.CHANGE_SWAPPED.value in stale_reasons(a_binding(), without)
+    with pytest.raises(OpsError, match="STALE"):
+        store.consume(approval.id, without, owner="w", idempotency_key="k")
+
+
+def test_recording_an_outcome_keeps_the_key_that_made_the_retry_idempotent(tmp_path: Path) -> None:
+    store = ApprovalStore(tmp_path)
+    approval = store.issue(a_binding())
+    store.consume(approval.id, current(), owner="worker-1", idempotency_key="job-42")
+    store.record_outcome(approval.id, {"state": "executed", "at": now()})
+    replay = store.consume(approval.id, current(), owner="worker-2", idempotency_key="job-42")
+    assert replay.outcome.get("idempotency_key") == "job-42"
+    assert replay.outcome.get("executed") is True
