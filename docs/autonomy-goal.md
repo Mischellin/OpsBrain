@@ -14,17 +14,21 @@ Epic: [#3](https://github.com/Mischellin/OpsBrain/issues/3). База — [#2](h
 
 | # | Задача | Модуль | PR | Состояние |
 |---|---|---|---|---|
-| 4 | OPS-AUTO-01 — ReviewService/Codex runner | `auto/review.py`, `auto/runners.py` | [#15](https://github.com/Mischellin/OpsBrain/pull/15) | 102 теста, 2 круга замечаний закрыто |
-| 5 | OPS-AUTO-02 — Evidence Bundle | `auto/evidence.py` | [#16](https://github.com/Mischellin/OpsBrain/pull/16) | 185 тестов, 2 круга замечаний закрыто |
-| 8 | OPS-AUTO-07 — проверка фактического состояния | `auto/verify.py` | [#17](https://github.com/Mischellin/OpsBrain/pull/17) | 233 теста, 3 круга замечаний закрыто |
-| 6 | OPS-AUTO-03 — preflight плана | `auto/plan.py`, `auto/preflight.py` | [#18](https://github.com/Mischellin/OpsBrain/pull/18) | 314 тестов, 2 круга замечаний закрыто |
-| 7 | OPS-AUTO-04 — ApprovalEngine | `auto/decision.py` | — | не начато |
-| 14 | OPS-AUTO-05 — STALE approval, optimistic locking, single-use lease | `auto/approval.py` | — | не начато |
+| 4 | OPS-AUTO-01 — ReviewService/Codex runner | `auto/review.py`, `auto/runners.py` | [#15](https://github.com/Mischellin/OpsBrain/pull/15) | 192 теста, 4 круга замечаний закрыто |
+| 5 | OPS-AUTO-02 — Evidence Bundle | `auto/evidence.py` | [#16](https://github.com/Mischellin/OpsBrain/pull/16) | 228 тестов, 2 круга замечаний закрыто |
+| 8 | OPS-AUTO-07 — проверка фактического состояния | `auto/verify.py` | [#17](https://github.com/Mischellin/OpsBrain/pull/17) | 246 тестов, 4 круга замечаний закрыто |
+| 6 | OPS-AUTO-03 — preflight плана | `auto/plan.py`, `auto/preflight.py` | [#18](https://github.com/Mischellin/OpsBrain/pull/18) | 343 теста, 4 круга замечаний закрыто |
+| 14 | OPS-AUTO-05 — STALE approval, optimistic locking, single-use lease | `auto/approval.py` | [#19](https://github.com/Mischellin/OpsBrain/pull/19) | 374 теста, P1 Codex закрыты |
+| — | три P1 из v1 (P1-фиксы базы) | `redact.py`, `readers.py`, `changes.py`, `operators.py` | [#20](https://github.com/Mischellin/OpsBrain/pull/20) | 380 тестов, P1 Codex закрыты |
+| 7 | OPS-AUTO-04 — ApprovalEngine | `auto/decision.py` | [#21](https://github.com/Mischellin/OpsBrain/pull/21) | 432 теста, 13 P1 и 4 P2 Codex закрыты |
 | 9 | OPS-AUTO-10 — policy profiles | `auto/profiles.py` | — | не начато |
 | 10 | OPS-AUTO-08 — Codex postflight | `auto/postflight.py` | — | не начато |
 | 11 | OPS-AUTO-06 — canary rollout | `auto/rollout.py` | — | не начато |
 | 12 | OPS-AUTO-09 — bounded recovery loop | `auto/recovery.py` | — | не начато |
 | 13 | OPS-AUTO-11 — E2E и regression fixtures | `tests/test_auto_e2e.py` | — | не начато |
+
+Порядок merge: **#2 → #20 → #15 → #16 → #17 → #18 → #19 → #21**. #20 меняет код v1, поэтому его
+разумнее влить в #2 до остального стека, а не после.
 
 ## Правило очерёдности
 
@@ -50,6 +54,16 @@ Epic: [#3](https://github.com/Mischellin/OpsBrain/issues/3). База — [#2](h
 7. Claude не является зависимостью. Модели и лимиты конфигурируются, скрытого платного fallback нет.
 8. Content-addressed id обязан проверяться против хеша содержимого при каждой верификации. Запись под
    существующим id с пересчитанным digest — не иммутабельность.
+9. **Факт, который не установили, — это не факт.** Отсутствующее поле не читается как «не изменилось»:
+   policy-факты, `preflight_approvable`, `evidence_ids`, `review_ids` и результат верификации обязаны
+   быть установлены явно, иначе решение блокируется. Дефолт, выдающий разрешение, — не разрешение.
+10. **Проверка сравнивает два независимых значения.** Binding не сверяется сам с собой: change хранит,
+    против чего решали, а gate выводит собственные факты change и сравнивает с ними. Версия policy
+    берётся из текущего конфига, а не из того же binding.
+11. **Проверка и действие — в одном шаге.** Дайджест сохранённого плана и его применение выполняются
+    одним shell на раннере: пересчитанное и применённое — одни и те же байты.
+12. Охрана, которая не применена на пути, — не охрана. Каждый из закрытых P1 был либо «существует и
+    задокументирована, но не вызывается», либо «проверяет поле, которого нет».
 
 ## Проверки
 
@@ -72,9 +86,12 @@ credentials, помечаются как пропущенные, а не выд�
 ## Готово, когда
 
 - [x] #4, #5, #6, #8 реализованы, покрыты тестами и стоят в стеке.
+- [x] #7 и #14 реализованы в том же формате (#21, #19).
+- [x] Сквозной разрешённый сценарий проходит без human `yes`: движок решил, выдал approval, исполнитель
+      дошёл до раннера. Неопределённый заканчивается `BLOCKED_AUTONOMOUSLY` без мутаций.
+- [x] Restart/retry не дублирует apply: идемпотентный ретрай отвечает записанным исходом, не входя в тело
+      ещё раз, а change остаётся одноразовым.
 - [ ] P1-замечания Codex закрыты во всех открытых PR; на каждом — свежее `@codex review` без P1.
-- [ ] Остальные 7 задач реализованы в том же формате.
-- [ ] Сквозной разрешённый сценарий проходит без human `yes`; неопределённый заканчивается
-      `BLOCKED_AUTONOMOUSLY` без мутаций.
-- [ ] Restart/retry не дублирует apply.
+      (Сейчас на #21 закрыто 13 P1 и 4 P2; свежие ревью запрошены, вердикты придут асинхронно.)
+- [ ] Остальные 5 задач (#9, #10, #11, #12, #13) реализованы в том же формате.
 - [ ] Документированы запуск, scopes, бюджеты, emergency stop и реально проверенные платформы.
