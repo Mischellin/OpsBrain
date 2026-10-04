@@ -249,7 +249,10 @@ class ApprovalStore:
                 if approval.binding.id != path.stem:
                     continue  # a file whose name is not its own identity is not one of ours
                 rows.append(approval.to_dict())
-            except (OSError, ValueError, OpsError):
+            except (OSError, ValueError, TypeError, OpsError):
+                # `TypeError` belongs here: a record whose `targets` or `outcome` is `null` raises it out of
+                # `tuple()` / `dict()` deep inside the constructor, and without this one malformed file
+                # took the entire listing down instead of being skipped like every other corrupt record.
                 continue
         rows.sort(key=lambda row: float(row["binding"].get("created", 0)), reverse=True)
         return rows[:limit]
@@ -395,6 +398,13 @@ def binding_for(change: Any, *, evidence_ids: Sequence[str] = (), policy_version
         raise OpsError(f"change {change.id} expired at {change.expires:.0f}; plan it again")
     remaining = max(0.0, float(change.expires) - now())
     lifetime = min(expires_s, remaining)
+    if evidence_ids and evidence_expires_in_s is None:
+        # Required, not optional. Left optional, the common case - evidence bound, cap forgotten - produced
+        # an approval good for the full 3600s while its evidence was fresh for 900s, and `stale_reasons`
+        # compares only the ids, so the stale bundle authorised execution for another three quarters of an
+        # hour. The caller has the bundles' ages; this is the one thing it cannot be allowed to leave out.
+        raise OpsError("an approval that binds evidence must say how long that evidence stays usable; "
+                       "pass evidence_expires_in_s from the bundle's remaining freshness")
     if evidence_expires_in_s is not None:
         # Only ever shortened. A caller passing a larger number must not be able to widen an approval past
         # the life of the evidence it rests on.

@@ -285,3 +285,38 @@ def test_agent_socket_falls_back_to_launchd(config, monkeypatch) -> None:  # typ
 def test_unreachable_host_reports_the_reason(ops, fake) -> None:  # type: ignore[no-untyped-def]
     fake.on(r"uptime_s", "Permission denied (publickey).", rc=255)
     assert ops.hosts_status(["pve"])["hosts"]["pve"]["warn"] == ["unreachable: Permission denied (publickey)."]
+
+
+def test_an_interrupted_plan_does_not_leave_its_partial_file_forever(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    """The age-based sweep matched only `*.tfplan`, and an interrupted plan writes `*.partial`.
+
+    A saved plan may hold the stack's variable values, so leaving one on the runner because the shell was
+    killed mid-command is not a thing to shrug at.
+    """
+    fake.on(r"tofu plan", "No changes.")
+    ops.tofu_plan()
+    script = next(script for _, script in fake.calls if "tofu plan" in script)
+    assert "*.partial" in script, "abandoned partials are swept like saved plans"
+    assert "-mmin +1440" in script
+
+
+def test_a_marker_without_the_refusal_exit_code_does_not_override_a_successful_apply(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    """A provisioner echoing the marker must not be able to report a successful apply as "nothing applied"."""
+    fake.on(r"tofu plan", f"Plan: 0 to add, 1 to change, 0 to destroy.\n{PLAN_SHA}\n{JSON_MARK}\n{PLAN_JSON}\n", rc=2)
+    plan = ops.tofu_plan()
+    approve(ops, plan["change"])
+    fake.on(r"tofu apply", "Apply complete! Resources: 0 added, 1 changed, 0 destroyed.\n"
+                           "@@OPSBRAIN-PLAN-MISMATCH deadbeefdeadbeef@@\n@@OPSBRAIN-POSTPLAN 0@@\n")
+    out = ops.tofu_apply(plan["change"])
+    assert out["ok"] is True, "the apply's own result stands"
+    assert "plan_changed" not in out
+    assert out["marker_without_refusal"] == "deadbeefdeadbeef", "the stray marker is reported as noise"
+
+
+def test_a_refusal_still_reports_the_mismatch(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    fake.on(r"tofu plan", f"Plan: 0 to add, 1 to change, 0 to destroy.\n{PLAN_SHA}\n{JSON_MARK}\n{PLAN_JSON}\n", rc=2)
+    plan = ops.tofu_plan()
+    approve(ops, plan["change"])
+    fake.on(r"tofu apply", "@@OPSBRAIN-PLAN-MISMATCH " + "cd" * 32 + "@@\n", rc=78)
+    out = ops.tofu_apply(plan["change"])
+    assert out["ok"] is False and out["plan_changed"] is True

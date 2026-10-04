@@ -242,7 +242,8 @@ def test_the_binding_is_built_from_the_change_not_from_the_caller(tmp_path: Path
     change = Change(id="c-1a2b3c4d", capability="ansible.apply", target="common.yml",
                     summary="ansible apply common.yml", hash="ph-1", created=now(), expires=now() + 3600,
                     args={"limit": "web-1", "tags": "nginx"})
-    binding = binding_for(change, evidence_ids=["ev-aaaaaaaabbbbbbbb"], policy_version="v1")
+    binding = binding_for(change, evidence_ids=["ev-aaaaaaaabbbbbbbb"], policy_version="v1",
+                          evidence_expires_in_s=900.0)
     assert binding.change_id == "c-1a2b3c4d"
     assert binding.subject == "ansible.apply:common.yml"
     assert binding.plan_hash == "ph-1", "the plan hash comes from the change record"
@@ -328,7 +329,8 @@ def test_an_approval_does_not_outlive_its_evidence(tmp_path: Path) -> None:
     """
     change = SimpleNamespace(id="c-0000a1b2", capability="tofu.apply", target="proxmox", hash="ph-1",
                              args={}, expired=False, expires=now() + 7200.0)
-    generous = binding_for(change, evidence_ids=("ev-aaaaaaaabbbbbbbb",), expires_s=3600.0)
+    generous = binding_for(change, evidence_ids=("ev-aaaaaaaabbbbbbbb",), expires_s=3600.0,
+                           evidence_expires_in_s=3600.0)
     assert generous.expires_s == pytest.approx(3600.0, abs=5)
     capped = binding_for(change, evidence_ids=("ev-aaaaaaaabbbbbbbb",), expires_s=3600.0,
                          evidence_expires_in_s=600.0)
@@ -436,3 +438,30 @@ def test_an_automatic_retry_does_not_undo_a_revocation(tmp_path: Path) -> None:
     with pytest.raises(OpsError, match="was revoked"):
         store.issue(a_binding())
     assert store.get(approval.id).state is LeaseState.REVOKED, "the withdrawal stands"
+
+
+def test_binding_evidence_without_saying_how_long_it_lasts_is_refused() -> None:
+    """The cap is not optional, because forgetting it is the common case and it fails open.
+
+    `stale_reasons` compares the evidence *ids*; whether the bundle is still fresh is checked only here.
+    Omitting the cap left an approval good for 3600s standing on evidence fresh for 900s.
+    """
+    change = SimpleNamespace(id="c-0000a1b2", capability="tofu.apply", target="proxmox", hash="ph-1",
+                             args={}, expired=False, expires=now() + 7200.0)
+    with pytest.raises(OpsError, match="how long that evidence stays usable"):
+        binding_for(change, evidence_ids=("ev-aaaaaaaabbbbbbbb",), expires_s=3600.0)
+    # With no evidence bound there is nothing to cap against, and the ordinary lifetime stands.
+    assert binding_for(change, expires_s=3600.0).expires_s == pytest.approx(3600.0, abs=5)
+
+
+def test_one_malformed_record_does_not_take_the_whole_listing_down(tmp_path: Path) -> None:
+    """`targets: null` raises `TypeError` out of `tuple()` deep in the constructor, not `OpsError`."""
+    store = ApprovalStore(tmp_path)
+    good = store.issue(a_binding())
+    broken = tmp_path / f"{a_binding(change_id='c-0000c0de').id}.json"
+    document = json.loads((tmp_path / f"{good.id}.json").read_text(encoding="utf-8"))
+    document["binding"]["targets"] = None
+    broken.write_text(json.dumps(document), encoding="utf-8")
+
+    listed = store.list()
+    assert [row["id"] for row in listed] == [good.id], "the valid record is still listed"

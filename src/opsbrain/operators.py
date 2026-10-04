@@ -25,6 +25,8 @@ PLAN_SHA = re.compile(r"^@@OPSBRAIN-PLAN-SHA ([0-9a-f]{64})@@$", re.MULTILINE)
 PLANMISMATCH = re.compile(r"^@@OPSBRAIN-PLAN-MISMATCH ([0-9a-f]*)@@$", re.MULTILINE)
 #: A saved plan is applied by path, so the path is constrained to the one shape `tofu_plan` ever writes.
 PLAN_PATH = re.compile(r"^\.opsbrain/j-[0-9a-f]{8}\.tfplan$")
+#: The exit code `_plan_apply_script` reserves for "the plan is not the one that was approved".
+PLAN_MISMATCH_RC = 78
 _LOCK = re.compile(r"^[0-9a-fA-F-]{8,64}$")
 _SYNC_SUFFIXES = (".tf", ".tftpl", ".tpl")
 _SKIP_FINGERPRINT = re.compile(r"(^|/)(\.git|__pycache__|\.ansible|collections|\.cache)(/|$)|\.retry$|\.pyc$")
@@ -96,7 +98,9 @@ class Operators(Core):
         # checksum guard with bytes the approver never saw. One held artifact is written, hashed, shown and
         # later applied, so every one of those four steps reads the same bytes.
         script = (f"{self._tofu_prefix(config)}mkdir -p .opsbrain && chmod 700 .opsbrain && "
-                  "find .opsbrain -name '*.tfplan' -mmin +1440 -delete; "
+                  # Both extensions: an interrupted plan leaves a `.partial` behind, and a saved plan may
+                  # hold the stack's variable values, so neither may sit on the runner indefinitely.
+                  "find .opsbrain \( -name '*.tfplan' -o -name '*.partial' \) -mmin +1440 -delete; "
                   f"{binary} plan -input=false -no-color -lock-timeout=60s -detailed-exitcode -out={scratch}; rc=$?; "
                   f"if [ $rc -eq 2 ]; then cp -- {scratch} {plan_file} && chmod 400 {plan_file}; rm -f {scratch}; "
                   f"echo \"@@OPSBRAIN-PLAN-SHA $(sha256sum {plan_file} | cut -d' ' -f1)@@\"; "
@@ -222,11 +226,16 @@ class Operators(Core):
         meta = self.artifacts.save("tofu-apply", job.title, text)
         out: dict[str, Any] = {"stack": job.meta["stack"], "change": job.meta["change"], "artifact": meta.id,
                                "ok": rc == 0, **parsers.tofu_text(text)}
-        if mismatch := PLANMISMATCH.search(text):
-            # The saved plan on the runner is not the one that was approved, so nothing was applied. Say so
-            # plainly instead of reporting a generic failure: the operator's next step is to plan again.
+        if rc == PLAN_MISMATCH_RC and (mismatch := PLANMISMATCH.search(text)):
+            # Only on the exit code the script reserves for the refusal. A successful apply whose output
+            # happens to contain a line matching the marker - a provisioner echoing it, say - would
+            # otherwise be reported as "nothing was applied" while the infrastructure had in fact changed.
             return {**out, "ok": False, "plan_changed": True, "found": mismatch.group(1) or "no file",
                     "hint": "the saved plan on the runner is not the one that was approved; plan again"}
+        if mismatch := PLANMISMATCH.search(text):
+            # The marker arrived with a different exit code, so the apply's own result stands and this is
+            # only noise worth reporting as such.
+            out["marker_without_refusal"] = mismatch.group(1)
         if match := POSTPLAN.search(text):
             out["post_plan_clean"] = match[1] == "0"
             if match[1] != "0":
