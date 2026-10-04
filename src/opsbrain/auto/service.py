@@ -12,7 +12,9 @@ Outside it, budgets do not exist and redelivery double-charges. Inside it:
 
 from __future__ import annotations
 
+import contextlib
 import threading
+import time
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -493,17 +495,24 @@ class AutoService:
         record = self.preflight().get_by_plan(plan_id)
         plan = ChangePlan.from_dict(record["plan_document"])
         result = PreflightResult.from_record(record)
-        # The review covers the operations the plan actually proposes, not merely the target it happens to
-        # name. Checking only the target meant any approvable plan mentioning `proxmox` could authorise any
-        # pending change against `proxmox` - a reviewed `ansible.apply` plan would approve a `tofu.apply`
-        # - and the binding is then built entirely from the change, so the reviewed operation never entered
-        # into it. Capability and target must both match.
-        proposed = {f"{change.capability}:{change.target}"
-                    for change in plan.changes if change.capability and change.target}
-        if proposed and f"{change.capability}:{change.target}" not in proposed:
+        # The review covers a concrete operation, not just a kind of edit. Comparing capability and target
+        # alone left a reviewed `tofu.apply` for `proxmox` able to authorise a *different* saved plan
+        # against the same stack, because the file it will run is named in the change's arguments and the
+        # plan never mentioned it. A step now declares the arguments it runs, and all three must match.
+        wanted = f"{change.capability}:{change.target}"
+        candidates = [step for step in plan.changes
+                      if f"{step.capability}:{step.target}" == wanted]
+        if plan.changes and not candidates:
+            proposed = sorted({f"{step.capability}:{step.target}" for step in plan.changes})
             return self._decision_refused(change_id, plan_id,
-                                          f"the plan proposes {', '.join(sorted(proposed))} and not "
-                                          f"{change.capability}:{change.target}", review_id=result.review_id)
+                                          f"the plan proposes {', '.join(proposed)} and not {wanted}",
+                                          review_id=result.review_id)
+        if candidates and not any(dict(step.arguments) == dict(change.args) for step in candidates):
+            seen = "; ".join(f"{wanted} {dict(step.arguments)}" for step in candidates)
+            return self._decision_refused(change_id, plan_id,
+                                          f"the plan proposes {seen}, and the change runs "
+                                          f"{wanted} {dict(change.args)}",
+                                          review_id=result.review_id)
         if plan.targets and change.target not in plan.targets:
             return self._decision_refused(change_id, plan_id,
                                           f"the plan names {', '.join(plan.targets)} and not "
@@ -525,7 +534,8 @@ class AutoService:
         # was written when the bundle was fresh; the decision happens later, and by then the bundle may have
         # aged past `evidence.max_age_s`, gone missing, or been tampered with. Treating a non-empty id tuple
         # as `evidence_fresh` made all three reach APPROVE.
-        evidence_ids, evidence_reason = self._evidence_state(result.evidence_ids)
+        evidence_ids, evidence_reason, evidence_remaining = self._evidence_state(
+            result.evidence_ids, change_id)
         inputs = Inputs(
             mode=self.auto.decision.mode,
             preflight_outcome=result.outcome,
@@ -556,34 +566,48 @@ class AutoService:
         out: dict[str, Any] = {"decision": decision.brief()}
         if decision.decision is Decision.RETRY:
             # Counted only after the decision, under the same lock as every other transition, so a crash
-            # between deciding and counting cannot buy a free cycle - and so the count is durable.
-            self.core.changes.note_repair_cycle(change_id)
-            out["decision"] = {**decision.brief(), "attempts": self._repair_count(change)}
+            # between deciding and counting cannot buy a free cycle - and so the count is durable. The
+            # *returned* change is used for the reply: the object loaded before the increment reports one
+            # less than the record now holds, so every answer was a cycle behind the durable counter.
+            counted = self.core.changes.note_repair_cycle(change_id)
+            out["decision"] = {**decision.brief(), "attempts": self._repair_count(counted),
+                               "repair_cycles_remaining": max(
+                                   0, self.auto.decision.max_repair_cycles - self._repair_count(counted))}
         if not decision.approvable:
             return out
         binding = binding_for(change, evidence_ids=result.evidence_ids,
                               policy_version=self.auto.decision.policy_version,
-                              arguments_hash=arguments)
+                              arguments_hash=arguments,
+                              evidence_expires_in_s=evidence_remaining)
         approval = self.engine().issue(plan_id, arguments, binding, record=decision)
         self.core.changes.attach_approval(change_id, approval)
         return {**out, "approval": approval, "next": f"apply change {change_id}; no human step is required"}
 
-    def _evidence_state(self, evidence_ids: Sequence[str]) -> tuple[tuple[str, ...], str]:
+    def _evidence_state(self, evidence_ids: Sequence[str],
+                        change_id: str = "") -> tuple[tuple[str, ...], str, float]:
         """Re-read and re-check every bundle a decision rests on, and answer with what is true now.
 
         A preflight record remembers which evidence travelled with the review; it does not remember
         whether that evidence is still usable. A bundle can pass its freshness window, go missing, or be
         replaced, and all three left the id tuple intact - so a decision taken later would still have
         reported `evidence_fresh` off a reference that no longer resolved to anything.
+
+        The bundles are also checked against `change_id`. Without it `check_evidence` falls back to the
+        bundle's own id as the expected identity, so a bundle consistently bound to some other change
+        passes every check and the approval records it as evidence for this one.
+
+        Returns the references, the reason, and how much longer the *earliest* bundle stays fresh - the
+        last of which caps the approval, so it cannot outlive its own evidence.
         """
         ids = tuple(evidence_ids)
         if not ids:
-            return (), "evidence_missing"
+            return (), "evidence_missing", 0.0
         # The references are returned even when they fail. Dropping them would send the engine down its
         # "no evidence at all" branch, whose message names no bundle - and the operator's next step is to
         # look at that bundle.
         failing: list[str] = []
         code = "evidence_fresh"
+        remaining = float("inf")
         for bundle_id in ids:
             try:
                 bundle = self.evidence.get(bundle_id)
@@ -592,14 +616,19 @@ class AutoService:
                 code = code if code != "evidence_fresh" else "evidence_missing"
                 continue
             payloads, blocked = self.evidence.load_artifacts(bundle)
-            checks = check_evidence(bundle, payloads, blocked=blocked)
+            checks = check_evidence(bundle, payloads, blocked=blocked, change_id=change_id or None)
+            # The earliest expiry is the one that matters: an approval outliving the *first* stale bundle
+            # is exactly the case worth refusing.
+            with contextlib.suppress(TypeError, ValueError):
+                remaining = min(remaining, max(0.0, float(bundle.created) + self.auto.evidence.max_age_s
+                                              - time.time()))
             found = reason_code(checks)
             if found != "evidence_fresh":
                 failing.append(bundle_id)
                 code = found if code == "evidence_fresh" else code
         if not failing:
-            return ids, "evidence_fresh"
-        return ids, f"{code} (unusable: {', '.join(failing)})"
+            return ids, "evidence_fresh", remaining
+        return ids, f"{code} (unusable: {', '.join(failing)})", remaining
 
     def _repair_count(self, change: Any) -> int:
         """How many repair cycles this change has already had, from the record rather than from memory.

@@ -206,13 +206,15 @@ class VerificationReport:
 
     @classmethod
     def from_dict(cls, document: dict[str, Any]) -> VerificationReport:
-        """Rebuild a report from its own `to_dict` shape, as a tool response hands it back.
+        """Rebuild a report from either shape this class emits.
 
-        `change_id` is honoured as given, so a caller that reads a report back can re-attach it to the
-        change it was about. The decision engine forces the id to the change it is deciding, because
-        binding a report to the right change is the engine's job and not the caller's.
+        `to_dict` names the change `change_id`; `brief` names it `change`, because `brief` is written for a
+        human reading a tool response. `verify_change` and `verify_plan` return `brief`, so reading it back
+        through the `to_dict` parser alone silently lost the identity and the decision engine then refused
+        a perfectly good report as naming no change at all. Both spellings are accepted.
         """
-        return cls(change_id=str(document.get("change_id", "")),
+        change_id = str(document.get("change_id") or document.get("change") or "")
+        return cls(change_id=change_id,
                    status=CheckStatus(str(document.get("status", CheckStatus.NOT_RUN.value))),
                    results=tuple(CheckResult(**{**row, "status": CheckStatus(str(row["status"])),
                                                 "evidence_refs": tuple(row.get("evidence_refs", ())),

@@ -70,6 +70,12 @@ class ProposedChange:
     capability: str
     target: str
     how: str
+    #: The concrete operation this step runs, as the change will record it - `{"plan_file": ...}` for a
+    #: saved OpenTofu plan, `{"playbook": ..., "limit": ...}` for an Ansible one. Without it a plan says
+    #: *what kind* of edit it proposes and a change says *which* one, and nothing connects them: a reviewed
+    #: plan for a stack would authorise a different saved plan against the same stack, because the
+    #: capability and the target were the only things being compared.
+    arguments: dict[str, Any] = field(default_factory=dict)
     reversible: Reversibility = Reversibility.ROLLBACK
     undo: str = ""
     irreversible_reason: str = ""
@@ -111,7 +117,8 @@ class ProposedChange:
                 "reversible": self.reversible.value, "undo": self.undo, "profile": self.profile,
                 "declared_check": self.declared_check, "host": self.host, "resource": self.resource,
                 "expectation": self.expectation, "expected_revision": self.expected_revision,
-                "irreversible_reason": self.irreversible_reason, "state_changing": self.state_changing}
+                "irreversible_reason": self.irreversible_reason, "state_changing": self.state_changing,
+                "arguments": dict(self.arguments)}
 
     @staticmethod
     def from_dict(data: Any) -> ProposedChange:
@@ -128,7 +135,8 @@ class ProposedChange:
             profile=str(data.get("profile", "") or ""),
             declared_check=str(data.get("declared_check", "") or ""), host=str(data.get("host", "") or ""),
             resource=str(data.get("resource", "") or ""), expectation=str(data.get("expectation", "") or ""),
-            expected_revision=str(data.get("expected_revision", "") or ""))
+            expected_revision=str(data.get("expected_revision", "") or ""),
+            arguments=dict(data.get("arguments") or {}))
 
 
 @dataclass(frozen=True)

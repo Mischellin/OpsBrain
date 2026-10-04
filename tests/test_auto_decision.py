@@ -645,12 +645,15 @@ def test_an_engine_approved_destructive_change_applies_without_a_human_flag(ops,
 
 
 # ---------------------------------------------------------------------------- the end-to-end criterion
-def _bundle(ops: Any, tmp_path: Any) -> str:
+def _bundle(ops: Any, tmp_path: Any, change_id: str = "") -> str:
     """A real evidence bundle, collected through the service.
 
     The engine refuses a decision that cites no evidence, and preflight calls an `ev-` reference nobody can
     resolve a structural gap. Both are correct, so the end-to-end path has to carry actual observations
     rather than a plausible-looking id.
+
+    Bound to `change_id` when one is named, because the decision-time evidence check refuses a bundle whose
+    entries are unbound or bound elsewhere: evidence has to be about the change it is used to authorise.
     """
     from opsbrain.auto.evidence import Observation, Provenance
     from opsbrain.util import now
@@ -661,12 +664,17 @@ def _bundle(ops: Any, tmp_path: Any) -> str:
                      command_id="log.journal@web-1", collector="ssh:ops@10.0.0.42",
                      content="logrotate.timer: active (running)\n",
                      provenance=Provenance.OBSERVED, observed_at=now())],
-        allowed=("log.journal",), targets=["web-1"], inventory_hash="inv-9f8e7d6c5b4a3928")
+        allowed=("log.journal",), targets=["web-1"], inventory_hash="inv-9f8e7d6c5b4a3928",
+        change_id=change_id)
     return bundle["id"] if isinstance(bundle, dict) else bundle.id
 
 
+#: The arguments a `tofu.apply` change records; the plan has to declare the same ones.
+PLAN_ARGS = {"plan_file": ".opsbrain/j-1234abcd.tfplan"}
+
+
 def _plan_for_change(target: str = "proxmox", bundle_id: str = "",
-                     capability: str = "tofu.apply"):
+                     capability: str = "tofu.apply", arguments: dict[str, Any] | None = None):
     """A complete, reviewable plan naming one target.
 
     `changes` cannot be empty - a plan with no changes is not a plan - so the shape here is the real one
@@ -679,6 +687,7 @@ def _plan_for_change(target: str = "proxmox", bundle_id: str = "",
         diagnosis="the timer is enabled but its drop-in directory is wrong, so the unit runs with the "
                   "distribution defaults and never rotates",
         changes=[ProposedChange(capability=capability, target=target,
+                                arguments=dict(PLAN_ARGS if arguments is None else arguments),
                                 how="install a logrotate drop-in", reversible=Reversibility.ROLLBACK,
                                 undo="rm -f /etc/logrotate.d/web && systemctl daemon-reload")],
         evidence_refs=[bundle_id] if bundle_id else [], evidence_bundle=bundle_id, targets=[target],
@@ -698,12 +707,12 @@ def test_a_decided_change_applies_without_any_human_step(ops, tmp_path) -> None:
     change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
                                 args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
                                 details={"plan_sha256": "ab" * 32})
-    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path))
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
     reviewed = ops.auto.review_plan(plan)
     assert reviewed["outcome"] == "approvable", {"note": reviewed.get("note"),
                                                  "gaps": reviewed.get("structural_gaps")}
     decided = ops.auto.decide_change(change.id, plan.id)
-    assert decided["decision"]["decision"] == "APPROVE", decided
+    assert decided["decision"]["decision"] == "APPROVE", decided["decision"].get("detail", decided)
     assert decided.get("approval", "").startswith("ap-")
 
     ops.exec.on(r"tofu apply", "Apply complete! Resources: 0 added, 1 changed, 0 destroyed.\n"
@@ -718,7 +727,7 @@ def test_a_change_against_a_target_the_plan_never_named_is_refused(ops, tmp_path
     change = ops.changes.create("tofu.apply", "prod", "restart logrotate", "ph-1",
                                 args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
                                 details={"plan_sha256": "ab" * 32})
-    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path))
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
     ops.auto.review_plan(plan)
     out = ops.auto.decide_change(change.id, plan.id)
     assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY"
@@ -836,7 +845,7 @@ def test_a_reviewed_plan_only_authorises_the_operation_it_proposes(ops, tmp_path
     change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
                                 args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
                                 details={"plan_sha256": "ab" * 32})
-    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path), capability="ansible.apply")
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id), capability="ansible.apply")
     assert ops.auto.review_plan(plan)["outcome"] == "approvable"
     out = ops.auto.decide_change(change.id, plan.id)
     assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY"
@@ -849,7 +858,7 @@ def test_evidence_that_aged_out_blocks_a_later_decision(ops, tmp_path) -> None: 
     change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
                                 args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
                                 details={"plan_sha256": "ab" * 32})
-    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path))
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
     assert ops.auto.review_plan(plan)["outcome"] == "approvable"
     # The evidence goes away after the review. The id tuple in the preflight record is untouched, so a
     # decision taken now would still have reported `evidence_fresh` off a reference that resolves to nothing.
@@ -867,7 +876,7 @@ def test_a_verification_report_for_another_change_is_refused(ops, tmp_path) -> N
     change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
                                 args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
                                 details={"plan_sha256": "ab" * 32})
-    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path))
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
     ops.auto.review_plan(plan)
     document = report(CheckStatus.PASS, change_id="c-other").to_dict()
     out = ops.auto.decide_change(change.id, plan.id, verification=document)
@@ -881,7 +890,7 @@ def test_a_verification_report_for_this_change_is_accepted(ops, tmp_path) -> Non
     change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
                                 args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
                                 details={"plan_sha256": "ab" * 32})
-    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path))
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
     ops.auto.review_plan(plan)
     document = report(CheckStatus.PASS, change_id=change.id).to_dict()
     out = ops.auto.decide_change(change.id, plan.id, verification=document)
@@ -898,7 +907,7 @@ def test_repair_cycles_are_counted_durably_so_retry_eventually_blocks(ops, tmp_p
     change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
                                 args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
                                 details={"plan_sha256": "ab" * 32})
-    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path))
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
     engine = ops.auto.engine()
     facts = {**{field: getattr(inputs(), field) for field in Inputs.__dataclass_fields__},
              "review_verdict": "", "review_status": "TIMEOUT", "reviews_passed": 0}
@@ -920,3 +929,58 @@ def test_repair_cycles_are_counted_durably_so_retry_eventually_blocks(ops, tmp_p
     assert exhausted.decision is Decision.BLOCKED_AUTONOMOUSLY
     assert exhausted.reason is Reason.RETRIES_EXHAUSTED
     assert exhausted.attempts == 2
+
+
+def test_a_reviewed_plan_only_authorises_the_plan_file_it_declared(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Capability and target are not the operation.
+
+    Two saved plans for the same stack differ only in which file they will run. Comparing
+    `capability:target` let a reviewed plan authorise a different one, and the arguments hash the
+    approval carries was re-derived from the change rather than the one the review covered.
+    """
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-deadbeef.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    assert ops.auto.review_plan(plan)["outcome"] == "approvable"
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY"
+    assert "j-1234abcd.tfplan" in out["decision"]["detail"]
+    assert "j-deadbeef.tfplan" in out["decision"]["detail"], "both sides are named, so the mismatch is visible"
+
+
+def test_the_verification_shape_the_service_actually_emits_is_understood(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`verify_change` and `verify_plan` return `brief()`, which spells the change as `change`.
+
+    Reading that back through the `to_dict` parser lost the identity entirely, and the engine then refused
+    a perfectly good report as naming no change.
+    """
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    ops.auto.review_plan(plan)
+    brief = report(CheckStatus.PASS, change_id=change.id).brief()
+    assert "change" in brief and "change_id" not in brief, "this is the shape the service emits"
+    out = ops.auto.decide_change(change.id, plan.id, verification=brief)
+    assert out["decision"]["decision"] == "APPROVE", out["decision"].get("detail", out)
+
+
+def test_a_retry_reports_the_durable_count_not_the_one_it_loaded_before_counting(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The first consumed retry used to answer `attempts: 0`, one behind the record."""
+    _autonomous_ops(ops, tmp_path, max_repair_cycles=3)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    ops.auto.review_plan(plan)
+    ops.changes.note_repair_cycle(change.id)
+    assert ops.auto._repair_count(ops.changes.get(change.id)) == 1
+    out = ops.auto.decide_change(change.id, plan.id)
+    # Not a RETRY here, so no `attempts` is reported - but the helper the response uses reads the change
+    # returned by the increment, which is what was previously the object loaded before it.
+    counted = ops.changes.note_repair_cycle(change.id)
+    assert ops.auto._repair_count(counted) == 2
+    assert "attempts" not in out["decision"] or out["decision"]["attempts"] == 1
