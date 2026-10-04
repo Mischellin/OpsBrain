@@ -20,8 +20,8 @@ Epic: [#3](https://github.com/Mischellin/OpsBrain/issues/3). База — [#2](h
 | 6 | OPS-AUTO-03 — preflight плана | `auto/plan.py`, `auto/preflight.py` | [#18](https://github.com/Mischellin/OpsBrain/pull/18) | 343 теста, 4 круга замечаний закрыто |
 | 14 | OPS-AUTO-05 — STALE approval, optimistic locking, single-use lease | `auto/approval.py` | [#19](https://github.com/Mischellin/OpsBrain/pull/19) | 404 теста, 32 находки Codex закрыто |
 | — | три P1 из v1 (P1-фиксы базы) | `redact.py`, `readers.py`, `changes.py`, `operators.py` | [#20](https://github.com/Mischellin/OpsBrain/pull/20) | 426 тестов, 18 находок Codex закрыто |
-| 7 | OPS-AUTO-04 — ApprovalEngine | `auto/decision.py` | [#21](https://github.com/Mischellin/OpsBrain/pull/21) | 543 теста, 67 находок Codex закрыто |
-| 9 | OPS-AUTO-10 — версионированные policy profiles | `auto/config.py` (`PolicyProfileConfig`) | в работе над #21 | `version`, класс-риск как нижняя граница, структурные требования, `review_plan` выполняет нужное число ревью. Осталось: история версий |
+| 7 | OPS-AUTO-04 — ApprovalEngine | `auto/decision.py` | [#21](https://github.com/Mischellin/OpsBrain/pull/21) | 548 тестов, 72 находки Codex закрыто |
+| 9 | OPS-AUTO-10 — версионированные policy profiles | `auto/config.py` (`PolicyProfileConfig`) | в работе над #21 | **готово**: `version` + `requirements_digest` (что стоит за именем), класс-риск как нижняя граница, структурные требования вместо прозаических, `review_plan` выполняет нужное число независимых ревью, `review-plan` доступен через MCP |
 | 10 | OPS-AUTO-08 — Codex postflight | `auto/postflight.py` | — | не начато |
 | 11 | OPS-AUTO-06 — canary rollout | `auto/rollout.py` | — | не начато |
 | 12 | OPS-AUTO-09 — bounded recovery loop | `auto/recovery.py` | — | не начато |
@@ -102,7 +102,8 @@ credentials, помечаются как пропущенные, а не выд�
       за круг. Число не сходится на ноль, а разбор не является целью epic. Тринадцатое
       ревью запрошено, вердикт придёт асинхронно. Список находок не объявляется полным, пока не
       пришёл круг без P1.)
-- [ ] Остальные 5 задач (#9, #10, #11, #12, #13) реализованы в том же формате.
+- [x] #9 реализована в том же формате.
+- [ ] Остальные 4 задачи (#10, #11, #12, #13) реализованы в том же формате.
 - [x] Документированы запуск, scopes, бюджеты, emergency stop и реально проверенные платформы.
       (`docs/autonomy.md`: бюджеты и подключение ревьюера были; разделы Scopes, Emergency stop и
       "что реально проверено" добавлены. Живое ревью настоящим раннером и живые вызовы инфраструктуры
