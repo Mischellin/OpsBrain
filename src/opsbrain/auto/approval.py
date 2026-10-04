@@ -207,13 +207,24 @@ class ApprovalStore:
         path = self._path(approval_id)
         if not path.is_file():
             raise OpsError(f"no approval {approval_id}")
-        return Approval.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        approval = Approval.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        # The id is derived from the binding's own hash, so a record whose recomputed identity disagrees
+        # with the name it was read under is not the record that was issued. Trusting the parsed binding
+        # instead means anything able to write this file can manufacture an approval for a change of its
+        # choosing, with no engine decision behind it - the same defect the change store had.
+        if approval.binding.id != approval_id:
+            raise OpsError(f"approval {approval_id} does not match its contents "
+                           f"(the file holds {approval.binding.id})")
+        return approval
 
     def list(self, limit: int = 20) -> list[dict[str, Any]]:
         rows = []
         for path in sorted(self.root.glob("ap-*.json")):
             try:
-                rows.append(Approval.from_dict(json.loads(path.read_text(encoding="utf-8"))).to_dict())
+                approval = Approval.from_dict(json.loads(path.read_text(encoding="utf-8")))
+                if approval.binding.id != path.stem:
+                    continue  # a file whose name is not its own identity is not one of ours
+                rows.append(approval.to_dict())
             except (OSError, ValueError, OpsError):
                 continue
         rows.sort(key=lambda row: float(row["binding"].get("created", 0)), reverse=True)
@@ -322,11 +333,17 @@ def _locked(path: Path) -> Iterator[None]:
 
 
 def binding_for(change: Any, *, evidence_ids: Sequence[str] = (), policy_version: str = "",
-                profile: str = "general", expires_s: float = 3600.0) -> ApprovalBinding:
+                profile: str = "general", expires_s: float = 3600.0,
+                evidence_expires_in_s: float | None = None) -> ApprovalBinding:
     """Build the binding for an existing `Change`, so a caller cannot quietly leave a field empty.
 
     Every one of the five inputs is taken from the change record itself rather than from the caller: a
     binding assembled from arguments the caller supplies is a binding the caller chose.
+
+    `evidence_expires_in_s` caps the approval at the moment its own evidence goes stale. The defaults put
+    the two an order of magnitude apart - evidence fresh for 900s, an approval good for 3600s - so without
+    the cap an approval issued just inside the freshness boundary stays executable for three quarters of
+    an hour after the observations behind it stopped describing the world.
     """
     arguments = digest({key: value for key, value in sorted(change.args.items())}) if change.args else ""
     # The binding inherits the change's own age instead of restarting at "now". An approval that outlives
@@ -334,10 +351,15 @@ def binding_for(change: Any, *, evidence_ids: Sequence[str] = (), policy_version
     if change.expired:
         raise OpsError(f"change {change.id} expired at {change.expires:.0f}; plan it again")
     remaining = max(0.0, float(change.expires) - now())
+    lifetime = min(expires_s, remaining)
+    if evidence_expires_in_s is not None:
+        # Only ever shortened. A caller passing a larger number must not be able to widen an approval past
+        # the life of the evidence it rests on.
+        lifetime = min(lifetime, max(0.0, float(evidence_expires_in_s)))
     return ApprovalBinding(
         change_id=change.id, subject=f"{change.capability}:{change.target}", plan_hash=change.hash,
         arguments_hash=arguments, targets=tuple(sorted({change.target})), evidence_ids=tuple(evidence_ids),
-        policy_version=policy_version or "unset", profile=profile, expires_s=min(expires_s, remaining),
+        policy_version=policy_version or "unset", profile=profile, expires_s=lifetime,
         created=now())
 
 

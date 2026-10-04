@@ -10,8 +10,10 @@ Two properties carry the whole issue and both are tested here from the outside:
 
 from __future__ import annotations
 
+import json
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -297,3 +299,44 @@ def test_a_swapped_plan_is_refused_at_apply(tmp_path: Path) -> None:
     assert store.get(change.id).state == "approved", "a refused consume leaves the approval spendable"
     assert store.consume(change.id, "tofu.apply", "proxmox", needs_approval=True,
                          content_hash="ph-original").state == "applied"
+
+
+def test_an_approval_whose_contents_do_not_match_its_name_is_refused(tmp_path: Path) -> None:
+    """The id is derived from the binding, so a file under the wrong name is not the record that was issued.
+
+    Without this, anything able to write the data file could author an approval for a change of its
+    choosing, with no engine decision behind it - the same defect the change store had.
+    """
+    store = ApprovalStore(tmp_path)
+    issued = store.issue(a_binding())
+    other = a_binding(change_id="c-deadbeef")
+    path = tmp_path / f"{issued.id}.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["binding"] = other.to_dict()
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(OpsError, match="does not match its contents"):
+        store.get(issued.id)
+    assert [row["id"] for row in store.list()] == [], "a file that is not its own identity is not listed"
+
+
+def test_an_approval_does_not_outlive_its_evidence(tmp_path: Path) -> None:
+    """Evidence is fresh for 900s and an approval is good for 3600s by default.
+
+    An approval issued just inside the freshness boundary would otherwise stay executable for three
+    quarters of an hour after the observations behind it stopped describing the world.
+    """
+    change = SimpleNamespace(id="c-0000a1b2", capability="tofu.apply", target="proxmox", hash="ph-1",
+                             args={}, expired=False, expires=now() + 7200.0)
+    generous = binding_for(change, evidence_ids=("ev-aaaaaaaabbbbbbbb",), expires_s=3600.0)
+    assert generous.expires_s == pytest.approx(3600.0, abs=5)
+    capped = binding_for(change, evidence_ids=("ev-aaaaaaaabbbbbbbb",), expires_s=3600.0,
+                         evidence_expires_in_s=600.0)
+    assert capped.expires_s == pytest.approx(600.0, abs=5)
+
+
+def test_the_evidence_cap_can_only_shorten_an_approval(tmp_path: Path) -> None:
+    """A caller passing a larger number must not be able to widen an approval past its evidence."""
+    change = SimpleNamespace(id="c-0000a1b2", capability="tofu.apply", target="proxmox", hash="ph-1",
+                             args={}, expired=False, expires=now() + 7200.0)
+    binding = binding_for(change, expires_s=300.0, evidence_expires_in_s=900.0)
+    assert binding.expires_s == pytest.approx(300.0, abs=5), "the shorter of the two stands"
