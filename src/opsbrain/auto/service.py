@@ -24,7 +24,7 @@ from .config import AutoConfig
 from .evidence import EvidenceBundle, EvidenceCollector, EvidenceStore, Observation, check_evidence, passed, reason_code
 from .ledger import BudgetLedger
 from .plan import ChangePlan
-from .preflight import Outcome, Preflight, PreflightResult
+from .preflight import Outcome, Preflight, PreflightResult, unverified_targets, verification_targets
 from .review import (
     CONTRACT_VERSION,
     Reviewer,
@@ -409,6 +409,24 @@ class AutoService:
 
     def plan_summary(self, document: dict[str, Any]) -> dict[str, Any]:
         return ChangePlan.from_dict(document).summary()
+
+    def verify_plan(self, plan_id: str) -> dict[str, Any]:
+        """Verify a change from the targets its own plan declared.
+
+        The change id is the plan's, never a caller's: a report that is not attributable to the change it
+        describes proves nothing, and this is the one surface where that is cheap to get wrong.
+        """
+        self.guard_enabled()
+        record = self.preflight().get_by_plan(plan_id)
+        plan = ChangePlan.from_dict(record["plan_document"])
+        targets = verification_targets(plan)
+        if not targets:
+            return {"plan": plan_id, "status": "not_verifiable",
+                    "unverified_targets": list(unverified_targets(plan)),
+                    "approvable": False,
+                    "note": "the plan declares no target a registered check can be run against"}
+        return self.verify_change(plan.id, targets, applied_at=plan.created,
+                                 declared=record.get("declared_checks", ()))
 
     # -- verification -----------------------------------------------------------------------------
     def verifier(self) -> Verifier:

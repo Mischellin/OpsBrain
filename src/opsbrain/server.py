@@ -6,13 +6,14 @@ from __future__ import annotations
 import secrets
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from .auto.config import REASON_CODES
 from .service import OpsBrain
 from .util import OpsError, write_private
 
@@ -170,16 +171,31 @@ def build_server(ops: OpsBrain) -> MCPServer:
             "discard": lambda: ops.changes.discard(_need(id, "id")).brief()}))
 
     @server.tool()
-    def autonomy(action: str = "status", limit: int = 20, id: str | None = None) -> str:  # noqa: A002
-        """Autonomous pipeline, read-only. action: status (switches, mode, budget) | capabilities (is the
-        reviewer runnable; never claims a model it could not check) | reviews (recent verdicts)."""
-        return ops.call("autonomy", {"action": action}, lambda: _dispatch(action, {
+    def autonomy(action: Literal[  # noqa: A002
+        "status", "capabilities", "reviews", "evidence", "bundles", "verify_evidence", "reasons", "checks",
+        "verify-plan"
+    ] = "status", limit: int = 20, id: str | None = None) -> str:
+        """Autonomous pipeline, read-only.
+
+        status: switches, mode, budget, evidence and verification overview
+        capabilities: is the reviewer runnable; never claims a model it could not check
+        reviews / bundles / evidence: recent records
+        verify_evidence: re-run every check on a stored bundle, with the change it is bound to
+        reasons: every reason code the pipeline can emit
+        checks: what verification can demand, each with its own statement of purpose
+        verify-plan: verify a change from the targets its own plan declared
+        """
+        return ops.call("autonomy", {"action": action, "id": id}, lambda: _dispatch(action, {
             "status": ops.auto.overview,
             "capabilities": lambda: ops.auto.reviews.capabilities(),
             "reviews": lambda: {"items": ops.auto.reviews.list(limit)},
             "evidence": lambda: ops.auto.evidence_overview(),
             "bundles": lambda: {"items": ops.auto.evidence_list(limit)},
-            "verify_evidence": lambda: ops.auto.verify_evidence(_need(id, "id"))}))
+            "verify_evidence": lambda: ops.auto.verify_evidence(_need(id, "id")),
+            "reasons": lambda: {"reasons": list(REASON_CODES)},
+            "checks": lambda: {"observation": ops.auto.verify_overview(),
+                               "available": ops.auto.verification_checks()},
+            "verify-plan": lambda: ops.auto.verify_plan(_need(id, "id"))}))
 
     return server
 

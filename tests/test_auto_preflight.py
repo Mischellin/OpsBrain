@@ -650,3 +650,40 @@ def test_a_refusal_keeps_the_reason_it_was_given() -> None:
     assert refused.approvable is False
     assert "bundle cannot be read" in refused.note
     assert plan.id == refused.plan_id
+
+
+def test_verification_uses_the_targets_the_plan_declared(ops, fake, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """The change id is the plan's, and the targets come from its steps - not from a caller or a default."""
+    from opsbrain.service import OpsBrain
+
+    runner = FakeReviewer()
+    runner.default = response_document(Verdict.PASS)
+    auto = OpsBrain(_config(tmp_path, review={"runner": "codex"}), executor=fake,
+                    http=ops.http, reviewer=runner).auto
+    plan = good_plan(changes=[unit_change(profile="systemd")])
+    auto.review_plan(plan)
+    answer = auto.verify_plan(plan.id)
+    assert answer["status"] != "not_verifiable"
+    assert answer["change"] == plan.id, "the report is attributed to the plan, not to a caller's change"
+    assert answer["is_pass"] is False, "a run started at the moment of the change cannot claim a settled state"
+
+
+def test_a_plan_with_no_verifiable_target_says_so_instead_of_passing(tmp_path: Path) -> None:
+    from opsbrain.auto.service import AutoService
+
+    auto = AutoService(_config(tmp_path, review={"runner": "codex"}), reviewer=FakeReviewer())
+    auto.reviews.reviewer().default = response_document(Verdict.PASS)
+    plan = good_plan(changes=[unit_change()])  # no profile
+    auto.review_plan(plan)
+    answer = auto.verify_plan(plan.id)
+    assert answer["status"] == "not_verifiable"
+    assert answer["approvable"] is False
+    assert answer["unverified_targets"], "the plan must be told which step nothing will check"
+
+
+def test_a_preflight_record_carries_the_plan_it_judged(tmp_path: Path) -> None:
+    engine, plan = preflight(tmp_path)
+    engine.run(plan)
+    stored = engine.get(plan.plan_hash)
+    assert stored["plan_document"]["id"] == plan.id
+    assert stored["plan_document"]["plan_hash"] == plan.plan_hash

@@ -18,13 +18,25 @@ PROFILE_NAMES = ("general", "network", "firewall", "vpn", "reboot", "auth", "sec
                  "k8s-control-plane", "dns")
 
 #: Reason codes the decision engine may emit. Stable strings: tests and audits match on them.
-REASON_CODES = (
-    "review_passed", "review_blocked", "review_failed", "review_missing", "evidence_fresh", "evidence_stale",
-    "evidence_missing", "evidence_tampered", "policy_allows", "policy_forbids", "policy_unclassified",
-    "target_not_in_scope", "destructive_requires_human", "verdict_disagreement", "budget_exhausted",
+#: What the *decision engine* may say. The reasons a check can produce live on `evidence.Reason` and are
+#: merged in by `all_reason_codes`, so a code the pipeline emits is a code a caller can enumerate.
+DECISION_REASON_CODES = (
+    "review_passed", "review_blocked", "review_failed", "review_missing", "policy_allows", "policy_forbids",
+    "policy_unclassified", "destructive_requires_human", "verdict_disagreement", "budget_exhausted",
     "retries_exhausted", "unknown_target", "approval_stale", "lease_taken", "precondition_failed",
     "verification_failed", "verification_unknown", "autonomy_revoked", "emergency_stop",
 )
+
+
+def all_reason_codes() -> tuple[str, ...]:
+    """Every code the pipeline can emit, sorted. The one list a caller needs."""
+    from .evidence import Reason
+
+    return tuple(sorted({*DECISION_REASON_CODES, *(reason.value for reason in Reason)}))
+
+
+#: Kept for callers that only need the decision half; `all_reason_codes` is the complete set.
+REASON_CODES = DECISION_REASON_CODES
 
 
 class ReviewConfig(_Model):

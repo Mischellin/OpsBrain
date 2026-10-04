@@ -182,6 +182,35 @@ def cmd_autonomy(args: argparse.Namespace) -> int:
             print(f"{row.get('review_id'):<20} {row.get('subject'):<15} {row.get('status'):<16} "
                   f"{row.get('verdict') or '-':<15} {row.get('model') or '-'}")
         return 0
+    if args.action == "reasons":
+        from opsbrain.auto.config import all_reason_codes
+
+        for code in all_reason_codes():
+            print(code)
+        return 0
+    if args.action == "preflights":
+        for row in auto.preflight_list(args.limit):
+            print(f"{row.get('plan'):<20} {row.get('outcome'):<14} approvable={row.get('approvable')!s:<6} "
+                  f"{row.get('reason')}")
+        return 0
+    if args.action == "checks":
+        view = auto.verify_overview()
+        if not view.get("bound"):
+            print("verification is not bound to a Core", file=sys.stderr)
+            return 1
+        print(f"observation_s={view['observation_s']} require_observation={view['require_observation']} "
+              f"allow_state_changing_checks={view['allow_state_changing_checks']}")
+        for row in auto.verification_checks():
+            flag = " (acts)" if row["state_changing"] else ""
+            print(f"  {row['check']:<28} {row['profile']:<9}{flag} {row['why']}")
+        return 0
+    if args.action == "verify-plan":
+        if not args.id:
+            print("usage: opsbrain autonomy verify-plan <plan-id>", file=sys.stderr)
+            return 2
+        answer = auto.verify_plan(args.id)
+        print(json.dumps(answer, ensure_ascii=False, indent=2, default=str))
+        return 1 if answer.get("status") == "not_verifiable" else 0
     if args.action == "evidence":
         view = auto.evidence_overview()
         print(f"bundles={view['bundles']} fresh_window_s={view['fresh_window_s']} "
@@ -243,7 +272,8 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("stats", help="token savings from the audit log").set_defaults(handler=cmd_stats)
     autonomy = commands.add_parser("autonomy", help="inspect the autonomous pipeline (read-only)")
     autonomy.add_argument("action", choices=["status", "capabilities", "reviews", "budget", "evidence",
-                                            "bundles", "verify"])
+                                            "bundles", "verify", "checks", "preflights", "reasons",
+                                            "verify-plan"])
     autonomy.add_argument("id", nargs="?")
     autonomy.add_argument("--limit", type=int, default=20)
     autonomy.set_defaults(handler=cmd_autonomy)

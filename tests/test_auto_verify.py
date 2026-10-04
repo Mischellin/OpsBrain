@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any
 
 import pytest
@@ -45,6 +46,9 @@ INTENDED_DROP_IN = "/etc/systemd/system/logrotate.service.d/10-ops.conf"
 WRONG_DROP_IN = "/etc/logrotate.d/10-ops.conf"
 APPLIED = "Sun 2026-10-04 03:00:00 UTC"
 HEALTH = "https://example.com/healthz"
+#: The name this endpoint is configured under. Verification resolves a plan's URL through
+#: `observe.http_checks`; a bare address nobody declared is refused, not contacted.
+HEALTH_NAME = "healthz"
 
 
 class Clock:
@@ -86,7 +90,7 @@ def rollout(*, revision: str | None = "7", replicas: int = 3, updated: int = 3, 
     status: dict[str, Any] = {"replicas": replicas, "updatedReplicas": updated, "observedGeneration": observed}
     if ready is not None:
         status["readyReplicas"] = ready
-    return json.dumps({"metadata": metadata, "status": status})
+    return json.dumps({"metadata": metadata, "spec": {"replicas": replicas}, "status": status})
 
 
 def status_of(status: CheckStatus) -> CheckResult:
@@ -177,7 +181,7 @@ def test_a_successful_http_probe_records_its_boundary_and_observation_window(ops
     http.codes[HEALTH] = 200
     clock = Clock(1_000.0)
     report = Verifier(AutoConfig(enabled=True), ops, clock=clock).verify(
-        "chg-9", [http_target("site", HEALTH)], checks=["http:reachable"], applied_at=900.0)
+        "chg-9", [http_target(HEALTH_NAME, HEALTH)], checks=["http:reachable"], applied_at=900.0)
 
     assert report.status is CheckStatus.PASS
     result = report.results[0]
@@ -195,25 +199,25 @@ def test_an_http_probe_inside_a_too_short_window_is_unknown_not_pass(ops, http) 
     http.codes[HEALTH] = 200
     clock = Clock(1_010.0)
     early = Verifier(AutoConfig(enabled=True), ops, clock=clock).verify(
-        "chg-9", [http_target("site", HEALTH)], checks=["http:reachable"], applied_at=1_000.0)
+        "chg-9", [http_target(HEALTH_NAME, HEALTH)], checks=["http:reachable"], applied_at=1_000.0)
     assert early.status is CheckStatus.UNKNOWN and early.is_pass is False
     assert "observation window too short" in early.results[0].reason
-    assert early.results[0].detail.startswith("site:") or "site" in early.results[0].detail
+    assert early.results[0].detail.startswith(f"{HEALTH_NAME}:")
 
     clock.at = 1_040.0  # the same endpoint, once the 30s window has passed
     settled = Verifier(AutoConfig(enabled=True), ops, clock=clock).verify(
-        "chg-9", [http_target("site", HEALTH)], checks=["http:reachable"], applied_at=1_000.0)
+        "chg-9", [http_target(HEALTH_NAME, HEALTH)], checks=["http:reachable"], applied_at=1_000.0)
     assert settled.status is CheckStatus.PASS and settled.results[0].observation_s == 40.0
 
     unmoved = Verifier(AutoConfig(enabled=True), ops, clock=Clock(1_000.0)).verify(
-        "chg-9", [http_target("site", HEALTH)], checks=["http:reachable"])
+        "chg-9", [http_target(HEALTH_NAME, HEALTH)], checks=["http:reachable"])
     assert unmoved.status is CheckStatus.UNKNOWN, "a plan that recorded no apply time has no window to claim"
 
 
 def test_an_unreachable_http_endpoint_is_unknown_not_a_failure(ops, http) -> None:  # type: ignore[no-untyped-def]
     """A refused connection and a filtered port look the same from the outside; guessing would be worse."""
     http.codes[HEALTH] = 0
-    report = verifier(ops).verify("chg-9", [http_target("site", HEALTH)], checks=["http:reachable"],
+    report = verifier(ops).verify("chg-9", [http_target(HEALTH_NAME, HEALTH)], checks=["http:reachable"],
                                 applied_at=1_000.0)
     result = report.results[0]
     assert result.status is CheckStatus.UNKNOWN
@@ -223,12 +227,12 @@ def test_an_unreachable_http_endpoint_is_unknown_not_a_failure(ops, http) -> Non
 
 def test_a_failing_http_status_is_a_failure_not_an_unknown(ops, http) -> None:  # type: ignore[no-untyped-def]
     http.codes[HEALTH] = 502
-    report = verifier(ops).verify("chg-9", [http_target("site", HEALTH)], checks=["http:reachable"],
+    report = verifier(ops).verify("chg-9", [http_target(HEALTH_NAME, HEALTH)], checks=["http:reachable"],
                                 applied_at=1_000.0)
     assert report.status is CheckStatus.FAIL
     assert "HTTP 502" in report.results[0].detail
     http.codes[HEALTH] = 200
-    strict = verifier(ops).verify("chg-9", [http_target("site", HEALTH, expected_status=204)],
+    strict = verifier(ops).verify("chg-9", [http_target(HEALTH_NAME, HEALTH, expected_status=204)],
                                  checks=["http:reachable"], applied_at=1_000.0)
     assert strict.status is CheckStatus.FAIL and "the plan expected 204" in strict.results[0].detail
 
@@ -421,7 +425,7 @@ def test_the_overall_status_ranks_fail_over_unknown_over_not_run() -> None:
 
 
 def test_a_required_check_without_a_target_is_not_run(ops) -> None:  # type: ignore[no-untyped-def]
-    report = verifier(ops).verify("chg-1", [http_target("site", HEALTH)], checks=["systemd:unit-active"])
+    report = verifier(ops).verify("chg-1", [http_target(HEALTH_NAME, HEALTH)], checks=["systemd:unit-active"])
     result = report.results[0]
     assert result.status is CheckStatus.NOT_RUN
     assert "no systemd target was named" in result.reason
@@ -438,7 +442,18 @@ def test_an_unknown_check_name_is_refused_instead_of_skipped(ops) -> None:  # ty
 
 def test_the_check_ceiling_is_enforced(ops) -> None:  # type: ignore[no-untyped-def]
     with pytest.raises(OpsError, match="the configured limit is 2"):
-        verifier(ops, max_checks=2).verify("chg-1", [the_unit()], checks=["systemd"])
+        verifier(ops, max_checks=2).verify("chg-1", [the_unit()],
+                                           checks=["systemd:unit-active", "systemd:drop-in", "drift:repo-live"])
+
+
+def test_a_broad_profile_does_not_sweep_in_an_undeclared_action(ops) -> None:  # type: ignore[no-untyped-def]
+    """Asking for `systemd` is not an authorisation to run `systemd:unit-start`."""
+    broad = [check.name for check in verifier(ops).select(["systemd"])]
+    assert "systemd:unit-start" not in broad
+    declared = [check.name for check in verifier(ops).select(["systemd"], declared=["systemd:unit-start"])]
+    assert "systemd:unit-start" in declared
+    # Naming it explicitly still selects it; `verify` is what decides, so the refusal stays in the report.
+    assert "systemd:unit-start" in [check.name for check in verifier(ops).select(["systemd:unit-start"])]
 
 
 def test_profiles_disabled_in_config_run_nothing(ops) -> None:  # type: ignore[no-untyped-def]
@@ -469,7 +484,7 @@ def test_a_state_changing_check_is_not_run_unless_the_plan_declared_it(ops, fake
     undeclared = verifier(ops, allow_state_changing_checks=True).verify(
         "chg-1", [the_unit()], checks=["systemd:unit-start"], applied_at=1_000.0)
     assert undeclared.results[0].status is CheckStatus.NOT_RUN
-    assert "the change plan did not declare it" in undeclared.results[0].reason
+    assert "the stored change does not declare it" in undeclared.results[0].reason
     assert not any("systemctl start" in script for _, script in fake.calls)
 
 
@@ -620,7 +635,7 @@ def test_targets_name_what_they_expect_so_a_check_can_refuse_to_guess() -> None:
     assert unit_target(HOST, UNIT).expect("drop_in") is None
     assert k8s_target("web", namespace="prod").expect("namespace") == "prod"
     assert storage_target("/var", min_free_pct=20).expect("min_free_pct") == "20"
-    assert http_target("site", HEALTH).label == "site"
+    assert http_target(HEALTH_NAME, HEALTH).label == HEALTH_NAME
     assert unit_target(HOST, UNIT).label == f"{HOST}/{UNIT}"
     assert Target("unit", UNIT).expected == ()
 
@@ -685,3 +700,115 @@ def test_verifying_through_a_disabled_service_is_refused(tmp_path: Any) -> None:
                              auto=AutoConfig(enabled=False)))
     with pytest.raises(OpsError, match="disabled"):
         auto.verify_change("c-11111111", [unit_target("web-1", "logrotate.service")])
+
+
+# ============================== P1 round 2 on #17: findings against the verification fixes themselves
+def test_an_option_like_unit_name_is_refused(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    """`-` turns the name into an option for systemctl, and shlex.quote does not change that."""
+    fake.on(r"systemctl show", show())
+    report = verifier(ops).verify("chg-1", [unit_target(HOST, "--now")], checks=["systemd:unit-active"],
+                               applied_at=1_000.0)
+    assert report.is_pass is False
+    assert "invalid unit name" in report.results[0].reason
+    assert not any("systemctl" in script for _, script in fake.calls), "nothing was executed"
+
+
+@pytest.mark.parametrize("kind", ["deployment", "deployments"])
+def test_a_real_resource_type_reaches_kubectl_unchanged(ops, fake, kind) -> None:  # type: ignore[no-untyped-def]
+    fake.on(f"get {re.escape(kind)} api", rollout(revision="7"))
+    verifier(ops).verify("chg-1", [k8s_target("api", kind=kind, expected_revision="7")],
+                        checks=["k8s:rollout"], applied_at=1_000.0)
+    assert any(f"get {kind} api" in script for _, script in fake.calls), \
+        "the resource type the plan asked for is the one kubectl received"
+
+
+@pytest.mark.parametrize("kind", ["apps/v1", "deployment.apps", "deploymnt"])
+def test_an_unsupported_kind_is_refused_before_anything_runs(ops, fake, kind) -> None:  # type: ignore[no-untyped-def]
+    fake.on(r"get ", rollout())
+    report = verifier(ops).verify("chg-1", [k8s_target("api", kind=kind)], checks=["k8s:rollout"],
+                               applied_at=1_000.0)
+    assert report.is_pass is False
+    assert "unsupported workload kind" in report.results[0].reason
+    assert not fake.calls, "nothing was sent to the cluster"
+
+
+def test_a_profile_and_its_member_select_one_check_not_two(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    """`['systemd', 'systemd:unit-start']` is one request written twice, and a state-changing check is an
+    action: running it twice is a second action nobody planned."""
+    fake.on(r"systemctl show", show())
+    fake.on(r"systemctl start", "")
+    selected = verifier(ops).select(["systemd", "systemd:unit-start"])
+    assert [check.name for check in selected].count("systemd:unit-start") == 1
+    assert len(verifier(ops).select(["systemd", "systemd:unit-active"])) == len(
+        verifier(ops).select(["systemd"])), "asking for a profile and a member is the same request twice"
+
+
+def test_a_deployment_manifest_is_not_persisted_with_its_environment(ops, fake, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Inline env values are routinely credentials, and a verification artifact is not a secrets store."""
+    document = json.loads(rollout(revision="7"))
+    document["spec"]["template"] = {"spec": {"containers": [
+        {"name": "api", "env": [{"name": "LICENSE", "value": "ghp_" + "e" * 36}]}]}}
+    fake.on(r"get deployments api", json.dumps(document))
+    report = verifier(ops).verify("chg-1", [k8s_target("api", expected_revision="7")], checks=["k8s:rollout"],
+                               applied_at=1_000.0)
+    stored = "".join(path.read_text(encoding="utf-8", errors="replace")
+                     for path in tmp_path.rglob("*.json") if path.is_file())
+    assert "ghp_" not in stored, "a credential from the manifest reached a stored artifact"
+    assert "e" * 36 not in stored
+    assert report.status is not None
+
+
+def test_a_scale_change_is_judged_against_the_count_the_plan_asked_for(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    """`spec.replicas` is what the cluster has now. For a scale change that is the result, not the goal."""
+    fake.on(r"get deployments web", rollout(revision="7", replicas=3, updated=3, ready=3))
+    unchanged = verifier(ops).verify("chg-1", [k8s_target("web", expected_revision="7", expected_replicas=5)],
+                                   checks=["k8s:rollout"], applied_at=1_000.0)
+    assert unchanged.status is CheckStatus.FAIL, "three replicas is not the five the plan asked for"
+    assert "3/5" in unchanged.results[0].detail
+
+    fake.on(r"get deployments web", rollout(revision="7", replicas=5, updated=5, ready=5))
+    achieved = verifier(ops).verify("chg-1", [k8s_target("web", expected_revision="7", expected_replicas=5)],
+                                  checks=["k8s:rollout"], applied_at=1_000.0)
+    assert achieved.status is CheckStatus.PASS
+
+
+def test_the_observation_window_is_recomputed_for_each_check(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    """A run that takes two minutes must not keep reporting the window it started with."""
+    clock = Clock(1_000.0)
+    fake.on(r"systemctl show", show())
+    calls = {"n": 0}
+    original = fake._answer
+
+    def advancing(where: str, script: str) -> Result:  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        if calls["n"] > 1:
+            clock.at += 25  # the second check happens 25s later
+        return original(where, script)
+
+    fake._answer = advancing  # type: ignore[method-assign]
+    report = Verifier(AutoConfig(enabled=True, verify={"observation_s": 20}), ops, clock=clock).verify(
+        "chg-1", [the_unit()], checks=["systemd:unit-active", "systemd:drop-in"], applied_at=995.0)
+    windows = [result.observation_s for result in report.results]
+    assert windows == [5.0, 30.0], f"each check is judged on the time it actually waited: {windows}"
+    assert report.observation_s == windows[-1]
+
+
+def test_every_reason_the_checks_can_emit_is_enumerable() -> None:
+    """A caller has to be able to enumerate the codes. A code nothing lists is a code nothing matches."""
+    from opsbrain.auto.config import all_reason_codes
+    from opsbrain.auto.evidence import Reason
+    from opsbrain.auto.preflight import REASON_BY_OUTCOME
+
+    listed = set(all_reason_codes())
+    missing = {reason.value for reason in Reason} - listed
+    assert missing == set(), f"reason codes the pipeline emits but nobody lists: {sorted(missing)}"
+    assert set(REASON_BY_OUTCOME.values()) <= listed, "an outcome maps to an unlisted reason"
+    for reason in Reason:
+        assert reason.value in listed
+
+
+def test_the_decision_codes_are_still_exported() -> None:
+    from opsbrain.auto.config import DECISION_REASON_CODES, REASON_CODES
+
+    assert REASON_CODES == DECISION_REASON_CODES
+    assert "approval_stale" in REASON_CODES

@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from ..util import now
+from ..util import OpsError, now
 from .config import AutoConfig
 from .evidence import EvidenceBundle, render_for_reviewer
 from .plan import ChangePlan
@@ -195,7 +195,7 @@ class Preflight:
                                     state_changing_probes=(), structural_gaps=plan.incomplete(),
                                     arguments_hash=plan.arguments_hash, plan_hash=plan.plan_hash, created=now(),
                                     note=reason)
-        self.store.put(f"pf-{plan.plan_hash[:16]}", preflight.to_dict())
+        self.store.put(f"pf-{plan.plan_hash[:16]}", {**preflight.to_dict(), "plan_document": plan.to_dict()})
         return preflight
 
     def limits(self) -> ReviewLimits:
@@ -244,7 +244,7 @@ class Preflight:
             requested_probes=read_only,
             state_changing_probes=acting, structural_gaps=gaps,
             arguments_hash=plan.arguments_hash, plan_hash=plan.plan_hash, created=now())
-        self.store.put(f"pf-{plan.plan_hash[:16]}", preflight.to_dict())
+        self.store.put(f"pf-{plan.plan_hash[:16]}", {**preflight.to_dict(), "plan_document": plan.to_dict()})
         return preflight
 
     def _outcome(self, result: ReviewResult, gaps: Sequence[str]) -> Outcome:
@@ -267,6 +267,15 @@ class Preflight:
 
     def get(self, plan_hash: str) -> dict[str, Any]:
         return self.store.get(f"pf-{plan_hash[:16]}")
+
+    def get_by_plan(self, plan_id: str) -> dict[str, Any]:
+        """The stored record for a plan id, including the plan itself so it can be re-read verbatim."""
+        for row in self.store.list(10_000):
+            if row.get("plan") == plan_id:
+                if "plan_document" not in row:
+                    raise OpsError(f"preflight record for {plan_id} does not carry its plan")
+                return row
+        raise OpsError(f"no preflight record for plan {plan_id}")
 
     def list(self, limit: int = 20) -> list[dict[str, Any]]:
         return [{key: row[key] for key in ("plan", "plan_hash", "arguments_hash", "outcome", "approvable",
@@ -301,14 +310,36 @@ def unmatched_declarations(plan: ChangePlan) -> tuple[str, ...]:
                          if change.state_changing and not change.profile} - known))
 
 
+#: `ChangePlan.targets` is a set of host or workload names; which kind each one is comes from the step
+#: that names it. A name that appears only in an untyped step stays untyped and is reported, not guessed.
 def verification_targets(plan: ChangePlan) -> tuple[Target, ...]:
-    """The targets a verification could be asked about, derived from the plan's declared scope.
+    """The targets verification is asked about, derived from the plan's own steps.
 
-    Deliberately empty unless the plan names concrete verification targets: a plan that says "fix the
-    logs" has not said what should be checked afterwards, and inventing the target here would let
-    verification pass against something nobody planned for.
+    Each step declares a profile - the same field the state-changing declaration is mapped through - so
+    the target set comes from what the plan says rather than from a default. A step whose profile names
+    no registered check produces no target, and `unverified_targets` says so: a plan that says "fix the
+    logs" has not said what should be checked afterwards, and inventing the target would let verification
+    pass against something nobody planned for.
     """
-    return ()
+    from .verify import REGISTRY, unit_target
+
+    profiles = {REGISTRY[name].profile for name in REGISTRY if REGISTRY[name].state_changing}
+    targets: list[Target] = []
+    for change in plan.changes:
+        if change.profile not in profiles or not change.target:
+            continue
+        targets.append(unit_target(change.target, change.target, drop_in=change.target,
+                                   expected_revision=plan.id))
+    return tuple(targets)
+
+
+def unverified_targets(plan: ChangePlan) -> tuple[str, ...]:
+    """Steps whose profile names no verification check, so nothing will be checked about them."""
+    from .verify import REGISTRY
+
+    profiles = {REGISTRY[name].profile for name in REGISTRY if REGISTRY[name].state_changing}
+    return tuple(sorted({f"{change.capability}:{change.target}" for change in plan.changes
+                         if change.profile not in profiles}))
 
 
 def blocking_findings(result: ReviewResult) -> tuple[dict[str, Any], ...]:
