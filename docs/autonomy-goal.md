@@ -14,10 +14,10 @@ Epic: [#3](https://github.com/Mischellin/OpsBrain/issues/3). База — [#2](h
 
 | # | Задача | Модуль | PR | Состояние |
 |---|---|---|---|---|
-| 4 | OPS-AUTO-01 — ReviewService/Codex runner | `auto/review.py`, `auto/runners.py` | [#15](https://github.com/Mischellin/OpsBrain/pull/15) | готово, 1 круг замечаний закрыт |
-| 5 | OPS-AUTO-02 — Evidence Bundle | `auto/evidence.py` | [#16](https://github.com/Mischellin/OpsBrain/pull/16) | готово, замечания открыты |
-| 8 | OPS-AUTO-07 — проверка фактического состояния | `auto/verify.py` | [#17](https://github.com/Mischellin/OpsBrain/pull/17) | готово, замечания открыты |
-| 6 | OPS-AUTO-03 — preflight плана | `auto/plan.py`, `auto/preflight.py` | [#18](https://github.com/Mischellin/OpsBrain/pull/18) | готово, ревью идёт |
+| 4 | OPS-AUTO-01 — ReviewService/Codex runner | `auto/review.py`, `auto/runners.py` | [#15](https://github.com/Mischellin/OpsBrain/pull/15) | 102 теста, 2 круга замечаний закрыто |
+| 5 | OPS-AUTO-02 — Evidence Bundle | `auto/evidence.py` | [#16](https://github.com/Mischellin/OpsBrain/pull/16) | 185 тестов, 2 круга замечаний закрыто |
+| 8 | OPS-AUTO-07 — проверка фактического состояния | `auto/verify.py` | [#17](https://github.com/Mischellin/OpsBrain/pull/17) | 233 теста, 3 круга замечаний закрыто |
+| 6 | OPS-AUTO-03 — preflight плана | `auto/plan.py`, `auto/preflight.py` | [#18](https://github.com/Mischellin/OpsBrain/pull/18) | 314 тестов, 2 круга замечаний закрыто |
 | 7 | OPS-AUTO-04 — ApprovalEngine | `auto/decision.py` | — | не начато |
 | 14 | OPS-AUTO-05 — STALE approval, optimistic locking, single-use lease | `auto/approval.py` | — | не начато |
 | 9 | OPS-AUTO-10 — policy profiles | `auto/profiles.py` | — | не начато |
@@ -56,8 +56,18 @@ Epic: [#3](https://github.com/Mischellin/OpsBrain/issues/3). База — [#2](h
 `ruff`, `mypy --strict` и `pytest` проходят в проектном окружении. Live-проверки, требующие реальных
 credentials, помечаются как пропущенные, а не выдаются за выполненные.
 
-Отдельно: `@codex review` нужно ставить **повторно** после каждого пуша в PR. Комментарий, оставленный
-на старом коммите, не обновляется сам, и ревью считается пройденным устаревшей версии.
+Два рабочих правила, которые стоили времени и неочевидны:
+
+* **`@codex review` нужно ставить повторно после каждого пуша.** Комментарий, оставленный на старом
+  коммите, не обновляется сам, и ревью считается пройденным устаревшей версии. Ревью асинхронно:
+  замечания приходят по коду, каким он был *на момент запроса*, поэтому «нет новых замечаний» первые
+  минуты после пуша не значит ничего.
+* **В стеке push вниз, rebase вверх.** Правка к модулю PR №5 требует перебазировать всё, что выше.
+  Порядок: запушить исправленный нижний PR, затем по очереди rebase на `origin/<предыдущий>` и
+  force-push. Ребейз в обратном порядке даёт «конфликтующий» PR, хотя конфликта нет.
+
+Ревью находит P1 и на строках, которые только что переписаны: закрытые находки не сходятся, каждый
+раунд приносит новые. Это свойство ревьюера, а не признак бесполезности правок.
 
 ## Готово, когда
 
