@@ -132,11 +132,13 @@ def stale_reasons(binding: ApprovalBinding, current: dict[str, Any]) -> tuple[st
     for name, stale in (("plan_hash", StaleReason.PLAN_CHANGED), ("arguments_hash", StaleReason.ARGUMENTS_CHANGED),
                         ("subject", StaleReason.SUBJECT_CHANGED), ("policy_version", StaleReason.POLICY_CHANGED)):
         expected = getattr(binding, name)
-        if current.get(name) and current[name] != expected:
+        # An absent field is a mismatch, not a free pass. Comparing only when the caller supplied a truthy
+        # value meant `consume(id, {"plan_hash": expected})` verified one field out of five.
+        if current.get(name) != expected:
             reasons.append(stale.value)
-    if current.get("targets") is not None and tuple(current["targets"]) != binding.targets:
+    if tuple(current.get("targets") or ()) != binding.targets:
         reasons.append(StaleReason.TARGETS_CHANGED.value)
-    if current.get("evidence_ids") is not None and tuple(current["evidence_ids"]) != binding.evidence_ids:
+    if tuple(current.get("evidence_ids") or ()) != binding.evidence_ids:
         reasons.append(StaleReason.EVIDENCE_CHANGED.value)
     return tuple(reasons)
 
@@ -167,6 +169,10 @@ class Approval:
                         consumed_at=float(data.get("consumed_at", 0.0)),
                         lease_owner=str(data.get("lease_owner", "")),
                         outcome=dict(data.get("outcome", {})))
+
+
+class AlreadySpent(OpsError):
+    """The idempotent retry was recognised, and there is nothing left to do."""
 
 
 class ApprovalStore:
@@ -230,7 +236,10 @@ class ApprovalStore:
                 raise OpsError(f"approval {approval_id} was revoked")
             if approval.state is LeaseState.CONSUMED:
                 if idempotency_key and approval.outcome.get("idempotency_key") == idempotency_key:
-                    return approval  # the same retry, answered rather than re-executed
+                    # Marked as a replay so `execute_once` knows not to enter the work a second time.
+                    return Approval(binding=approval.binding, state=approval.state,
+                                     consumed_at=approval.consumed_at, lease_owner=approval.lease_owner,
+                                     outcome={**approval.outcome, "replayed": True})
                 raise OpsError(f"approval {approval_id} was already spent "
                                f"(by {approval.lease_owner or 'someone else'})")
             if approval.binding.expired:
@@ -276,11 +285,16 @@ def execute_once(approval_id: str, store: ApprovalStore, current: dict[str, Any]
                  owner: str = "", idempotency_key: str = "") -> Iterator[Approval]:
     """Spend the approval, run the work once, and record what happened.
 
-    A crash between the spend and the record leaves the approval spent with no outcome: the safe side to
-    fail on. A *retry* with the same idempotency key is answered with that recorded outcome, and a retry
-    without one is refused — which is what stops a restart from launching the same apply twice.
+    A retry with the same idempotency key is *answered*, not re-entered: yielding here would run the
+    caller's mutation body a second time, which is precisely what the idempotency key exists to prevent,
+    and it would also re-execute after a crash that spent the approval without recording an outcome. The
+    recorded outcome is returned through `AlreadySpent` instead, so a caller can report it without the
+    body ever running twice.
     """
     approval = store.consume(approval_id, current, owner=owner, idempotency_key=idempotency_key)
+    if approval.state is LeaseState.CONSUMED and approval.outcome.get("replayed"):
+        raise AlreadySpent(f"approval {approval_id} was already spent by {approval.lease_owner or 'an earlier run'}"
+                           f"; the recorded outcome is {approval.outcome}")
     yield approval
     store.record_outcome(approval_id, {"state": "executed", "at": round(now(), 3)})
 
@@ -315,10 +329,16 @@ def binding_for(change: Any, *, evidence_ids: Sequence[str] = (), policy_version
     binding assembled from arguments the caller supplies is a binding the caller chose.
     """
     arguments = digest({key: value for key, value in sorted(change.args.items())}) if change.args else ""
+    # The binding inherits the change's own age instead of restarting at "now". An approval that outlives
+    # the plan it approves is a fresh hour of authority for a plan a human looked at days ago.
+    if change.expired:
+        raise OpsError(f"change {change.id} expired at {change.expires:.0f}; plan it again")
+    remaining = max(0.0, float(change.expires) - now())
     return ApprovalBinding(
         change_id=change.id, subject=f"{change.capability}:{change.target}", plan_hash=change.hash,
         arguments_hash=arguments, targets=tuple(sorted({change.target})), evidence_ids=tuple(evidence_ids),
-        policy_version=policy_version or "unset", profile=profile, expires_s=expires_s)
+        policy_version=policy_version or "unset", profile=profile, expires_s=min(expires_s, remaining),
+        created=now())
 
 
 def verify(approval: Approval, current: dict[str, Any]) -> tuple[str, ...]:

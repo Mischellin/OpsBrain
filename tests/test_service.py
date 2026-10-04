@@ -30,8 +30,11 @@ def test_tofu_plan_without_changes(ops, fake) -> None:  # type: ignore[no-untype
     assert "cd /root/tofu && set -a && . /root/.tofu.env" in script and "-detailed-exitcode" in script
 
 
+PLAN_SHA = "@@OPSBRAIN-PLAN-SHA " + "ab" * 32 + "@@"
+
+
 def test_tofu_apply_requires_human_approval_and_applies_the_saved_plan(ops, fake) -> None:  # type: ignore[no-untyped-def]
-    fake.on(r"tofu plan", f"Plan: 0 to add, 1 to change, 0 to destroy.\n{JSON_MARK}\n{PLAN_JSON}\n", rc=2)
+    fake.on(r"tofu plan", f"Plan: 0 to add, 1 to change, 0 to destroy.\n{PLAN_SHA}\n{JSON_MARK}\n{PLAN_JSON}\n", rc=2)
     plan = ops.tofu_plan()
     assert plan["change"].startswith("c-") and plan["resources"] == [
         {"addr": "proxmox_vm.web", "action": "change", "attrs": ["cores"]}]
@@ -45,20 +48,43 @@ def test_tofu_apply_requires_human_approval_and_applies_the_saved_plan(ops, fake
     assert not any("tofu apply" in script for _, script in fake.calls)
 
     approve(ops, plan["change"])
-    # The apply re-reads the saved plan and re-fingerprints it before spending the approval, so a plan
-    # replaced in between is caught rather than run under an approval for the original actions.
-    fake.on(r"tofu show -json", f"Warning: deprecated attribute\n{PLAN_JSON}\n")
+    # The runner re-hashes the saved plan in the same shell that applies it, so a plan replaced in between
+    # is refused rather than run under an approval for the original actions.
     fake.on(r"tofu apply", "Apply complete! Resources: 0 added, 1 changed, 0 destroyed.\n@@OPSBRAIN-POSTPLAN 0@@\n")
     applied = ops.tofu_apply(plan["change"])
     assert applied["ok"] and applied["applied"]["changed"] == 1 and applied["post_plan_clean"] is True
     script = next(script for _, script in fake.calls if "tofu apply" in script)
     assert ".opsbrain/j-" in script and ".tfplan" in script
+    assert "sha256sum" in script and "ab" * 32 in script, "the apply verifies the plan bytes it is about to run"
     with pytest.raises(OpsError, match="single use"):
         ops.tofu_apply(plan["change"])
 
 
+def test_a_replaced_plan_file_is_refused_instead_of_applied(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    """The digest the approval was granted for and the bytes on disk are the same check, not two."""
+    fake.on(r"tofu plan", f"Plan: 0 to add, 1 to change, 0 to destroy.\n{PLAN_SHA}\n{JSON_MARK}\n{PLAN_JSON}\n", rc=2)
+    plan = ops.tofu_plan()
+    approve(ops, plan["change"])
+    fake.on(r"tofu apply", "@@OPSBRAIN-PLAN-MISMATCH " + "cd" * 32 + "@@\n", rc=78)
+    out = ops.tofu_apply(plan["change"])
+    assert out["ok"] is False and out["plan_changed"] is True
+    assert out["found"] == "cd" * 32
+    assert "plan again" in out["hint"]
+    assert "post_plan_clean" not in out, "the apply never ran, so there is no post-plan result to report"
+
+
+def test_a_plan_without_a_readable_digest_is_not_offered_for_approval(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    """No digest means no check. Such a plan must not become an approvable change."""
+    fake.on(r"tofu plan", f"Plan: 0 to add, 1 to change, 0 to destroy.\n{JSON_MARK}\n{PLAN_JSON}\n", rc=2)
+    plan = ops.tofu_plan()
+    assert "next" not in plan, "an unchecksummed plan is not handed to a human for approval"
+    assert "plan digest unreadable" in plan["warning"]
+    assert not [change for change in ops.changes.list()], "no change record was created at all"
+
+
 def test_destructive_plan_is_flagged_and_needs_allow_destroy(ops, fake) -> None:  # type: ignore[no-untyped-def]
-    fake.on(r"tofu plan", f"Plan: 0 to add, 0 to change, 1 to destroy.\n{JSON_MARK}\n{DESTROY_JSON}\n", rc=2)
+    fake.on(r"tofu plan",
+            f"Plan: 0 to add, 0 to change, 1 to destroy.\n{PLAN_SHA}\n{JSON_MARK}\n{DESTROY_JSON}\n", rc=2)
     plan = ops.tofu_plan()
     assert plan["dangerous"] is True and plan["destroy"] == 1
     assert "--allow-destroy" in ops.tofu_apply(plan["change"])["next"]

@@ -21,6 +21,10 @@ from .util import OpsError, clip
 
 JSON_MARK = "@@OPSBRAIN-JSON@@"
 POSTPLAN = re.compile(r"^@@OPSBRAIN-POSTPLAN (\d+)@@$", re.MULTILINE)
+PLAN_SHA = re.compile(r"^@@OPSBRAIN-PLAN-SHA ([0-9a-f]{64})@@$", re.MULTILINE)
+PLANMISMATCH = re.compile(r"^@@OPSBRAIN-PLAN-MISMATCH ([0-9a-f]*)@@$", re.MULTILINE)
+#: A saved plan is applied by path, so the path is constrained to the one shape `tofu_plan` ever writes.
+PLAN_PATH = re.compile(r"^\.opsbrain/j-[0-9a-f]{8}\.tfplan$")
 _LOCK = re.compile(r"^[0-9a-fA-F-]{8,64}$")
 _SYNC_SUFFIXES = (".tf", ".tftpl", ".tpl")
 _SKIP_FINGERPRINT = re.compile(r"(^|/)(\.git|__pycache__|\.ansible|collections|\.cache)(/|$)|\.retry$|\.pyc$")
@@ -87,7 +91,9 @@ class Operators(Core):
         script = (f"{self._tofu_prefix(config)}mkdir -p .opsbrain && chmod 700 .opsbrain && "
                   "find .opsbrain -name '*.tfplan' -mmin +1440 -delete; "
                   f"{binary} plan -input=false -no-color -lock-timeout=60s -detailed-exitcode -out={plan_file}; rc=$?; "
-                  f"if [ $rc -eq 2 ]; then echo {JSON_MARK}; {binary} show -json {plan_file}; "
+                  f"if [ $rc -eq 2 ]; then "
+                  f"echo \"@@OPSBRAIN-PLAN-SHA $(sha256sum {plan_file} | cut -d' ' -f1)@@\"; "
+                  f"echo {JSON_MARK}; {binary} show -json {plan_file}; "
                   f"else rm -f {plan_file}; fi; exit $rc")
         job.meta["plan_file"] = plan_file
         self.jobs.save(job)
@@ -120,35 +126,43 @@ class Operators(Core):
         dangerous = bool(summary["destroy"] or summary["replace"])
         line = (f"tofu apply {stack}: +{summary['add']} ~{summary['change']} -{summary['destroy']} "
                 f"replace {summary['replace']}")
+        # The digest of the saved plan file itself, taken on the runner as it was written. The change
+        # record is worthless without it: `tofu_apply` re-hashes the file and refuses to apply anything
+        # whose bytes are not the ones this approval was granted for. A plan that cannot report it is not
+        # offered as approvable, because "no digest" would otherwise mean "no check".
+        sha = PLAN_SHA.search(human)
+        if not sha:
+            return {**out, "changes": True, **summary, "dangerous": dangerous,
+                    "warning": "plan digest unreadable: no change was created, plan again"}
         change = self.changes.create("tofu.apply", stack, line, digest(parsers.tofu_fingerprint(document)),
                                      dangerous=dangerous, args={"plan_file": job.meta["plan_file"]},
-                                     details={"resources": summary["resources"]})
+                                     details={"resources": summary["resources"], "plan_sha256": sha.group(1)})
         return {**out, "changes": True, **summary, "dangerous": dangerous, "change": change.id,
                 "next": f"tofu action=apply change_id={change.id} (after a human approves it)"}
 
-    def _plan_fingerprint(self, config: Any, plan_file: str) -> str:
-        """The digest of the saved plan, read from the runner immediately before the approval is spent.
+    def _plan_apply_script(self, config: Any, plan_file: str, expected_sha: str) -> str:
+        """One runner-side script: re-hash the saved plan, compare, and apply - in the same shell.
 
-        The plan lives where `tofu plan` wrote it, on the runner, so it is hashed there. A local read would
-        either fail or - worse - silently hash nothing and let a replaced plan through under an approval a
-        human gave for the original resource actions.
+        The digest used to be fetched in one command and the apply issued in another, which left a window:
+        anything that replaced the plan file in between had *its* plan applied under an approval a human
+        gave for the first one. Hashing the file and applying it are now one script, so the bytes that are
+        checked are the bytes that get applied.
+
+        The hash covers the `.tfplan` file rather than `tofu show -json` output. It is the artifact that is
+        actually applied, it needs no JSON parser on the runner, and it removes the "first line starting
+        with `{`" tolerance that a warning above the document used to require.
         """
         binary = shlex.quote(config.binary)
-        result = self.exec.run_ssh(
-            config.runner,
-            f"{self._tofu_prefix(config)}{binary} show -json {shlex.quote(plan_file)}",
-            timeout=60)
-        if not result.ok:
-            raise OpsError(f"the saved plan is unreadable: {clip(result.out.strip(), 120)}")
-        # `tofu show` can print a warning before the document, so the first `{` line wins - the same
-        # tolerance the plan path already applies, rather than a stricter rule that would fail on a warning.
-        for line in result.out.splitlines():
-            if line.startswith("{"):
-                try:
-                    return digest(parsers.tofu_fingerprint(json.loads(line)))
-                except ValueError:
-                    break
-        raise OpsError(f"the saved plan is unreadable: {clip(result.out.strip(), 120)}")
+        prefix = self._tofu_prefix(config)
+        quoted = shlex.quote(plan_file)
+        return (
+            f"actual=$(sha256sum {quoted} 2>/dev/null | cut -d' ' -f1); "
+            f'if [ -z "$actual" ] || [ "$actual" != {shlex.quote(expected_sha)} ]; then '
+            f'echo "@@OPSBRAIN-PLAN-MISMATCH $actual@@"; exit 78; fi; '
+            f"{prefix}{binary} apply -input=false -no-color -lock-timeout=60s {quoted}; "
+            f"rc=$?; rm -f {quoted}; if [ $rc -eq 0 ]; then "
+            f"{binary} plan -input=false -no-color -lock-timeout=60s -detailed-exitcode > /dev/null 2>&1; "
+            "echo \"@@OPSBRAIN-POSTPLAN $?@@\"; fi; exit $rc")
 
     def tofu_apply(self, change_id: str, wait_s: int | None = None) -> dict[str, Any]:
         pending = self.changes.get(change_id)
@@ -156,21 +170,20 @@ class Operators(Core):
         access = self.require("tofu.apply", name)
         if pending.state == "pending" and (access is Access.CONFIRM or pending.dangerous):
             return self.approval_needed(pending)
-        # The saved plan is re-read and re-fingerprinted immediately before the approval is spent.
-        # Without it the plan file can be replaced between plan and apply and still run under an
-        # approval a human gave for the original resource actions.
-        plan_file = str(pending.args["plan_file"])
+        plan_file = str(pending.args.get("plan_file", ""))
+        # Validated before the change is spent and before the path reaches a shell command.
+        if not PLAN_PATH.fullmatch(plan_file):
+            raise OpsError("corrupt change record: it does not name a saved plan")
+        expected_sha = str(pending.details.get("plan_sha256", ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+            raise OpsError(f"change {change_id} carries no plan digest; plan again")
+        # No `content_hash` here on purpose: re-deriving the fingerprint on this side and comparing it to
+        # the stored value is exactly the check that had the window. `consume` still burns the change under
+        # its lock; the authoritative content check happens on the runner, atomically with the apply.
         change = self.changes.consume(change_id, "tofu.apply", name,
-                                      needs_approval=access is Access.CONFIRM,
-                                      content_hash=self._plan_fingerprint(config, plan_file))
-        if not re.fullmatch(r"\.opsbrain/j-[0-9a-f]{8}\.tfplan", plan_file):
-            raise OpsError("corrupt change record")
-        binary = shlex.quote(config.binary)
+                                      needs_approval=access is Access.CONFIRM)
         # a saved plan file is applied: tofu itself refuses it when the state moved since the plan
-        script = (f"{self._tofu_prefix(config)}{binary} apply -input=false -no-color -lock-timeout=60s {plan_file}; "
-                  f"rc=$?; rm -f {plan_file}; if [ $rc -eq 0 ]; then "
-                  f"{binary} plan -input=false -no-color -lock-timeout=60s -detailed-exitcode > /dev/null 2>&1; "
-                  "echo \"@@OPSBRAIN-POSTPLAN $?@@\"; fi; exit $rc")
+        script = self._plan_apply_script(config, plan_file, expected_sha)
         job = self.start_job("tofu.apply", f"tofu apply {name}", config.runner, script,
                              meta={"stack": name, "change": change.id})
         return self.wait(job, wait_s)
@@ -179,6 +192,11 @@ class Operators(Core):
         meta = self.artifacts.save("tofu-apply", job.title, text)
         out: dict[str, Any] = {"stack": job.meta["stack"], "change": job.meta["change"], "artifact": meta.id,
                                "ok": rc == 0, **parsers.tofu_text(text)}
+        if mismatch := PLANMISMATCH.search(text):
+            # The saved plan on the runner is not the one that was approved, so nothing was applied. Say so
+            # plainly instead of reporting a generic failure: the operator's next step is to plan again.
+            return {**out, "ok": False, "plan_changed": True, "found": mismatch.group(1) or "no file",
+                    "hint": "the saved plan on the runner is not the one that was approved; plan again"}
         if match := POSTPLAN.search(text):
             out["post_plan_clean"] = match[1] == "0"
             if match[1] != "0":

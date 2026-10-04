@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 from opsbrain.auto.approval import (
+    AlreadySpent,
     Approval,
     ApprovalBinding,
     ApprovalStore,
@@ -155,8 +156,10 @@ def test_a_retry_with_the_same_key_is_answered_rather_than_re_executed(tmp_path:
     approval = store.issue(a_binding())
     first = store.consume(approval.id, current(), owner="worker-1", idempotency_key="job-42")
     again = store.consume(approval.id, current(), owner="worker-2", idempotency_key="job-42")
+    assert first.outcome.get("replayed") is None, "the first spend is the real one"
     assert again.state is LeaseState.CONSUMED
     assert again.outcome.get("idempotency_key") == "job-42"
+    assert again.outcome.get("replayed") is True, "the retry is marked so execute_once will not re-enter"
     assert again.lease_owner == "worker-1", "the retry was answered by the original spender"
     with pytest.raises(OpsError, match="already spent"):
         store.consume(approval.id, current(), owner="worker-3", idempotency_key="a-different-job")
@@ -168,6 +171,35 @@ def test_execute_once_records_the_outcome(tmp_path: Path) -> None:
     with execute_once(approval.id, store, current(), owner="w", idempotency_key="k") as spent:
         assert spent.state is LeaseState.CONSUMED
     assert store.get(approval.id).outcome["state"] == "executed"
+
+
+def test_execute_once_does_not_re_enter_the_body_on_a_retry(tmp_path: Path) -> None:
+    """A restart that retries must get the earlier answer, never a second apply.
+
+    The first fix let the retry through the context manager, which re-ran the caller's mutation body -
+    the exact thing the idempotency key exists to prevent. The retry is now refused, with the recorded
+    outcome, before the body can be entered.
+    """
+    store = ApprovalStore(tmp_path)
+    approval = store.issue(a_binding())
+    runs: list[str] = []
+    with execute_once(approval.id, store, current(), owner="w", idempotency_key="job-42") as spent:
+        assert spent.state is LeaseState.CONSUMED
+        runs.append("apply")
+    with pytest.raises(AlreadySpent, match="already spent"), \
+            execute_once(approval.id, store, current(), owner="w", idempotency_key="job-42"):
+        runs.append("apply")
+    assert runs == ["apply"], "the body ran exactly once"
+
+
+def test_a_retry_without_an_idempotency_key_is_refused(tmp_path: Path) -> None:
+    store = ApprovalStore(tmp_path)
+    approval = store.issue(a_binding())
+    with execute_once(approval.id, store, current(), owner="w", idempotency_key="k"):
+        pass
+    with pytest.raises(OpsError, match="already spent"), \
+            execute_once(approval.id, store, current(), owner="w", idempotency_key="other"):
+        raise AssertionError("a second apply with a different key must not run")
 
 
 def test_issuing_the_same_binding_twice_is_one_approval(tmp_path: Path) -> None:

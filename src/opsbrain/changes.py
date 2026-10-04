@@ -21,6 +21,8 @@ from typing import Any
 from .util import OpsError, compact, new_id, now, write_private
 
 _ID = re.compile(r"^c-[0-9a-f]{8}$")
+#: The id becomes a lock filename, so it is validated as one before it is used as one.
+_CHANGE_ID = re.compile(r"^c-[0-9a-f]{8,64}$")
 PENDING, APPROVED, APPLIED, DISCARDED = "pending", "approved", "applied", "discarded"
 
 
@@ -92,23 +94,31 @@ class ChangeStore:
         return sorted(changes, key=lambda change: change.created, reverse=True)
 
     def approve(self, change_id: str, *, allow_dangerous: bool = False) -> Change:
-        change = self.get(change_id)
-        if change.state != PENDING:
-            raise OpsError(f"change {change_id} is {change.state}, not pending")
-        if change.expired:
-            raise OpsError(f"change {change_id} has expired; plan again")
-        if change.dangerous and not allow_dangerous:
-            raise OpsError(f"change {change_id} destroys or replaces resources: approve with --allow-destroy")
-        change.state, change.allow_dangerous, change.decided_at = APPROVED, allow_dangerous, now()
-        self._save(change)
+        # approve/discard/consume are three transitions of one record and share one lock. Locking only
+        # `consume` leaves the window this closes: a concurrent `approve` reads PENDING, `consume` writes
+        # APPLIED, and `approve` writes APPROVED back over it - handing out a second run of a spent change.
+        with self._transition(change_id):
+            change = self.get(change_id)
+            if change.state != PENDING:
+                raise OpsError(f"change {change_id} is {change.state}, not pending")
+            if change.expired:
+                raise OpsError(f"change {change_id} has expired; plan again")
+            if change.dangerous and not allow_dangerous:
+                raise OpsError(f"change {change_id} destroys or replaces resources: "
+                               f"approve with --allow-destroy")
+            change.state, change.allow_dangerous, change.decided_at = APPROVED, allow_dangerous, now()
+            self._save(change)
         return change
 
     def discard(self, change_id: str) -> Change:
-        change = self.get(change_id)
-        if change.state not in (PENDING, APPROVED):
-            raise OpsError(f"change {change_id} is already {change.state}")
-        change.state, change.decided_at = DISCARDED, now()
-        self._save(change)
+        # The whole read-check-write is inside the lock. Taking it only around the read - as an earlier fix
+        # did - serialises nothing at all: the check and the write still straddle the unlock.
+        with self._transition(change_id):
+            change = self.get(change_id)
+            if change.state not in (PENDING, APPROVED):
+                raise OpsError(f"change {change_id} is already {change.state}")
+            change.state, change.decided_at = DISCARDED, now()
+            self._save(change)
         return change
 
     def consume(self, change_id: str, capability: str, target: str, *, needs_approval: bool,
@@ -149,7 +159,10 @@ class ChangeStore:
         A lock left behind by a crash is reclaimed after a minute rather than wedging every later
         approval behind a process that no longer exists.
         """
-        lock = self.root / f"{change_id}.consume.lock"
+        if not _CHANGE_ID.fullmatch(change_id):
+            # The id reaches a filename, so it is checked before it is used as one.
+            raise OpsError(f"invalid change id: {change_id!r}")
+        lock = self.root / f"{change_id}.transition.lock"
         self.root.mkdir(parents=True, exist_ok=True)
         while True:
             try:
