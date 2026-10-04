@@ -517,6 +517,18 @@ class AutoService:
             return self._decision_refused(change_id, plan_id,
                                           f"the plan names {', '.join(plan.targets)} and not "
                                           f"{change.target!r}", review_id=result.review_id)
+        profile = self._profile_for(plan)
+        if profile is None and self.auto.profiles:
+            return self._decision_refused(change_id, plan_id,
+                                          f"the plan is filed under profile {plan.profile!r}, which the "
+                                          f"configuration does not define", review_id=result.review_id)
+        # The profile is what says this class of work may touch this target with this operation at all.
+        # `target_in_scope=bool(change.target)` said only that a string was present, so every scope the
+        # operator had written - `allow_autonomous`, `allowed_targets`, `allowed_capabilities` - was
+        # configured, validated, shown in the overview, and never consulted.
+        if profile is not None and not self.autonomous_for(change, profile):
+            return self._decision_refused(change_id, plan_id, self._scope_reason(change, profile),
+                                          review_id=result.review_id)
         access = self.core.require(change.capability, change.target)
         if verification is not None:
             report = VerificationReport.from_dict(verification)
@@ -546,13 +558,22 @@ class AutoService:
             review_verdict=result.verdict.value if result.verdict else "",
             review_status=result.review_status.value,
             policy_allows=access is not Access.DENY,
-            target_in_scope=bool(change.target),
+            target_in_scope=profile is None or self.autonomous_for(change, profile),
             destructive=bool(change.dangerous),
             verification=report,
             attempts=self._repair_count(change),
             policy_version=self.auto.decision.policy_version,
         )
-        review_ids = (result.review_id,) if result.review_id else ()
+        # Resolved, not copied. `_evaluate` only checks that the tuple is non-empty, so a review record
+        # that was deleted, corrupted or replaced after the preflight still produced a citation nobody
+        # could open - an approval whose stated justification cannot be audited.
+        review_ids: tuple[str, ...] = ()
+        if result.review_id:
+            if not self._review_still_stands(result.review_id, plan_id):
+                return self._decision_refused(change_id, plan_id,
+                                              f"review {result.review_id} cannot be resolved for this plan, "
+                                              f"so nothing here has been judged", review_id="")
+            review_ids = (result.review_id,)
         # The change record is the authority for what an approval covers, so it is what both the record
         # and the binding name. The plan's own `arguments_hash` travels in the record for audit; the two
         # vocabularies are different, and pretending they are one would let them silently disagree.
@@ -583,6 +604,50 @@ class AutoService:
         approval = self.engine().issue(plan_id, arguments, binding, record=decision)
         self.core.changes.attach_approval(change_id, approval)
         return {**out, "approval": approval, "next": f"apply change {change_id}; no human step is required"}
+
+    def _review_still_stands(self, review_id: str, plan_id: str) -> bool:
+        """Whether the cited review is still a readable, passing verdict about this plan.
+
+        The preflight record is a copy made at review time. Time passes, records get removed, and a copy
+        outlives its original - so the engine is told a `PASS` it cannot re-derive from anything.
+        """
+        try:
+            stored = self.reviews.store.get(review_id)
+        except OpsError:
+            return False
+        if stored.get("status") != "OK" or not stored.get("verdict"):
+            return False
+        subject_ref = str(stored.get("subject_ref", ""))
+        return not subject_ref or subject_ref == plan_id
+
+    def _profile_for(self, plan: Any) -> Any:
+        """The policy profile the plan is filed under, or None when the operator defined none."""
+        for profile in self.auto.profiles:
+            if profile.name == plan.profile:
+                return profile
+        return None
+
+    def autonomous_for(self, change: Any, profile: Any) -> bool:
+        """Whether this profile covers this operation, on this target, for autonomous execution.
+
+        An empty `allowed_*` list means the operator did not restrict it. That is the only reading under
+        which an empty list is permission without becoming a default that grants authority nobody chose.
+        """
+        if not profile.allow_autonomous:
+            return False
+        if profile.allowed_capabilities and change.capability not in profile.allowed_capabilities:
+            return False
+        return not (profile.allowed_targets and change.target not in profile.allowed_targets)
+
+    def _scope_reason(self, change: Any, profile: Any) -> str:
+        """Which of the three limits refused it, so the operator knows which one to change."""
+        if not profile.allow_autonomous:
+            return f"profile {profile.name!r} does not allow autonomous execution"
+        if profile.allowed_capabilities and change.capability not in profile.allowed_capabilities:
+            return (f"profile {profile.name!r} does not cover {change.capability}; it covers "
+                    f"{', '.join(sorted(profile.allowed_capabilities))}")
+        return (f"profile {profile.name!r} does not cover the target {change.target!r}; it covers "
+                f"{', '.join(sorted(profile.allowed_targets))}")
 
     def _evidence_state(self, evidence_ids: Sequence[str],
                         change_id: str = "") -> tuple[tuple[str, ...], str, float]:

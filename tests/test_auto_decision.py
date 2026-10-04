@@ -326,8 +326,14 @@ def _autonomous_ops(ops: Any, tmp_path: Any, **decision: Any) -> tuple[Any, Appr
     # runner `codex` with a stub reviewer injected: the default runner is named `fake`, and the stub guard
     # refuses to let a fake stand in for a paid reviewer. Naming it `codex` is what lets the pipeline be
     # exercised without spending a token.
-    auto = type(ops.config.auto)(enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
-                                 decision={"mode": "autonomous", **decision})
+    existing = ops.config.auto
+    # Profiles and the default profile come from whatever the test set up, not from a fresh default:
+    # rebuilding the config silently dropped them, which is how a scope test could pass a gate that
+    # never had a profile to refuse it.
+    auto = type(existing)(enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
+                          decision={"mode": "autonomous",
+                                    "default_profile": existing.decision.default_profile, **decision},
+                          profiles=list(existing.profiles))
     # `Config` is frozen too, so the pipeline is switched on by building a new one rather than by
     # assigning into it - which is also what an operator does when they edit the YAML.
     ops.config = ops.config.model_copy(update={"auto": auto})
@@ -1111,3 +1117,86 @@ def test_the_approval_cap_comes_from_the_same_freshness_measurement_as_the_check
     # Measured the way `check_evidence` measures it - from the oldest entry, not from ingestion.
     assert remaining <= window - stale_by + 5.0, (
         f"the cap is {remaining:.0f}s, but the evidence has only {window - stale_by:.0f}s left")
+
+
+def _profile(**fields: Any) -> Any:
+    from opsbrain.auto.config import PolicyProfileConfig
+
+    return PolicyProfileConfig(name="general", **fields)
+
+
+def test_a_profile_that_excludes_the_target_blocks_the_decision(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`target_in_scope=bool(change.target)` said only that a string was present.
+
+    So every scope the operator wrote - `allow_autonomous`, `allowed_targets`, `allowed_capabilities` -
+    was configured, validated, shown in the overview, and never consulted.
+    """
+    from opsbrain.auto.config import AutoConfig
+
+    ops.config = ops.config.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
+        decision={"mode": "autonomous"}, profiles=[_profile(allowed_targets=["web-1"])])})
+    _ops, engine = _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    assert ops.auto.review_plan(plan)["outcome"] == "approvable", "the review itself is fine"
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY"
+    assert "does not cover the target 'proxmox'" in out["decision"]["detail"]
+    assert "web-1" in out["decision"]["detail"], "and the operator is told what it does cover"
+
+
+def test_a_profile_that_excludes_the_capability_blocks_the_decision(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from opsbrain.auto.config import AutoConfig
+
+    ops.config = ops.config.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
+        decision={"mode": "autonomous"}, profiles=[_profile(allowed_capabilities=["k8s.get"])])})
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    ops.auto.review_plan(plan)
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY"
+    assert "does not cover tofu.apply" in out["decision"]["detail"]
+
+
+def test_a_profile_that_forbids_autonomy_blocks_the_decision(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from opsbrain.auto.config import AutoConfig
+
+    ops.config = ops.config.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
+        decision={"mode": "autonomous"}, profiles=[_profile(allow_autonomous=False)])})
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    ops.auto.review_plan(plan)
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY"
+    assert "does not allow autonomous execution" in out["decision"]["detail"]
+
+
+def test_a_review_that_cannot_be_resolved_blocks_the_decision(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`_evaluate` only checked that the tuple was non-empty.
+
+    A preflight record is a copy made at review time; records get removed and copies outlive their
+    originals, so the engine was told a PASS it could not re-derive from anything - an approval whose
+    stated justification cannot be audited.
+    """
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    assert ops.auto.review_plan(plan)["outcome"] == "approvable"
+    review_id = ops.auto.preflight().get_by_plan(plan.id)["review"]
+    assert ops.auto.reviews.store.discard(review_id), "the review record is gone"
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY"
+    assert "cannot be resolved" in out["decision"]["detail"]
