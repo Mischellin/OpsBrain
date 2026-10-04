@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..audit import AuditLog
-from ..util import OpsError, new_id
+from ..util import OpsError, new_id, now
 from .approval import ApprovalStore, binding_for
 from .config import AutoConfig
 from .decision import ApprovalEngine
@@ -536,16 +536,33 @@ class AutoService:
             # decision is about the plan, and forcing the id to the change here made every document
             # disagree with the plan it was gathered for. Forcing it would also let a PASS for one change
             # be read as proof about another.
-            if report.change_id and report.change_id != change_id:
+            # `verify_plan` reports against the plan id, because that is what a caller names; the
+            # executor's change is `c-*`. Both are the same object, so a report naming this plan is
+            # accepted - while a report naming a *different* plan or a different change is still refused.
+            expected = {change_id, plan_id}
+            if report.change_id and report.change_id not in expected:
                 return self._decision_refused(change_id, plan_id,
-                                              f"the verification report is for {report.change_id}, not "
-                                              f"{change_id}", review_id=result.review_id)
+                                              f"the verification report is for {report.change_id}, which is "
+                                              f"neither this change ({change_id}) nor this plan ({plan_id})",
+                                              review_id=result.review_id)
         else:
             report = None
         # Evidence is re-read and re-checked here rather than trusted from the preflight record. That record
         # was written when the bundle was fresh; the decision happens later, and by then the bundle may have
         # aged past `evidence.max_age_s`, gone missing, or been tampered with. Treating a non-empty id tuple
         # as `evidence_fresh` made all three reach APPROVE.
+        # What was reviewed is what the plan declared. `review_plan(plan, evidence=B)` lets a caller
+        # supply a different bundle, and the preflight then records B - so the approval would be bound to
+        # evidence the immutable reviewed plan never named. Both the declared bundle and the declared
+        # references have to be what the review actually saw.
+        declared = set(plan.evidence_refs) | ({plan.evidence_bundle} if plan.evidence_bundle else set())
+        reviewed = set(result.evidence_ids)
+        if declared and not reviewed.issubset(declared):
+            return self._decision_refused(change_id, plan_id,
+                                          f"the review saw {', '.join(sorted(reviewed))} but the plan "
+                                          f"declares {', '.join(sorted(declared))}; an approval cannot rest "
+                                          f"on evidence the reviewed plan did not name",
+                                          review_id=result.review_id)
         evidence_ids, evidence_reason, evidence_remaining = self._evidence_state(
             result.evidence_ids, change_id)
         inputs = Inputs(
@@ -563,6 +580,9 @@ class AutoService:
             verification=report,
             attempts=self._repair_count(change),
             policy_version=self.auto.decision.policy_version,
+            calls_used=self.reviews.ledger.calls,
+            spend_usd=self.reviews.ledger.spend_usd,
+            elapsed_s=now() - change.created,
         )
         # Resolved, not copied. `_evaluate` only checks that the tuple is non-empty, so a review record
         # that was deleted, corrupted or replaced after the preflight still produced a citation nobody

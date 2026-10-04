@@ -1200,3 +1200,111 @@ def test_a_review_that_cannot_be_resolved_blocks_the_decision(ops, tmp_path) -> 
     out = ops.auto.decide_change(change.id, plan.id)
     assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY"
     assert "cannot be resolved" in out["decision"]["detail"]
+
+
+# ------------------------------------------------ the ceilings the operator set, and the ids it named
+def test_a_retry_stops_at_the_call_ceiling_not_only_the_cycle_count() -> None:
+    """`max_repair_cycles` bounds how many times the loop goes round, not what it spends going round.
+
+    A reviewer that fails on a quota error is retryable by construction, so a cycle budget alone lets the
+    loop walk straight past the call, cost and elapsed-time bounds the operator set.
+    """
+    tight = engine(max_model_calls=2)
+    facts = {field: getattr(inputs(), field) for field in Inputs.__dataclass_fields__}
+    facts.update(review_status="TIMEOUT", review_verdict="", reviews_passed=0)
+
+    still_going = tight.decide(Inputs(**{**facts, "attempts": 0, "calls_used": 1}),
+                               "pl-1", "ah-1", change_id="c-1", review_ids=("rv-0000abcd",))
+    assert still_going.decision is Decision.RETRY
+
+    out = tight.decide(Inputs(**{**facts, "attempts": 0, "calls_used": 2}),
+                       "pl-1", "ah-1", change_id="c-1", review_ids=("rv-0000abcd",))
+    assert out.decision is Decision.BLOCKED_AUTONOMOUSLY
+    assert out.reason is Reason.RETRIES_EXHAUSTED
+    assert "call ceiling is reached" in out.detail
+
+
+def test_a_retry_stops_at_the_spend_and_elapsed_ceilings_too() -> None:
+    tight = engine(max_spend_usd=1.0, max_wall_s=600)
+    facts = {field: getattr(inputs(), field) for field in Inputs.__dataclass_fields__}
+    facts.update(review_status="TIMEOUT", review_verdict="", reviews_passed=0)
+    spent = tight.decide(Inputs(**{**facts, "attempts": 0, "spend_usd": 1.5}),
+                         "pl-1", "ah-1", change_id="c-1", review_ids=("rv-0000abcd",))
+    assert spent.reason is Reason.RETRIES_EXHAUSTED and "spend ceiling" in spent.detail
+    slow = tight.decide(Inputs(**{**facts, "attempts": 0, "elapsed_s": 900.0}),
+                        "pl-1", "ah-1", change_id="c-1", review_ids=("rv-0000abcd",))
+    assert slow.reason is Reason.RETRIES_EXHAUSTED and "elapsed-time ceiling" in slow.detail
+
+
+def test_the_instructions_name_the_retry_outcome_the_enum_actually_uses() -> None:
+    from opsbrain.auto.decision import Decision
+    from opsbrain.server import build_instructions
+
+    assert Decision.RETRY.value == "RETRY"
+    ops = _autonomous_ops_text()
+    text = build_instructions(ops)
+    assert "RETRY" in text
+    assert "REFTRY" not in text, "a client matching the advertised name would not find the enum value"
+
+
+def _autonomous_ops_text() -> Any:
+    from opsbrain.config import AutoConfig
+
+    class _Stub:
+        pass
+
+    stub = _Stub()
+    stub.auto = AutoConfig(enabled=True, autonomy_token=TOKEN, decision={"mode": "autonomous"})
+    return stub
+
+
+def test_destructive_work_is_not_sent_to_a_path_that_cannot_execute(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`--allow-destroy` is unreachable in autonomous mode: the gate still demands an engine approval."""
+    _autonomous_ops(ops, tmp_path, allow_destructive=False)
+    record = engine().decide(
+        Inputs(**{**{f: getattr(inputs(), f) for f in Inputs.__dataclass_fields__},
+                  "destructive": True, "reviews_passed": 1}),
+        "pl-1", "ah-1", change_id="c-1", review_ids=("rv-0000abcd",))
+    assert record.decision is Decision.BLOCKED_AUTONOMOUSLY
+    assert "REFTRY" not in record.next
+    assert "allow_destructive" in record.next, "the operator is told the switch that would work"
+    assert "manual" in record.next, "and the mode they would switch to"
+
+
+def test_an_approval_cannot_rest_on_evidence_the_plan_never_named(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`review_plan(plan, evidence=B)` lets a caller supply a different bundle than the plan declares."""
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    declared = _bundle(ops, tmp_path, change.id)
+    other = _bundle(ops, tmp_path, change.id)
+    plan = _plan_for_change(bundle_id=declared)
+    # `review_plan` refuses the substitution at the door, so the plan never acquires a preflight that
+    # would let a decision rest on evidence the immutable reviewed plan did not name.
+    ops.auto.review_plan(plan, evidence=other)
+    record = ops.auto.preflight().get_by_plan(plan.id)
+    reviewed_ids = set(record["evidence_ids"])
+    assert other in reviewed_ids, "the caller did add a bundle the plan never named"
+    assert declared in reviewed_ids, "and the plan's own bundle is there too"
+    # So the refusal has to happen at the decision, where the plan's own declaration is available: an
+    # approval must not rest on evidence the immutable reviewed plan never named.
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY"
+    assert "did not name" in out["decision"]["detail"]
+
+
+def test_a_report_naming_this_plan_is_accepted_by_a_service_that_produced_it(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`verify_plan` reports against the plan id; the executor's change is `c-*`. Same object, two names."""
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    ops.auto.review_plan(plan)
+    # A report as the service emits it: `brief` names the change `change`, and `verify_plan` uses the plan
+    # id there - the same object under the name a caller would have used.
+    brief = report(CheckStatus.PASS, change_id=plan.id).brief()
+    assert brief["change"] == plan.id
+    out = ops.auto.decide_change(change.id, plan.id, verification=brief)
+    assert out["decision"]["decision"] == "APPROVE", out["decision"].get("detail", out)

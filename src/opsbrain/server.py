@@ -44,7 +44,7 @@ def build_instructions(config: Any) -> str:
     return _COMMON + (
         "Mutations are two-step: plan/check returns a change id, then call `autonomy action=decide` with the "
         "change id as `id` and the reviewed plan id as `plan`; the decision engine decides, and an APPROVE "
-        "issues the approval the apply then spends - no human step. A REFTRY means run the review again; "
+        "issues the approval the apply then spends - no human step. A RETRY means run the review again; "
         "BLOCKED_AUTONOMOUSLY means it stops there and says what is missing." + _TAIL
     )
 

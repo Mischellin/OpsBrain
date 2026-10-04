@@ -105,6 +105,12 @@ class Inputs:
     attempts: int = 0
     policy_version: str = ""
     autonomy_revoked: bool = False
+    #: What this workflow has already spent, and how long it has been running. The engine consults these
+    #: before every RETRY, because `max_repair_cycles` alone bounds the count of retries and not their
+    #: cost: a reviewer that fails on a quota error is retryable by construction.
+    calls_used: int = 0
+    spend_usd: float = 0.0
+    elapsed_s: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -241,6 +247,32 @@ class ApprovalEngine:
             "profile": profile,
         }
 
+    def _budget_exhausted(self, inputs: Inputs) -> str:
+        """Which of the operator's ceilings this workflow has already reached, if any.
+
+        `max_repair_cycles` bounds how many times the loop may go round, not what it may spend doing it, so
+        a reviewer that fails on a quota error is retryable by construction and the loop walks straight
+        past the call, cost and elapsed-time bounds the operator set. Each ceiling is checked against what
+        this workflow has used, and the strictest of the operator's `decision` and `review` settings wins.
+        """
+        decision = self.config.decision
+        review = self.config.review
+        max_calls = min(decision.max_model_calls, review.max_model_calls)
+        if inputs.calls_used >= max_calls:
+            return f"the call ceiling is reached ({inputs.calls_used} of {max_calls} model calls)"
+        # `ReviewConfig` spells the two money-and-time ceilings differently from `DecisionConfig`; the
+        # strictest of each pair is the one that binds.
+        # Zero means "no limit stated" in both configs, so `min` would collapse a real limit to "off".
+        # The binding ceiling is the smallest *stated* one.
+        stated = [value for value in (decision.max_spend_usd, review.budget_usd) if value > 0]
+        max_spend = min(stated) if stated else 0.0
+        if max_spend > 0 and inputs.spend_usd >= max_spend:
+            return f"the spend ceiling is reached (${inputs.spend_usd:.4f} of ${max_spend:.2f})"
+        max_wall = decision.max_wall_s
+        if inputs.elapsed_s >= max_wall:
+            return f"the elapsed-time ceiling is reached ({inputs.elapsed_s:.0f}s of {max_wall:.0f}s)"
+        return ""
+
     def autonomous(self) -> bool:
         # `enabled` is part of the answer. The gate is installed unconditionally by `Core`, so an
         # `AutoConfig(enabled=False, decision={"mode": "autonomous"})` - valid, and the default shape of a
@@ -337,6 +369,10 @@ class ApprovalEngine:
             return (Decision.BLOCKED_AUTONOMOUSLY, Reason.REVIEW_MISSING,
                     "no review was run, so nothing was judged", "run a review")
         if inputs.review_status in _RETRYABLE_REVIEW_STATUS:
+            exhausted = self._budget_exhausted(inputs)
+            if exhausted:
+                return (Decision.BLOCKED_AUTONOMOUSLY, Reason.RETRIES_EXHAUSTED, exhausted,
+                        "raise the budget deliberately, or a human looks at this")
             if inputs.attempts < self.config.decision.max_repair_cycles:
                 return (Decision.RETRY, Reason.RETRYABLE_RUNNER_FAILURE,
                         f"the reviewer reported {inputs.review_status}, which one more attempt may fix",
@@ -353,6 +389,10 @@ class ApprovalEngine:
             # a successful disagreement meant a required extra review that timed out vanished, and a
             # passing primary review carried the decision on its own.
             if inputs.secondary_review_status in _RETRYABLE_REVIEW_STATUS:
+                exhausted = self._budget_exhausted(inputs)
+                if exhausted:
+                    return (Decision.BLOCKED_AUTONOMOUSLY, Reason.RETRIES_EXHAUSTED, exhausted,
+                            "raise the budget deliberately, or a human looks at this")
                 if inputs.attempts < self.config.decision.max_repair_cycles:
                     return (Decision.RETRY, Reason.RETRYABLE_RUNNER_FAILURE,
                             f"the second reviewer reported {inputs.secondary_review_status}, which one "
@@ -393,6 +433,10 @@ class ApprovalEngine:
                     f"preflight concluded {inputs.preflight_outcome.value} ({inputs.preflight_reason})",
                     "revise the plan")
         if inputs.preflight_outcome is Outcome.NEEDS_EVIDENCE:
+            exhausted = self._budget_exhausted(inputs)
+            if exhausted:
+                return (Decision.BLOCKED_AUTONOMOUSLY, Reason.RETRIES_EXHAUSTED, exhausted,
+                        "raise the budget deliberately, or a human looks at this")
             if inputs.attempts < self.config.decision.max_repair_cycles:
                 return (Decision.RETRY, Reason.RETRY_BUDGET_LEFT,
                         f"preflight needs evidence: {inputs.preflight_reason}",
@@ -440,9 +484,16 @@ class ApprovalEngine:
             return (Decision.BLOCKED_AUTONOMOUSLY, Reason.DESTRUCTIVE_REQUIRES_HUMAN,
                     "the change destroys or replaces resources", "a human approves with --allow-destroy")
         if inputs.destructive and self.autonomous() and not self.config.decision.allow_destructive:
+            # Not "a human approves with --allow-destroy". In autonomous mode that advice cannot be
+            # followed: `decide_change` never supplies `human_approved`, and once a human *has* approved
+            # the change, `consume` still consults the autonomous gate because the change is dangerous -
+            # where the absent engine approval is refused. So the operator was told to take a path that
+            # ends in the same refusal, and destructive work was impossible without changing the
+            # subsystem's own configuration. The two ways out are named instead.
             return (Decision.BLOCKED_AUTONOMOUSLY, Reason.DESTRUCTIVE_REQUIRES_HUMAN,
                     "the change is destructive and auto.decision.allow_destructive is false",
-                    "a human approves with --allow-destroy")
+                    "either set auto.decision.allow_destructive=true, or switch auto.decision.mode to "
+                    "manual and approve this change by hand with `opsbrain approve <id> --allow-destroy`")
         if inputs.human_approved:
             return (Decision.APPROVE, Reason.HUMAN_APPROVED, "a human approved this change", "")
 
