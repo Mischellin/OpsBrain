@@ -28,7 +28,7 @@ from typing import Any
 
 from ..changes import digest
 from ..util import OpsError, new_id, now
-from .approval import ApprovalBinding, ApprovalStore, StaleReason, stale_reasons
+from .approval import ApprovalBinding, ApprovalStore, LeaseState, StaleReason, stale_reasons
 from .config import AutoConfig
 from .evidence import Reason as EvidenceReason
 from .preflight import Outcome
@@ -82,6 +82,8 @@ class Inputs:
     mode: str
     preflight_outcome: Outcome | None = None
     preflight_reason: str = ""
+    #: Tri-state on purpose. `None` means "preflight did not say", which is not `True`, and a plan whose
+    #: approvability nobody established must not be approved on the strength of an outcome label alone.
     preflight_approvable: bool | None = None
     evidence_reason: str = EvidenceReason.EVIDENCE_FRESH.value
     evidence_ids: tuple[str, ...] = ()
@@ -89,8 +91,10 @@ class Inputs:
     review_status: str = ""
     secondary_review_verdict: str = ""
     secondary_review_status: str = ""
-    policy_allows: bool = True
-    target_in_scope: bool = True
+    #: Both are tri-state for the same reason. Defaulting them to `True` meant a caller who forgot to run
+    #: or map the policy lookup got an affirmative policy decision it never made.
+    policy_allows: bool | None = None
+    target_in_scope: bool | None = None
     destructive: bool = False
     human_approved: bool = False
     verification: VerificationReport | None = None
@@ -114,6 +118,9 @@ class DecisionRecord:
     policy_version: str
     plan_id: str
     arguments_hash: str
+    #: The change this decision is about. Carried in the record so issuance can prove the approval it
+    #: writes is the one this decision authorised, instead of trusting the binding it was handed.
+    change_id: str = ""
     created: float = field(default_factory=now)
     id: str = ""
     evidence_ids: tuple[str, ...] = ()
@@ -126,7 +133,8 @@ class DecisionRecord:
         return {"id": self.id, "contract_version": CONTRACT_VERSION, "decision": self.decision.value,
                 "reason": self.reason.value, "detail": self.detail, "mode": self.mode,
                 "policy_version": self.policy_version, "plan": self.plan_id,
-                "arguments_hash": self.arguments_hash, "created": round(self.created, 3),
+                "change": self.change_id, "arguments_hash": self.arguments_hash,
+                "created": round(self.created, 3),
                 "evidence_refs": list(self.evidence_ids), "review_refs": list(self.review_ids),
                 "verification": self.verification_status, "attempts": self.attempts, "next": self.next}
 
@@ -184,7 +192,17 @@ class ApprovalEngine:
         if approval.binding.change_id != change.id:
             raise OpsError(f"approval {approval.id} was issued for {approval.binding.change_id}, "
                            f"not for {change.id}")
-        reasons = stale_reasons(approval.binding, self._current_for(change, approval.binding.policy_version))
+        # Liveness, not just provenance. `get()` returns a revoked, consumed or expired approval perfectly
+        # happily, and this gate was checking only the binding - so a change could execute under an
+        # approval that had already been withdrawn or spent on something else.
+        if approval.state is not LeaseState.ISSUED:
+            raise OpsError(f"approval {approval.id} is {approval.state.value}, not usable for execution")
+        if approval.binding.expired:
+            raise OpsError(f"approval {approval.id} expired more than {approval.binding.expires_s:.0f}s ago")
+        # The engine's *current* configured version, not the one the binding carries. Supplying the
+        # binding's own value makes the comparison equal by construction, so an approval issued under v1
+        # stayed executable forever after the policy moved to v2.
+        reasons = stale_reasons(approval.binding, self._current_for(change, self.config.decision.policy_version))
         if reasons:
             raise OpsError(f"approval {approval.id} is STALE ({', '.join(reasons)})")
         return True
@@ -211,24 +229,48 @@ class ApprovalEngine:
         }
 
     def autonomous(self) -> bool:
-        return self.config.decision.autonomous
+        # `enabled` is part of the answer. The gate is installed unconditionally by `Core`, so an
+        # `AutoConfig(enabled=False, decision={"mode": "autonomous"})` - valid, and the default shape of a
+        # config that simply has not been switched on - would otherwise block ordinary changes for
+        # lacking an engine approval from a subsystem the operator turned off.
+        return bool(self.config.enabled and self.config.decision.autonomous)
 
     # ---------------------------------------------------------------------------------- the decision
-    def decide(self, inputs: Inputs, plan_id: str, arguments_hash: str, *,
+    def decide(self, inputs: Inputs, plan_id: str, arguments_hash: str, *, change_id: str = "",
                review_ids: Sequence[str] = ()) -> DecisionRecord:
-        outcome, reason, detail, nxt = self._evaluate(inputs)
+        outcome, reason, detail, nxt = self._evaluate(inputs, plan_id, tuple(review_ids))
         return DecisionRecord(
             id=new_id("dr"), decision=outcome, reason=reason, detail=detail, mode=inputs.mode,
             policy_version=inputs.policy_version, plan_id=plan_id, arguments_hash=arguments_hash,
+            change_id=change_id,
             evidence_ids=inputs.evidence_ids, review_ids=tuple(review_ids),
             verification_status=inputs.verification.status.value if inputs.verification else "",
             attempts=inputs.attempts, next=nxt)
 
-    def _evaluate(self, inputs: Inputs) -> tuple[Decision, Reason, str, str]:
+    def _evaluate(self, inputs: Inputs, plan_id: str, review_ids: Sequence[str]) -> tuple[Decision, Reason, str, str]:
         # ---- terminal, checked first so nothing downstream can undo them
         if inputs.mode not in ("manual", "autonomous"):
             return (Decision.BLOCKED_AUTONOMOUSLY, Reason.MODE_UNKNOWN,
                     f"unknown mode {inputs.mode!r}: the engine will not guess how it is allowed to act", "")
+
+        # ---- policy: a `deny` is a `deny`, in every mode, at every attempt, and before anything that
+        # sounds temporary - so a forbidden change is never reported as "a human could approve this".
+        if inputs.policy_allows is False:
+            return (Decision.DENY, Reason.POLICY_FORBIDS,
+                    "policy denies this capability for this target", "no further action")
+        if inputs.target_in_scope is False:
+            return (Decision.BLOCKED_AUTONOMOUSLY, Reason.TARGET_NOT_IN_SCOPE,
+                    "the target is not covered by the configured policy, and an uncovered target is not an "
+                    "allowed target", "extend the policy explicitly, or leave it to a human")
+
+        # The mode a caller claims must be the mode the operator configured. Otherwise an autonomous
+        # engine can be handed `mode="manual"` plus `human_approved=True`, take the manual branch, and
+        # issue an engine approval - which is exactly the gate this module exists to keep shut.
+        if inputs.mode != self.config.decision.mode:
+            return (Decision.BLOCKED_AUTONOMOUSLY, Reason.MODE_UNKNOWN,
+                    f"the caller asked for {inputs.mode!r} but auto.decision.mode is "
+                    f"{self.config.decision.mode!r}: the engine decides in its configured mode only", "")
+
         if inputs.mode == "autonomous" and self.config.decision.emergency_stop:
             return (Decision.BLOCKED_AUTONOMOUSLY, Reason.EMERGENCY_STOP,
                     "auto.decision.emergency_stop is set: every autonomous decision is blocked", "")
@@ -247,19 +289,23 @@ class ApprovalEngine:
             return (Decision.BLOCKED_AUTONOMOUSLY, Reason.AUTONOMY_OFF,
                     "auto.decision.mode is `manual` and no human approved this change", "")
 
-        # ---- policy: a `deny` is a `deny`, in every mode and at every attempt
-        if not inputs.policy_allows:
-            return (Decision.DENY, Reason.POLICY_FORBIDS,
-                    "policy denies this capability for this target", "no further action")
-        if not inputs.target_in_scope:
+        # ---- policy facts must have been established, not merely omitted
+        if inputs.policy_allows is not True:
+            return (Decision.BLOCKED_AUTONOMOUSLY, Reason.POLICY_FORBIDS,
+                    "no policy decision was supplied for this capability, and an unlooked-up policy is not "
+                    "a permissive one", "resolve the policy and decide again")
+        if inputs.target_in_scope is not True:
             return (Decision.BLOCKED_AUTONOMOUSLY, Reason.TARGET_NOT_IN_SCOPE,
-                    "the target is not covered by the configured policy, and an uncovered target is not an "
-                    "allowed target", "extend the policy explicitly, or leave it to a human")
+                    "no scope decision was supplied for this target, and an unclassified target is not an "
+                    "allowed target", "classify the target and decide again")
 
         # ---- evidence
-        if not inputs.evidence_ids and not inputs.evidence_reason:
+        if not inputs.evidence_ids:
+            # Regardless of the reason string. A caller that passes the default `evidence_fresh` with an
+            # empty list would otherwise reach APPROVE with nothing an auditor could resolve afterwards.
             return (Decision.BLOCKED_AUTONOMOUSLY, Reason.EVIDENCE_MISSING,
-                    "the decision is based on no evidence at all", "collect evidence")
+                    "the decision references no evidence bundle, so nothing about it can be re-checked",
+                    "collect evidence")
         if inputs.evidence_reason == EvidenceReason.EVIDENCE_MISSING.value:
             return (Decision.BLOCKED_AUTONOMOUSLY, Reason.EVIDENCE_MISSING,
                     f"the evidence bundle is missing: {inputs.evidence_reason}", "collect evidence")
@@ -268,6 +314,12 @@ class ApprovalEngine:
                     f"the evidence is not usable: {inputs.evidence_reason}", "collect fresh evidence")
 
         # ---- the review, and the shape of its answer
+        if not review_ids:
+            # A verdict nobody can resolve is not a verdict. Without the reference the record names a
+            # judgement with no artefact behind it, and the executor has nothing to re-check.
+            return (Decision.BLOCKED_AUTONOMOUSLY, Reason.REVIEW_MISSING,
+                    "no review reference was recorded, so the PASS cannot be resolved to a stored review",
+                    "run a review and keep its reference")
         if not inputs.review_status:
             return (Decision.BLOCKED_AUTONOMOUSLY, Reason.REVIEW_MISSING,
                     "no review was run, so nothing was judged", "run a review")
@@ -283,11 +335,27 @@ class ApprovalEngine:
                     f"the reviewer could not answer: {inputs.review_status}", "a human looks at this")
         if inputs.review_verdict == "DENY":
             return (Decision.DENY, Reason.REVIEW_DENIED, "the reviewer denied the plan", "revise the plan")
-        if inputs.secondary_review_status == "OK" and inputs.secondary_review_verdict != inputs.review_verdict:
-            # Two independent reviews that disagree are not a tie to break by preference.
-            return (Decision.BLOCKED_AUTONOMOUSLY, Reason.VERDICT_DISAGREEMENT,
-                    f"two reviews disagree: {inputs.review_verdict} against {inputs.secondary_review_verdict}",
-                    "a human decides")
+        if inputs.secondary_review_status:
+            # Any populated non-OK secondary status has to be handled like the primary one. Handling only
+            # a successful disagreement meant a required extra review that timed out vanished, and a
+            # passing primary review carried the decision on its own.
+            if inputs.secondary_review_status in _RETRYABLE_REVIEW_STATUS:
+                if inputs.attempts < self.config.decision.max_repair_cycles:
+                    return (Decision.RETRY, Reason.RETRYABLE_RUNNER_FAILURE,
+                            f"the second reviewer reported {inputs.secondary_review_status}, which one "
+                            "more attempt may fix", "retry the review")
+                return (Decision.BLOCKED_AUTONOMOUSLY, Reason.RETRIES_EXHAUSTED,
+                        f"the second reviewer failed {inputs.secondary_review_status} on every attempt",
+                        "a human looks at this")
+            if inputs.secondary_review_status != "OK":
+                return (Decision.BLOCKED_AUTONOMOUSLY, Reason.REVIEW_FAILED,
+                        f"the second reviewer could not answer: {inputs.secondary_review_status}",
+                        "a human looks at this")
+            if inputs.secondary_review_verdict != inputs.review_verdict:
+                # Two independent reviews that disagree are not a tie to break by preference.
+                return (Decision.BLOCKED_AUTONOMOUSLY, Reason.VERDICT_DISAGREEMENT,
+                        f"two reviews disagree: {inputs.review_verdict} against "
+                        f"{inputs.secondary_review_verdict}", "a human decides")
         if inputs.review_verdict != "PASS":
             return (Decision.BLOCKED_AUTONOMOUSLY, Reason.REVIEW_MISSING,
                     f"the reviewer answered {inputs.review_verdict or 'nothing'}", "revise the plan")
@@ -307,14 +375,23 @@ class ApprovalEngine:
                         "collect the evidence the reviewer asked for")
             return (Decision.BLOCKED_AUTONOMOUSLY, Reason.RETRIES_EXHAUSTED,
                     f"the evidence never arrived: {inputs.preflight_reason}", "a human looks at this")
-        if inputs.preflight_outcome is not Outcome.APPROVABLE or inputs.preflight_approvable is False:
+        if inputs.preflight_outcome is not Outcome.APPROVABLE or inputs.preflight_approvable is not True:
+            # `is not True`, not `is False`: an outcome label of APPROVABLE with an unestablished
+            # `approvable` field is a plan nobody confirmed, and `PreflightResult.approvable` is the field
+            # that opens the gate. Absent, malformed or unavailable all mean the same thing here.
             return (Decision.BLOCKED_AUTONOMOUSLY, Reason.REVIEW_MISSING,
-                    f"preflight concluded {inputs.preflight_outcome.value} ({inputs.preflight_reason})",
-                    "revise the plan")
+                    f"preflight concluded {inputs.preflight_outcome.value} but approvability is "
+                    f"{inputs.preflight_approvable!r} ({inputs.preflight_reason})", "revise the plan")
 
         # ---- what actually happened, not that the command returned
         report = inputs.verification
         if report is not None:
+            # The report has to be about *this* plan. Reading only its aggregate status meant a PASS from
+            # an unrelated earlier change could be supplied while deciding this one.
+            if report.change_id and plan_id and report.change_id != plan_id:
+                return (Decision.BLOCKED_AUTONOMOUSLY, Reason.VERIFICATION_UNKNOWN,
+                        f"the verification report is for {report.change_id}, not for {plan_id}",
+                        "verify this plan again")
             if report.status is CheckStatus.FAIL:
                 return (Decision.DENY, Reason.VERIFICATION_FAILED,
                         f"verification of the applied change failed: {report.brief().get('reason', '')}",
@@ -358,6 +435,24 @@ class ApprovalEngine:
         if self.changes is None:
             raise OpsError("the engine is not installed in front of a change store, so an issued approval "
                            "would record nothing for the gate to check later; call install() first")
+        # The binding has to be the one this record decided about. Checking only `record.approvable` and
+        # ignoring `plan_id`/`arguments_hash` let an APPROVE produced for one plan authorise an arbitrary
+        # binding for another change - the record said yes to something, and the approval said yes to
+        # whatever the caller handed over.
+        if record.change_id and binding.change_id != record.change_id:
+            raise OpsError(f"refusing to issue: the binding authorises {binding.change_id!r} but the "
+                           f"decision was made about {record.change_id!r}")
+        if record.arguments_hash and binding.arguments_hash != record.arguments_hash:
+            raise OpsError(f"refusing to issue: the binding carries arguments {binding.arguments_hash!r} "
+                           f"but the decision was about {record.arguments_hash!r}")
+        if binding.policy_version != record.policy_version:
+            raise OpsError(f"refusing to issue: the binding names policy {binding.policy_version!r} but the "
+                           f"decision was made under {record.policy_version!r}")
+        if tuple(sorted(binding.evidence_ids)) != tuple(sorted(record.evidence_ids)):
+            raise OpsError(f"refusing to issue: the binding names {len(binding.evidence_ids)} evidence "
+                           f"references but the decision was made on {len(record.evidence_ids)}")
+        if not binding.targets:
+            raise OpsError("refusing to issue: the binding names no target, so it authorises nothing")
         approval_id = self.approvals.issue(binding).id
         self.changes.record_decision_inputs(
             binding.change_id, evidence_ids=list(binding.evidence_ids),

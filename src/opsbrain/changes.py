@@ -127,6 +127,17 @@ class ChangeStore:
         self._save(change)
         return change
 
+    def update_args(self, change_id: str, new_args: dict[str, Any]) -> Change:
+        """Rewrite the recorded arguments. Used only to model "the arguments moved after the decision".
+
+        Same purpose as `update_hash`, for the other half of the binding: an approval names both, and a
+        change whose arguments move after a decision is as stale as one whose plan moves.
+        """
+        change = self.get(change_id)
+        change.args = dict(new_args)
+        self._save(change)
+        return change
+
     def attach_approval(self, change_id: str, approval_id: str) -> Change:
         """Record the engine-issued approval this change will be executed under.
 

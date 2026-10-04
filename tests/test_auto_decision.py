@@ -23,8 +23,10 @@ from opsbrain.auto.verify import CheckResult, CheckStatus, VerificationReport
 from opsbrain.util import OpsError
 
 
-def report(status: CheckStatus, *, reason: str = "") -> VerificationReport:
-    return VerificationReport(change_id="chg-1", status=status, captured=1.0, evidence_refs=("ev-aaaaaaaabbbbbbbb",),
+def report(status: CheckStatus, *, reason: str = "", change_id: str = "pl-1") -> VerificationReport:
+    # `change_id` matches the plan the engine decides about: the engine now refuses a report that is
+    # about some other change, so a mismatched fixture would be testing the wrong branch.
+    return VerificationReport(change_id=change_id, status=status, captured=1.0, evidence_refs=("ev-aaaaaaaabbbbbbbb",),
                              observation_s=60.0,
                              results=(CheckResult(check="systemd:unit-active", profile="systemd", target="web-1",
                                                   status=status, captured=1.0, detail="", reason=reason),))
@@ -55,8 +57,25 @@ def engine_manual(**config: Any) -> ApprovalEngine:
     return ApprovalEngine(AutoConfig(enabled=True, decision={"mode": "manual", **config}))
 
 
-def decide(**overrides: Any) -> DecisionRecord:
-    return engine().decide(inputs(**overrides), "pl-1", "ah-1")
+def decide(change_id: str = "", **overrides: Any) -> DecisionRecord:
+    """A decision over fully-populated inputs: a PASS nobody can resolve is not a PASS."""
+    return engine().decide(inputs(**overrides), "pl-1", "ah-1", change_id=change_id,
+                           review_ids=("rv-0000abcd",))
+
+
+def decide_for(change: Any, **overrides: Any) -> DecisionRecord:
+    """A decision about one concrete change, carrying the same facts the binding will.
+
+    `issue` now refuses a binding whose arguments, evidence or policy differ from the record's, so the
+    decision and the approval have to be produced from the same change - which is the point.
+    """
+    from opsbrain.changes import digest
+
+    arguments = digest({k: v for k, v in sorted(change.args.items())}) if change.args else ""
+    # The report is about this change, or the engine correctly refuses a PASS from elsewhere.
+    facts = {"verification": report(CheckStatus.PASS, change_id=change.id)}
+    return engine().decide(inputs(**{**facts, **overrides}), change.id, arguments, change_id=change.id,
+                           review_ids=("rv-0000abcd",))
 
 
 # --------------------------------------------------------------------------- the positive path
@@ -70,9 +89,32 @@ def test_everything_in_order_approves_without_asking_anybody() -> None:
 
 
 def test_a_human_approval_approves_even_in_manual_mode() -> None:
-    record = decide(mode="manual", human_approved=True)
+    record = engine_manual().decide(inputs(mode="manual", human_approved=True), "pl-1", "ah-1",
+                                    review_ids=("rv-0000abcd",))
     assert record.decision is Decision.APPROVE
     assert record.reason is Reason.HUMAN_APPROVED
+
+
+def test_a_caller_cannot_choose_a_weaker_mode_than_the_operator_configured() -> None:
+    """Claiming `manual` on an autonomous engine must not reach the human-approval branch.
+
+    Otherwise the gate this module exists to keep shut is opened from the inside: submit `mode="manual"`
+    with `human_approved=True`, take the manual branch, and the resulting engine approval satisfies the
+    autonomous gate as if the engine had judged it.
+    """
+    record = decide(mode="manual", human_approved=True)
+    assert record.decision is Decision.BLOCKED_AUTONOMOUSLY
+    assert record.reason is Reason.MODE_UNKNOWN
+    assert "manual" in record.detail and "autonomous" in record.detail
+
+
+def test_a_policy_denial_is_terminal_even_when_nobody_approved() -> None:
+    """A forbidden change is `DENY` in every mode, not a block that reads like "ask a human"."""
+    record = engine_manual().decide(inputs(mode="manual", human_approved=False, policy_allows=False),
+                                    "pl-1", "ah-1", review_ids=("rv-0000abcd",))
+    assert record.decision is Decision.DENY
+    assert record.reason is Reason.POLICY_FORBIDS
+    assert record.next == "no further action"
 
 
 def test_a_human_approval_still_cannot_override_a_policy_denial() -> None:
@@ -112,10 +154,12 @@ def test_destructive_work_stays_with_a_person() -> None:
     # And even with autonomy on, the operator has to opt into destructive execution explicitly.
     strict = ApprovalEngine(AutoConfig(enabled=True, autonomy_token=TOKEN,
                                        decision={"mode": "autonomous", "allow_destructive": False}))
-    assert strict.decide(inputs(destructive=True), "pl-1", "ah-1").decision is Decision.BLOCKED_AUTONOMOUSLY
+    blocked = strict.decide(inputs(destructive=True), "pl-1", "ah-1", review_ids=("rv-0000abcd",))
+    assert blocked.decision is Decision.BLOCKED_AUTONOMOUSLY
     permissive = ApprovalEngine(AutoConfig(enabled=True, autonomy_token=TOKEN,
                                           decision={"mode": "autonomous", "allow_destructive": True}))
-    assert permissive.decide(inputs(destructive=True), "pl-1", "ah-1").decision is Decision.APPROVE
+    allowed = permissive.decide(inputs(destructive=True), "pl-1", "ah-1", review_ids=("rv-0000abcd",))
+    assert allowed.decision is Decision.APPROVE
 
 
 # -------------------------------------------------------------------------------------- the blocks
@@ -167,7 +211,7 @@ def test_a_target_the_policy_does_not_cover_is_refused_not_assumed_allowed() -> 
 def test_emergency_stop_beats_everything() -> None:
     stopped = ApprovalEngine(AutoConfig(enabled=True, autonomy_token=TOKEN,
                                         decision={"mode": "autonomous", "emergency_stop": True}))
-    record = stopped.decide(inputs(), "pl-1", "ah-1")
+    record = stopped.decide(inputs(), "pl-1", "ah-1", review_ids=("rv-0000abcd",))
     assert record.decision is Decision.BLOCKED_AUTONOMOUSLY
     assert record.reason is Reason.EMERGENCY_STOP
 
@@ -183,7 +227,7 @@ def test_an_unknown_mode_is_refused_rather_than_guessed() -> None:
 
 def test_manual_mode_does_not_decide_on_its_own() -> None:
     """`mode: manual` is not a weaker autonomous mode; it is the human's path."""
-    record = engine_manual().decide(inputs(mode="manual"), "pl-1", "ah-1")
+    record = engine_manual().decide(inputs(mode="manual"), "pl-1", "ah-1", review_ids=("rv-0000abcd",))
     assert record.decision is Decision.BLOCKED_AUTONOMOUSLY
     assert record.reason is Reason.AUTONOMY_OFF
 
@@ -200,7 +244,8 @@ def test_a_transient_runner_failure_is_a_retry(status: str) -> None:
 def test_a_retry_stops_when_the_budget_runs_out() -> None:
     limited = ApprovalEngine(AutoConfig(enabled=True, autonomy_token=TOKEN,
                                         decision={"mode": "autonomous", "max_repair_cycles": 1}))
-    record = limited.decide(inputs(review_status="TIMEOUT", review_verdict="", attempts=1), "pl-1", "ah-1")
+    record = limited.decide(inputs(review_status="TIMEOUT", review_verdict="", attempts=1), "pl-1", "ah-1",
+                            review_ids=("rv-0000abcd",))
     assert record.decision is Decision.BLOCKED_AUTONOMOUSLY
     assert record.reason is Reason.RETRIES_EXHAUSTED
     assert record.attempts == 1
@@ -245,7 +290,7 @@ def test_an_approval_is_issued_only_for_an_approval(tmp_path: Any) -> None:
     change = changes.create("tofu.apply", "proxmox", "x", "ph-1")
     binding = bound_for(change)
     # issued from an autonomous decision: a human-approved one in manual mode also qualifies
-    assert issuing.issue("pl-1", "ah-1", binding, record=decide())
+    assert issuing.issue("pl-1", "ah-1", binding, record=decide_for(change))
     blocked_dir = tmp_path / "blocked"
     blocked_dir.mkdir()
     blocked_engine = ApprovalEngine(AutoConfig(enabled=True, autonomy_token=TOKEN), ApprovalStore(blocked_dir))
@@ -329,7 +374,7 @@ def test_an_engine_approval_opens_it(ops, tmp_path) -> None:  # type: ignore[no-
     ops, engine = _autonomous_ops(ops, tmp_path)
     change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1",
                                 args={"plan_file": ".opsbrain/j-1234abcd.tfplan"})
-    approval = engine.issue(change.id, change.hash, bound_for(change), record=decide())
+    approval = engine.issue(change.id, change.hash, bound_for(change), record=decide_for(change))
     ops.changes.attach_approval(change.id, approval)
     assert ops.changes.consume(change.id, "tofu.apply", "proxmox", needs_approval=True).state == "applied"
 
@@ -339,14 +384,57 @@ def test_a_binding_that_names_neither_the_arguments_nor_the_evidence_is_refused(
 
     The gate used to compare a dict the caller assembled field by field, and skip any it left out - so a
     binding that named only the plan and the subject passed a five-field check. Every field is now derived
-    from the change, and a binding that does not match is STALE.
+    from the change, and issuance refuses a binding that disagrees with the record.
     """
     ops, engine = _autonomous_ops(ops, tmp_path)
     change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1",
                                 args={"plan_file": ".opsbrain/j-1234abcd.tfplan"})
     lazy = bound_for(change, arguments_hash="", evidence_ids=())
-    ops.changes.attach_approval(change.id, engine.issue(change.id, change.hash, lazy, record=decide()))
+    with pytest.raises(OpsError, match="refusing to issue"):
+        engine.issue(change.id, change.hash, lazy, record=decide_for(change))
+    assert not change.engine_approval, "nothing was attached, so nothing can be executed under it"
+
+
+def test_an_approval_stops_covering_a_change_whose_arguments_moved(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Correctly issued is not a permanent property: the change can still move under it."""
+    ops, engine = _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"})
+    ops.changes.attach_approval(change.id, engine.issue(change.id, change.hash, bound_for(change),
+                                                        record=decide_for(change)))
+    ops.changes.update_args(change.id, {"plan_file": ".opsbrain/j-deadbeef.tfplan"})
     with pytest.raises(OpsError, match="STALE"):
+        ops.changes.consume(change.id, "tofu.apply", "proxmox", needs_approval=True)
+
+
+def test_a_revoked_approval_does_not_open_the_gate(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`get()` returns a revoked approval perfectly happily. The gate has to notice."""
+    ops, engine = _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1")
+    approval = engine.issue(change.id, change.hash, bound_for(change), record=decide_for(change))
+    ops.changes.attach_approval(change.id, approval)
+    assert engine.approvals is not None
+    engine.approvals.revoke(approval)
+    with pytest.raises(OpsError, match="revoked"):
+        ops.changes.consume(change.id, "tofu.apply", "proxmox", needs_approval=True)
+
+
+def test_a_spent_approval_does_not_open_a_second_run(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """A lease is spent once. The gate must not treat a CONSUMED approval as authority again."""
+    ops, engine = _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1")
+    approval = engine.issue(change.id, change.hash, bound_for(change), record=decide_for(change))
+    assert engine.approvals is not None
+    from opsbrain.changes import digest
+
+    binding_now = {"plan_hash": change.hash,
+                   "arguments_hash": digest({k: v for k, v in sorted(change.args.items())})
+                   if change.args else "",
+                   "subject": f"{change.capability}:{change.target}", "targets": [change.target],
+                   "evidence_ids": ["ev-aaaaaaaabbbbbbbb"], "policy_version": "v1"}
+    engine.approvals.consume(approval, binding_now, owner="w", idempotency_key="k")
+    ops.changes.attach_approval(change.id, approval)
+    with pytest.raises(OpsError, match="consumed"):
         ops.changes.consume(change.id, "tofu.apply", "proxmox", needs_approval=True)
 
 
@@ -355,7 +443,8 @@ def test_an_approval_issued_for_another_change_is_refused(ops, tmp_path) -> None
     mine = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1")
     theirs = ops.changes.create("tofu.apply", "prod", "y", "ph-2")
     binding = bound_for(theirs)
-    ops.changes.attach_approval(mine.id, engine.issue(mine.id, mine.hash, binding, record=decide()))
+    ops.changes.attach_approval(mine.id, engine.issue(mine.id, mine.hash, binding,
+                                                      record=decide_for(theirs)))
     with pytest.raises(OpsError, match="was issued for"):
         ops.changes.consume(mine.id, "tofu.apply", "proxmox", needs_approval=True)
 
@@ -365,7 +454,7 @@ def test_a_stale_approval_no_longer_opens_the_gate(ops, tmp_path) -> None:  # ty
     ops, engine = _autonomous_ops(ops, tmp_path)
     change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1")
     binding = bound_for(change, plan_hash="ph-original")
-    ops.changes.attach_approval(change.id, engine.issue(change.id, change.hash, binding, record=decide()))
+    ops.changes.attach_approval(change.id, engine.issue(change.id, change.hash, binding, record=decide_for(change)))
     ops.changes.update_hash(change.id, "ph-swapped")  # the plan was replaced after the decision
     with pytest.raises(OpsError, match="STALE"):
         ops.changes.consume(change.id, "tofu.apply", "proxmox", needs_approval=True)
@@ -379,12 +468,13 @@ def test_an_engine_that_was_never_installed_refuses_to_issue(tmp_path: Any) -> N
     it says so instead of quietly producing one.
     """
     from opsbrain.auto.approval import ApprovalStore
+    from opsbrain.changes import ChangeStore
 
+    changes = ChangeStore(tmp_path / "changes", 3600)
+    change = changes.create("tofu.apply", "proxmox", "x", "ph-1")
     engine = ApprovalEngine(AutoConfig(enabled=True, autonomy_token=TOKEN), ApprovalStore(tmp_path))
-    binding = bound_for(type("C", (), {"id": "c-00000000", "capability": "tofu.apply", "target": "p",
-                                       "hash": "h", "args": {}})())
     with pytest.raises(OpsError, match="not installed"):
-        engine.issue("pl-1", "ah-1", binding, record=decide())
+        engine.issue(change.id, change.hash, bound_for(change), record=decide_for(change))
 
 
 def test_manual_mode_leaves_the_human_path_working(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -396,3 +486,79 @@ def test_manual_mode_leaves_the_human_path_working(ops, tmp_path) -> None:  # ty
     change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1")
     ops.changes.approve(change.id, allow_dangerous=True)
     assert ops.changes.consume(change.id, "tofu.apply", "proxmox", needs_approval=True).state == "applied"
+
+
+# ------------------------------------------------- fail-closed: a fact nobody established is not a fact
+def test_policy_facts_are_not_affirmative_by_default() -> None:
+    """A caller who never ran the policy lookup must not get an affirmative answer out of it.
+
+    `policy_allows` and `target_in_scope` defaulted to `True`, so forgetting to map the policy result was
+    indistinguishable from the policy having allowed the change.
+    """
+    blank = Inputs(mode="autonomous", preflight_outcome=Outcome.APPROVABLE, preflight_approvable=True,
+                   evidence_ids=("ev-aaaaaaaabbbbbbbb",), review_verdict="PASS", review_status="OK",
+                   policy_version="v1")
+    record = engine().decide(blank, "pl-1", "ah-1", review_ids=("rv-0000abcd",))
+    assert record.decision is Decision.BLOCKED_AUTONOMOUSLY
+    assert record.reason is Reason.POLICY_FORBIDS
+    assert "unlooked-up policy" in record.detail
+
+
+def test_a_target_nobody_classified_is_not_an_in_scope_target() -> None:
+    blank = Inputs(mode="autonomous", preflight_outcome=Outcome.APPROVABLE, preflight_approvable=True,
+                   evidence_ids=("ev-aaaaaaaabbbbbbbb",), review_verdict="PASS", review_status="OK",
+                   policy_allows=True, policy_version="v1")
+    record = engine().decide(blank, "pl-1", "ah-1", review_ids=("rv-0000abcd",))
+    assert record.decision is Decision.BLOCKED_AUTONOMOUSLY
+    assert record.reason is Reason.TARGET_NOT_IN_SCOPE
+
+
+def test_an_approval_with_no_evidence_reference_is_refused() -> None:
+    """The default `evidence_fresh` reason with an empty list reached APPROVE with nothing to re-check."""
+    record = decide(evidence_ids=())
+    assert record.decision is Decision.BLOCKED_AUTONOMOUSLY
+    assert record.reason is Reason.EVIDENCE_MISSING
+    assert "no evidence bundle" in record.detail
+
+
+def test_a_pass_nobody_can_resolve_is_refused() -> None:
+    record = engine().decide(inputs(), "pl-1", "ah-1", review_ids=())
+    assert record.decision is Decision.BLOCKED_AUTONOMOUSLY
+    assert record.reason is Reason.REVIEW_MISSING
+    assert "cannot be resolved" in record.detail
+
+
+def test_approvable_means_the_field_said_yes_not_that_nobody_said() -> None:
+    """An APPROVABLE outcome with an unestablished `approvable` is a plan nobody confirmed."""
+    record = decide(preflight_approvable=None)
+    assert record.decision is Decision.BLOCKED_AUTONOMOUSLY
+    assert record.reason is Reason.REVIEW_MISSING
+    assert "approvability is None" in record.detail
+
+
+def test_a_verification_report_from_another_change_is_not_proof_of_this_one() -> None:
+    record = engine().decide(inputs(verification=report(CheckStatus.PASS, change_id="c-someoneelse")),
+                             "pl-1", "ah-1", review_ids=("rv-0000abcd",))
+    assert record.decision is Decision.BLOCKED_AUTONOMOUSLY
+    assert record.reason is Reason.VERIFICATION_UNKNOWN
+    assert "c-someoneelse" in record.detail
+
+
+def test_a_second_reviewer_that_failed_does_not_vanish() -> None:
+    """A required extra review that timed out used to be ignored, and the primary review carried it."""
+    record = decide(secondary_review_status="TIMEOUT")
+    assert record.decision is Decision.RETRY
+    assert record.reason is Reason.RETRYABLE_RUNNER_FAILURE
+    assert "second reviewer" in record.detail
+
+
+def test_a_second_reviewer_that_hard_failed_blocks() -> None:
+    record = decide(secondary_review_status="UNAUTHORIZED")
+    assert record.decision is Decision.BLOCKED_AUTONOMOUSLY
+    assert record.reason is Reason.REVIEW_FAILED
+
+
+def test_two_reviews_that_agree_still_approve() -> None:
+    """The secondary check is not a veto on everything - a passing pair must still get through."""
+    record = decide(secondary_review_status="OK", secondary_review_verdict="PASS")
+    assert record.decision is Decision.APPROVE
