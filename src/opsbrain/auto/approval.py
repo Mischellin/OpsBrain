@@ -223,11 +223,11 @@ class ApprovalStore:
                 if existing.state is LeaseState.CONSUMED:
                     raise OpsError(f"approval {approval.id} was already spent; a spent approval is not "
                                    f"replaced, and the change it authorised has already run")
-                if existing.state is LeaseState.REVOKED and not shortens:
+                if existing.state is LeaseState.REVOKED:
                     # Revocation is a decision by a person, and an automatic retry of the original issuance
                     # silently undoing it would make the change executable again with nobody having looked
-                    # at it a second time. A genuinely shorter grant is the single exception: it can only
-                    # ever take authority away, never add it.
+                    # at it a second time. A shorter deadline is not the exception it looks like: tightening
+                    # a live approval only takes authority away, while rewriting a revoked one adds it back.
                     raise OpsError(f"approval {approval.id} was revoked ({existing.lease_owner or 'no reason'}); "
                                    f"a revoked approval is not reissued, and re-reviewing is what undoes it")
                 approval = Approval(binding=binding)
@@ -293,6 +293,12 @@ class ApprovalStore:
                                      outcome={**approval.outcome, "replayed": True})
                 raise OpsError(f"approval {approval_id} was already spent "
                                f"(by {approval.lease_owner or 'someone else'})")
+            if approval.state is not LeaseState.ISSUED:
+                # Everything else is terminal, and an expiry is terminal by state rather than by the clock:
+                # it can be recorded explicitly, in which case the binding's own time has not run out.
+                # Checking the clock alone let an EXPIRED record past the revoked and spent branches and be
+                # rewritten as CONSUMED - the expired decision executing.
+                raise OpsError(f"approval {approval_id} is {approval.state.value}, not usable for execution")
             if approval.binding.expired:
                 raise OpsError(f"approval {approval_id} expired; review and approve again")
             reasons = stale_reasons(approval.binding, current)
@@ -404,7 +410,8 @@ def binding_for(change: Any, *, evidence_ids: Sequence[str] = (), policy_version
         # anything else raised `AttributeError` from three frames down, which reads like a bug in this
         # function rather than a wrong argument.
         raise OpsError(f"binding_for needs a Change with `args` and `expires`, not {type(change).__name__}; "
-                       f"a reviewed ChangePlan is bound through AutoService.decide_change")
+                       f"an approval binds the change record, not a reviewed plan - a plan is what the "
+                       f"decision is made about, and the change is what the approval covers")
     arguments = digest({key: value for key, value in sorted(change.args.items())}) if change.args else ""
     # The binding inherits the change's own age instead of restarting at "now". An approval that outlives
     # the plan it approves is a fresh hour of authority for a plan a human looked at days ago.

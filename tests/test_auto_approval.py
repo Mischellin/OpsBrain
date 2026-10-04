@@ -500,12 +500,48 @@ def test_a_shorter_reissue_still_may_not_resurrect_a_spent_approval(tmp_path: Pa
 
 
 def test_binding_for_rejects_a_reviewed_plan_with_a_message_that_names_the_right_path() -> None:
-    """`AttributeError` from three frames down reads like a bug here rather than a wrong argument."""
+    """`AttributeError` from three frames down reads like a bug here rather than a wrong argument.
+
+    The message must also not point at a method that does not exist in this tree - a reader sent to
+    `AutoService.decide_change` from this PR finds nothing there.
+    """
     from opsbrain.auto.plan import ChangePlan, ProposedChange
 
     plan = ChangePlan.build(
         objective="o", diagnosis="d",
         changes=[ProposedChange(capability="tofu.apply", target="proxmox", how="h", undo="revert it")],
         rollback="revert it", created=1_700_000_000.0)
-    with pytest.raises(OpsError, match="AutoService.decide_change"):
+    with pytest.raises(OpsError, match="binds the change record, not a reviewed plan") as raised:
         binding_for(plan)
+    assert "decide_change" not in str(raised.value), "no reference to code that is not in this tree"
+
+
+def test_a_shorter_reissue_still_cannot_resurrect_a_revoked_approval(tmp_path: Path) -> None:
+    """Tightening a live approval only removes authority; rewriting a revoked one adds it back.
+
+    `shortens` may bypass the "hand back the live record" shortcut and nothing else.
+    """
+    store = ApprovalStore(tmp_path)
+    approval = store.issue(a_binding(expires_s=3600.0))
+    store.revoke(approval.id, "the target is not ours")
+    with pytest.raises(OpsError, match="was revoked"):
+        store.issue(a_binding(expires_s=60.0))
+    assert store.get(approval.id).state is LeaseState.REVOKED, "the withdrawal stands"
+
+
+def test_an_expired_record_cannot_be_spent_even_before_its_own_clock_runs_out(tmp_path: Path) -> None:
+    """Expiry is terminal by state, not only by the clock: it can be recorded explicitly.
+
+    Checking `binding.expired` alone let an EXPIRED record past the revoked and spent branches and be
+    rewritten as CONSUMED - the expired decision executing.
+    """
+    store = ApprovalStore(tmp_path)
+    approval = store.issue(a_binding())
+    path = tmp_path / f"{approval.id}.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["state"] = LeaseState.EXPIRED.value
+    path.write_text(json.dumps(document), encoding="utf-8")
+    assert store.get(approval.id).binding.expired is False, "its own clock has not run out"
+    with pytest.raises(OpsError, match="expired, not usable"):
+        store.consume(approval.id, current(), owner="worker-1", idempotency_key="job-42")
+    assert store.get(approval.id).state is LeaseState.EXPIRED
