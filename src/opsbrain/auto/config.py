@@ -164,6 +164,13 @@ class PolicyProfileConfig(_Model):
 
     name: str
     classification: str = "low"
+    #: What this profile means *now*, bumped by the operator whenever its requirements change.
+    #:
+    #: An approval is bound to the profile that granted it, and a profile is a set of requirements that
+    #: can be rewritten in place. Without a version, tightening `secrets` to require an extra review left
+    #: every approval already issued under it spendable: nothing in the binding had moved, because the
+    #: binding only named the profile. With one, a requirements change is a fact the gate can see.
+    version: str = "1"
     require_evidence: list[str] = Field(default_factory=list)
     require_preconditions: list[str] = Field(default_factory=list)
     require_verification: list[str] = Field(default_factory=list)

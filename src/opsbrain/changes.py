@@ -195,6 +195,7 @@ class ChangeStore:
     # `list[str]` annotation here is not a type at all and mypy is right to say so.
     def record_decision_inputs(self, change_id: str, *, evidence_ids: Sequence[str], policy_version: str,
                               plan_id: str, decision: str, arguments_hash: str = "", profile: str = "",
+                              profile_version: str = "",
                               decision_record: dict[str, Any] | None = None) -> Change:
         """Record what the decision engine decided against, so the gate can check it later.
 
@@ -212,6 +213,7 @@ class ChangeStore:
                               "policy_version": policy_version, "plan_id": plan_id,
                               "decision": decision, "arguments_hash": arguments_hash,
                               **({"profile": profile} if profile else {}),
+                              **({"profile_version": profile_version} if profile_version else {}),
                               **({"decision_id": (decision_record or {}).get("id")}
                                  if decision_record and decision_record.get("id") else {}),
                               **({"decision_record": decision_record} if decision_record else {})}

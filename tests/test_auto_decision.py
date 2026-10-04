@@ -462,7 +462,8 @@ def test_a_spent_approval_does_not_open_a_second_run(ops, tmp_path) -> None:  # 
                    if change.args else "",
                    "subject": f"{change.capability}:{change.target}", "targets": [change.target],
                    "evidence_ids": ["ev-aaaaaaaabbbbbbbb"], "policy_version": "v1",
-                   "profile": bound_for(change).profile}
+                   "profile": bound_for(change).profile,
+                   "profile_version": bound_for(change).profile_version}
     engine.approvals.consume(approval, binding_now, owner="w", idempotency_key="k")
     ops.changes.attach_approval(change.id, approval)
     with pytest.raises(OpsError, match="consumed"):
@@ -1561,3 +1562,42 @@ def test_the_refusal_code_is_one_a_client_can_enumerate() -> None:
     from opsbrain.auto.decision import Reason as DecisionReason
 
     assert DecisionReason.PLAN_CHANGED.value in set(all_reason_codes())
+
+
+def test_tightening_a_profile_makes_the_approvals_it_granted_stale(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """#9: a profile is a set of requirements that can be rewritten in place.
+
+    Requiring an extra review of `secrets` left every approval already issued under it spendable, because
+    nothing in the binding had moved - it named the profile, and the profile still had the same name. A
+    version is the fact that makes a requirements change visible.
+    """
+    from opsbrain.auto.approval import ApprovalStore
+    from opsbrain.auto.config import AutoConfig, PolicyProfileConfig
+    from opsbrain.auto.decision import ApprovalEngine
+
+    def config_with(version: str) -> Any:
+        return AutoConfig(
+            enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
+            decision={"mode": "autonomous", "default_profile": "general"},
+            profiles=[PolicyProfileConfig(name="general"),
+                      PolicyProfileConfig(name="secrets", allowed_targets=["proxmox"], version=version)])
+
+    ops.config = ops.config.model_copy(update={"auto": config_with("1")})
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id), profile="secrets")
+    ops.auto.review_plan(plan)
+    approval = ops.auto.decide_change(change.id, plan.id)["approval"]
+    assert ApprovalStore(ops.auto.root / "approvals").get(approval).binding.profile_version == "1"
+
+    # The operator tightens the same profile. Its name is unchanged; its requirements are not.
+    # A fresh engine over the tightened configuration - the same way a restarted server would see it.
+    from opsbrain.auto.approval import ApprovalStore as Store
+
+    engine = ApprovalEngine(ops.config.model_copy(update={"auto": config_with("2")}).auto,
+                            Store(ops.auto.root / "approvals"))
+    assert Store(ops.auto.root / "approvals").get(approval).binding.profile_version == "1"
+    with pytest.raises(OpsError, match="profile_version_changed"):
+        engine.gate(ops.changes.get(change.id), spend=False)
