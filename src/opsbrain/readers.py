@@ -30,6 +30,9 @@ _SELECTOR = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./=!, ()-]{0,199}$")
 _SINCE = re.compile(r"^[0-9]{1,4} ?(s|sec|m|min|h|hour|hours|d|day|days)( ago)?$|^[0-9T:. -]{8,25}$|"
                     r"^(today|yesterday)$")
 _UNIT = re.compile(r"^[A-Za-z0-9@_.:-]{1,120}$")
+#: How many per-namespace reads run at once. Enough that a hundred namespaces is not a hundred
+#: sequential round trips, bounded so a wide cluster cannot fan out into a fork bomb.
+_K8S_READ_PARALLELISM = 8
 
 K8S_KINDS = {
     "pods": "pods", "deployments": "deployments", "statefulsets": "statefulsets", "daemonsets": "daemonsets",
@@ -115,6 +118,53 @@ class Readers(Core):
         return out
 
     # ----------------------------------------------------------------------------------------- hosts
+    def may_read_namespace(self, name: str) -> bool:
+        """Whether the policy covers this namespace, without raising on one it does not."""
+        try:
+            self.require("k8s.read", name)
+        except OpsError:
+            return False
+        return True
+
+    def _require_all_namespaces(self) -> list[str]:
+        """The namespaces a cluster-wide read may cover, each authorised individually.
+
+        Returns the authorised list rather than only asserting, because the caller must then read *those*
+        namespaces by name. Authorising a list and afterwards issuing one `-A` read is not the same thing:
+        a namespace created in between is absent from the loop and its objects still come back. Reading the
+        authorised namespaces explicitly is what makes the per-namespace rule mean something at the moment
+        the objects are actually fetched.
+        """
+        # The bare capability is checked *before* the cluster is read. Checking it afterwards meant a
+        # caller the policy denies had already caused `kubectl get namespaces` to run.
+        self.require("k8s.read")
+        listing = parsers.k8s_rows("namespaces", self._kubectl_json("get", "namespaces"))
+        names = [str(row.get("name", "")) for row in listing if str(row.get("name", ""))]
+        if not names:
+            raise OpsError("cannot read the namespace list, so an all-namespace read is not authorised")
+        withheld = 0
+        for name in names:
+            if not self.may_read_namespace(name):
+                withheld += 1
+        if withheld:
+            # A count, never the names. `require` raises a message naming the target it refused, and that
+            # message travels back to the caller - disclosing exactly the namespace the rule withholds, by
+            # the back door the listing branch was built to close.
+            raise OpsError(f"an all-namespace read is not authorised: {withheld} namespace(s) are not "
+                           f"covered by policy. Read them by name, or extend the policy.")
+        return names
+
+    def _authorise_hosts(self, names: list[str]) -> None:
+        """Check `hosts.read` for *every* selected host, not once for the batch.
+
+        A rule like `hosts.read:pve: deny` is keyed on the host, and a batch action that asks only about
+        the bare capability never lets it participate: the denial was configured, and the host was read
+        anyway. Authorising each name before any command goes out is what makes the targeted rule mean
+        something, for explicit lists and for tag-selected batches alike.
+        """
+        for name in names:
+            self.require("hosts.read", name)
+
     def _select_hosts(self, hosts: list[str] | None, tag: str | None, *, kind: str = "linux") -> list[str]:
         if hosts:
             for name in hosts:
@@ -132,22 +182,24 @@ class Readers(Core):
         return dict(zip(names, results, strict=True))
 
     def hosts_list(self) -> dict[str, Any]:
+        """The inventory. Gated like every other host read: it carries addresses, jump chains and tags."""
+        self.require("hosts.read")
         return {"hosts": [{"name": name, "addr": host.address, **({"jump": host.jump} if host.jump else {}),
                            **({"tags": host.tags} if host.tags else {}),
                            **({"services": host.services} if host.services else {})}
                           for name, host in self.config.hosts.items()]}
 
     def hosts_ping(self, hosts: list[str] | None = None, tag: str | None = None) -> dict[str, Any]:
-        self.require("hosts.read")
         names = self._select_hosts(hosts, tag)
+        self._authorise_hosts(names)
         results = self._parallel(names, "true", timeout=25)
         down = {name: clip(result.out.strip().splitlines()[-1] if result.out.strip() else "timeout", 160)
                 for name, result in results.items() if not result.ok}
         return {"up": len(names) - len(down), "total": len(names), "down": down}
 
     def hosts_status(self, hosts: list[str] | None = None, tag: str | None = None) -> dict[str, Any]:
-        self.require("hosts.read")
         names = self._select_hosts(hosts, tag)
+        self._authorise_hosts(names)
         results = self._parallel(names, STATUS_SCRIPT)
         ignore = frozenset(self.config.ignore_failed_units)
         rows: dict[str, Any] = {}
@@ -271,15 +323,80 @@ class Readers(Core):
 
     def k8s_get(self, kind: str, namespace: str | None = None, name: str | None = None,
                 selector: str | None = None) -> dict[str, Any]:
-        self.require("k8s.read", namespace or "")
         if kind not in K8S_KINDS:
             raise OpsError(f"kind must be one of {sorted(K8S_KINDS)}")
         self._names(namespace, name)
+        if selector and not _SELECTOR.fullmatch(selector):
+            raise OpsError(f"invalid selector: {selector!r}")
+        if kind == "namespaces" and not namespace and not name:
+            # The listing *is* the disclosure, and this branch issues the cluster read itself, so the bare
+            # capability is checked *before* it - exactly as `_require_all_namespaces` does. Checking the
+            # per-namespace rules only afterwards meant a caller denied `k8s.read` outright had already
+            # caused `kubectl get namespaces` to run.
+            self.require("k8s.read")
+            # The selector was validated but never passed on, so this branch answered with every
+            # authorised namespace rather than the ones asked for.
+            args = ["get", "namespaces"]
+            if selector:
+                args += ["-l", selector]
+            rows = parsers.k8s_rows(kind, self._kubectl_json(*args))
+            allowed, withheld = [], 0
+            for row in rows:
+                row_name = str(row.get("name", ""))
+                if not row_name:
+                    continue
+                if self.may_read_namespace(row_name):
+                    allowed.append(row)
+                else:
+                    withheld += 1
+            # Capped, like every other listing this module returns, so a wide cluster cannot page an
+            # unbounded answer out of a single call.
+            out = {"kind": kind, "namespaces": [str(r.get("name", "")) for r in allowed[:40]],
+                   **self.capped(allowed, 40)}
+            if withheld:
+                # A count, not the names. Naming them would put back exactly what the rule withholds.
+                out["withheld"] = withheld
+                out["note"] = f"{withheld} namespace(s) are not covered by policy and are not listed"
+            return out
+        cluster_wide = not namespace and kind not in ("nodes", "namespaces")
+        names: list[str] = []
+        if cluster_wide:
+            # `-A` returns objects from namespaces the policy may well deny. Checking the empty target
+            # only proves that `k8s.read:` is allowed, so a per-namespace deny never participated. Either
+            # the operator has allowed every namespace explicitly, or this read does not happen - and even
+            # then each authorised namespace is read *by name*, so a namespace created after the check
+            # cannot smuggle its objects into the answer.
+            names = self._require_all_namespaces()
+        else:
+            self.require("k8s.read", namespace or "")
+        if names:
+            # Authorised per namespace, so the reads are per namespace too - but concurrently and with a
+            # bound. Serially, a cluster with a hundred namespaces turned one request into a hundred
+            # subprocesses that each wait on the API, and an ordinary MCP call could time out while the
+            # server was still being loaded. The authorisation is unchanged: the point is that a namespace
+            # created after the check cannot appear here, not how fast the reads happen.
+            def read_scope(scope: str) -> list[Any]:
+                args = ["get", K8S_KINDS[kind], *([name] if name else []), "-n", scope]
+                if name:
+                    # `kubectl get <kind> <name>` exits non-zero with NotFound when that object is not in
+                    # this namespace, and a named object normally lives in exactly one. Without
+                    # `--ignore-not-found` the first namespace that does not have it aborted the whole
+                    # read, so a lookup that used to work with `-A` failed on ordinary input.
+                    args.append("--ignore-not-found")
+                if selector:
+                    args += ["-l", selector]
+                return parsers.k8s_rows(kind, self._kubectl_json(*args))
+
+            if len(names) == 1:
+                rows = read_scope(names[0])
+            else:
+                workers = min(_K8S_READ_PARALLELISM, len(names))
+                with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="opsbrain-k8s") as pool:
+                    rows = [row for chunk in pool.map(read_scope, names) for row in chunk]
+            return {"kind": kind, "namespaces": list(names), **self.capped(rows, 40)}
         args = ["get", K8S_KINDS[kind], *([name] if name else [])]
         args += ["-n", namespace] if namespace else ([] if kind in ("nodes", "namespaces") else ["-A"])
         if selector:
-            if not _SELECTOR.fullmatch(selector):
-                raise OpsError(f"invalid selector: {selector!r}")
             args += ["-l", selector]
         return {"kind": kind, **self.capped(parsers.k8s_rows(kind, self._kubectl_json(*args)), 40)}
 
