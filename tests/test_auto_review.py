@@ -704,3 +704,31 @@ def test_auth_api_must_name_its_key_in_config() -> None:
     with pytest.raises(ValidationError, match="api_key_env"):
         AutoConfig(enabled=True, review={"live": True, "command": ["codex", "{prompt}"], "sandbox": ["bwrap"],
                                          "auth": "api"})
+
+
+def test_a_response_that_omits_status_is_not_ok() -> None:
+    """Only an affirmative runner outcome may carry a permission; silence is not affirmation."""
+    result = parse_review_response(request_for(), json.dumps(
+        {"contract_version": CONTRACT_VERSION, "verdict": "PASS"}))
+    assert result.status is RunnerStatus.INVALID_RESPONSE
+    assert result.is_pass is False
+    assert "status must be present" in result.note
+
+
+def test_home_is_replaced_even_without_a_configured_scratch_dir() -> None:
+    """A read-only wrapper binding `/` does not care what HOME says, so HOME must not be the guard."""
+    env = RunnerSettings().safe_env()
+    assert env["HOME"] != str(Path.home()) or Path.home() == Path(env["HOME"])
+    assert env["HOME"] != os.environ.get("HOME", env["HOME"]) or "HOME" not in os.environ
+
+
+def test_releasing_a_lease_never_deletes_the_next_owners(tmp_path: Path) -> None:
+    """Read-then-unlink is a race: the contender's live lease must survive the original owner's release."""
+    path = tmp_path / "lease.claim"
+    assert atomic_claim(path, "first", ttl_s=-1.0) == "first"
+    time.sleep(0.01)
+    assert atomic_claim(path, "second", ttl_s=60.0) == "second"
+    assert release_claim(path, "first") is False, "a stale owner released someone else's lease"
+    assert read_claim(path)["owner"] == "second"
+    assert release_claim(path, "second") is True
+    assert read_claim(path) is None

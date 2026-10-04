@@ -144,14 +144,31 @@ def _expired_dict(document: dict[str, Any], ttl_s: float) -> bool:
 
 
 def release_claim(path: Path, owner: str) -> bool:
+    """Release the lease, but only if this owner still holds it.
+
+    Read-then-unlink is a race: the lease can expire and be reclaimed by a contender between the two
+    steps, and the original owner would then delete the *contender's* live lease while the contender goes
+    on believing it owns exclusivity. Renaming the claim to a name of our own first means the thing we
+    delete is provably the one we read, because `rename` cannot clobber a different name.
+    """
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        document = read_claim(path)
+    except OSError:
         return False
-    if document.get("owner") != owner:
+    if document is None or document.get("owner") != owner:
+        return False
+    mine = path.with_name(f"{path.name}.release-{owner}-{os.getpid()}")
+    try:
+        os.rename(path, mine)
+    except OSError:
         return False
     try:
-        path.unlink()
+        still = read_claim(mine)
+        if still is not None and still.get("owner") != owner:
+            with contextlib.suppress(OSError):
+                os.rename(mine, path)
+            return False
+        mine.unlink(missing_ok=True)
     except OSError:
         return False
     return True

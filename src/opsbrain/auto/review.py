@@ -310,9 +310,13 @@ def build_result(request: ReviewRequest, document: Any) -> ReviewResult:
     if version != CONTRACT_VERSION:
         return ReviewResult.failure(request, RunnerStatus.INVALID_RESPONSE,
                                     f"contract version mismatch: got {version!r}, expected {CONTRACT_VERSION!r}")
-    status = document.get("status", RunnerStatus.OK.value)
+    status = document.get("status")
     if not isinstance(status, str) or status not in set(RunnerStatus):
-        return ReviewResult.failure(request, RunnerStatus.INVALID_RESPONSE, f"unknown status {status!r}")
+        # Not defaulted to OK. Only an affirmative runner outcome may carry a permission, and a response
+        # that forgot to say how it went has not said it went well.
+        return ReviewResult.failure(request, RunnerStatus.INVALID_RESPONSE,
+                                    f"status must be present and one of {[s.value for s in RunnerStatus]}, "
+                                    f"got {status!r}")
     parsed_status = RunnerStatus(status)
     if parsed_status in FAILED_STATUSES:
         # The runner told us it failed. Keep its note, drop any verdict it may have optimistically sent.

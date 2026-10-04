@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import subprocess  # noqa: S404 - fixed argv, no shell, scrubbed environment
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,11 +72,13 @@ class RunnerSettings:
         # The inherited HOME is a way to the operator's ssh keys, cloud config and shell history. Point it
         # at an empty scratch directory so "read your credentials" is a filesystem decision the sandbox
         # makes, not something a well-behaved reviewer is trusted not to try.
-        scratch = self.scratch_home or self.snapshot_dir
-        if scratch:
-            home = str(Path(scratch).expanduser())
-            env.update({"HOME": home, "XDG_CONFIG_HOME": f"{home}/.config", "XDG_CACHE_HOME": f"{home}/.cache",
-                        "XDG_DATA_HOME": f"{home}/.local/share"})
+        # Replaced even when no scratch path is configured. Leaving the inherited HOME in place means a
+        # read-only wrapper like `bwrap --ro-bind / /` still exposes the operator's ssh keys, .aws and
+        # .kube - a bound mount of the whole filesystem does not care what HOME says, so HOME must not be
+        # the thing standing between the reviewer and those files.
+        home = str(Path(self.scratch_home or self.snapshot_dir or tempfile.gettempdir()).expanduser())
+        env.update({"HOME": home, "XDG_CONFIG_HOME": f"{home}/.config", "XDG_CACHE_HOME": f"{home}/.cache",
+                    "XDG_DATA_HOME": f"{home}/.local/share"})
         return self._apply_auth(env)
 
     def _apply_auth(self, env: dict[str, str]) -> dict[str, str]:
