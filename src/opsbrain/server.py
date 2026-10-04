@@ -169,6 +169,15 @@ def build_server(ops: OpsBrain) -> MCPServer:
             "show": lambda: (lambda item: {**item.brief(), "details": item.details})(ops.changes.get(_need(id, "id"))),
             "discard": lambda: ops.changes.discard(_need(id, "id")).brief()}))
 
+    @server.tool()
+    def autonomy(action: str = "status", limit: int = 20) -> str:
+        """Autonomous pipeline, read-only. action: status (switches, mode, budget) | capabilities (is the
+        reviewer runnable; never claims a model it could not check) | reviews (recent verdicts)."""
+        return ops.call("autonomy", {"action": action}, lambda: _dispatch(action, {
+            "status": ops.auto.overview,
+            "capabilities": lambda: ops.auto.reviews.capabilities(),
+            "reviews": lambda: {"items": ops.auto.reviews.list(limit)}}))
+
     return server
 
 
