@@ -279,7 +279,7 @@ def test_the_binding_is_built_from_the_change_not_from_the_caller(tmp_path: Path
     # A change whose arguments differ yields a different binding, so an approval cannot be carried over.
     other = Change(id="c-1a2b3c4d", capability="ansible.apply", target="common.yml", summary="x",
                    hash="ph-1", created=now(), expires=now() + 3600, args={"limit": "db-1"})
-    assert binding_for(other).arguments_hash != binding.arguments_hash
+    assert binding_for(other, policy_version="v1").arguments_hash != binding.arguments_hash
 
 
 # --------------------------------------------------- the same guarantee in the human change path
@@ -355,10 +355,10 @@ def test_an_approval_does_not_outlive_its_evidence(tmp_path: Path) -> None:
     """
     change = SimpleNamespace(id="c-0000a1b2", capability="tofu.apply", target="proxmox", hash="ph-1",
                              args={}, expired=False, expires=now() + 7200.0)
-    generous = binding_for(change, evidence_ids=("ev-aaaaaaaabbbbbbbb",), expires_s=3600.0,
+    generous = binding_for(change, evidence_ids=("ev-aaaaaaaabbbbbbbb",), expires_s=3600.0, policy_version="v1",
                            evidence_expires_in_s=3600.0)
     assert generous.expires_s == pytest.approx(3600.0, abs=5)
-    capped = binding_for(change, evidence_ids=("ev-aaaaaaaabbbbbbbb",), expires_s=3600.0,
+    capped = binding_for(change, evidence_ids=("ev-aaaaaaaabbbbbbbb",), expires_s=3600.0, policy_version="v1",
                          evidence_expires_in_s=600.0)
     assert capped.expires_s == pytest.approx(600.0, abs=5)
 
@@ -367,7 +367,7 @@ def test_the_evidence_cap_can_only_shorten_an_approval(tmp_path: Path) -> None:
     """A caller passing a larger number must not be able to widen an approval past its evidence."""
     change = SimpleNamespace(id="c-0000a1b2", capability="tofu.apply", target="proxmox", hash="ph-1",
                              args={}, expired=False, expires=now() + 7200.0)
-    binding = binding_for(change, expires_s=300.0, evidence_expires_in_s=900.0)
+    binding = binding_for(change, expires_s=300.0, evidence_expires_in_s=900.0, policy_version="v1")
     assert binding.expires_s == pytest.approx(300.0, abs=5), "the shorter of the two stands"
 
 
@@ -475,9 +475,10 @@ def test_binding_evidence_without_saying_how_long_it_lasts_is_refused() -> None:
     change = SimpleNamespace(id="c-0000a1b2", capability="tofu.apply", target="proxmox", hash="ph-1",
                              args={}, expired=False, expires=now() + 7200.0)
     with pytest.raises(OpsError, match="how long that evidence stays usable"):
-        binding_for(change, evidence_ids=("ev-aaaaaaaabbbbbbbb",), expires_s=3600.0)
+        binding_for(change, evidence_ids=("ev-aaaaaaaabbbbbbbb",), expires_s=3600.0,
+                    policy_version="v1")
     # With no evidence bound there is nothing to cap against, and the ordinary lifetime stands.
-    assert binding_for(change, expires_s=3600.0).expires_s == pytest.approx(3600.0, abs=5)
+    assert binding_for(change, expires_s=3600.0, policy_version="v1").expires_s == pytest.approx(3600.0, abs=5)
 
 
 def test_one_malformed_record_does_not_take_the_whole_listing_down(tmp_path: Path) -> None:
@@ -538,7 +539,7 @@ def test_binding_for_rejects_a_reviewed_plan_with_a_message_that_names_the_right
         changes=[ProposedChange(capability="tofu.apply", target="proxmox", how="h", undo="revert it")],
         rollback="revert it", created=1_700_000_000.0)
     with pytest.raises(OpsError, match="binds the change record, not a reviewed plan") as raised:
-        binding_for(plan)
+        binding_for(plan, policy_version="v1")
     assert "decide_change" not in str(raised.value), "no reference to code that is not in this tree"
 
 
@@ -610,3 +611,35 @@ def test_a_creation_time_ahead_of_the_clock_is_refused(tmp_path: Path) -> None:
         a_binding(created=now() + CLOCK_SKEW_S + 60.0)
     # Ordinary drift between the issuing and the spending process is absorbed, not rejected.
     assert a_binding(created=now() + 5.0).id
+
+
+def test_an_approval_names_the_policy_version_it_was_granted_under() -> None:
+    """A sentinel reading as "no policy version" is a value the caller has to mirror forever.
+
+    `DecisionConfig.policy_version` defaults to `v1`, so an approval built with `"unset"` was refused the
+    moment it was spent - or, worse, the caller mirrored `"unset"` so it would work, and the approval then
+    never went stale when the configured policy version actually moved.
+    """
+    with pytest.raises(OpsError, match="policy version"):
+        a_binding(policy_version="")
+    change = SimpleNamespace(id="c-0000a1b2", capability="tofu.apply", target="proxmox", hash="ph-1",
+                             args={}, expired=False, expires=now() + 7200.0)
+    binding = binding_for(change, policy_version="v2")
+    assert binding.policy_version == "v2", "the binding carries what the configuration said"
+    assert binding_for(change, policy_version="v3").id != binding.id, "and a policy bump changes the identity"
+
+
+def test_an_approval_for_another_change_is_stale(tmp_path: Path) -> None:
+    """The change id is part of the binding's identity, so it belongs in the staleness check.
+
+    Two records that agree on plan, arguments, subject, targets, evidence, policy and profile are
+    otherwise interchangeable - and an approval issued for one could be spent against the other, skipping
+    that record's own approval or revocation.
+    """
+    store = ApprovalStore(tmp_path)
+    approval = store.issue(a_binding())
+    with pytest.raises(OpsError, match="STALE"):
+        store.consume(approval.id, current(change_id="c-99999999"), owner="w", idempotency_key="k")
+    assert StaleReason.CHANGE_SWAPPED.value in stale_reasons(
+        a_binding(), current(change_id="c-99999999"))
+    assert stale_reasons(a_binding(), current()) == (), "and the matching change is not stale"

@@ -49,6 +49,7 @@ class StaleReason(StrEnum):
     EVIDENCE_CHANGED = "evidence_changed"
     POLICY_CHANGED = "policy_changed"
     PROFILE_CHANGED = "profile_changed"
+    CHANGE_SWAPPED = "change_swapped"
     SUBJECT_CHANGED = "subject_changed"
     UNBOUND = "unbound"
 
@@ -90,6 +91,8 @@ class ApprovalBinding:
             raise OpsError("an approval must name the change it approves")
         if not self.plan_hash.strip():
             raise OpsError("an approval must carry the hash of the plan it approves")
+        if not self.policy_version.strip():
+            raise OpsError("an approval must name the policy version it was granted under")
         if not math.isfinite(self.expires_s) or self.expires_s <= 0:
             raise OpsError(f"an approval must have a finite positive lifetime, not {self.expires_s!r}")
         if not math.isfinite(self.created):
@@ -151,6 +154,12 @@ def stale_reasons(binding: ApprovalBinding, current: dict[str, Any]) -> tuple[st
     reasons: list[str] = []
     if not current.get("plan_hash"):
         reasons.append(StaleReason.UNBOUND.value)
+    # The binding's identity covers the change it approves, so the change being executed has to be
+    # compared too. Two records with otherwise identical plan, arguments, subject, targets, evidence,
+    # policy and profile are otherwise interchangeable, and an approval issued for one of them could be
+    # spent against the other - bypassing that record's own approval or revocation.
+    if str(current.get("change_id") or binding.change_id) != binding.change_id:
+        reasons.append(StaleReason.CHANGE_SWAPPED.value)
     for name, stale in (("plan_hash", StaleReason.PLAN_CHANGED), ("arguments_hash", StaleReason.ARGUMENTS_CHANGED),
                         ("subject", StaleReason.SUBJECT_CHANGED), ("policy_version", StaleReason.POLICY_CHANGED),
                         # The profile is not decoration: it selects the evidence a change must rest on, the
@@ -436,7 +445,7 @@ def _locked(path: Path) -> Iterator[None]:
             path.unlink()
 
 
-def binding_for(change: Any, *, evidence_ids: Sequence[str] = (), policy_version: str = "",
+def binding_for(change: Any, *, evidence_ids: Sequence[str] = (), policy_version: str,
                 profile: str = "general", expires_s: float = 3600.0,
                 evidence_expires_in_s: float | None = None) -> ApprovalBinding:
     """Build the binding for an existing `Change`, so a caller cannot quietly leave a field empty.
@@ -478,8 +487,10 @@ def binding_for(change: Any, *, evidence_ids: Sequence[str] = (), policy_version
     return ApprovalBinding(
         change_id=change.id, subject=f"{change.capability}:{change.target}", plan_hash=change.hash,
         arguments_hash=arguments, targets=tuple(sorted({change.target})), evidence_ids=tuple(evidence_ids),
-        policy_version=policy_version or "unset", profile=profile, expires_s=lifetime,
-        created=now())
+        # No sentinel. `DecisionConfig.policy_version` defaults to `v1`, so an approval built with
+        # "unset" was either refused the moment it was spent, or - worse - the caller mirrored "unset" so
+        # it would work, and then the approval never went stale when the policy version actually moved.
+        policy_version=policy_version, profile=profile, expires_s=lifetime, created=now())
 
 
 def verify(approval: Approval, current: dict[str, Any]) -> tuple[str, ...]:
