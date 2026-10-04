@@ -22,7 +22,8 @@ from ..audit import AuditLog
 from ..util import OpsError, new_id
 from .config import AutoConfig
 from .evidence import EvidenceCollector, EvidenceStore, Observation, passed, reason_code
-from .ledger import BudgetLedger
+from .plan import ChangePlan
+from .preflight import Preflight, PreflightResult
 from .review import (
     CONTRACT_VERSION,
     Reviewer,
@@ -67,7 +68,6 @@ class ReviewService:
         self.config = config
         self.root = root
         self.store = RecordStore(root / "reviews", ("rv",))
-        self.ledger = BudgetLedger(root / "budget.jsonl")
         self.reviews = config.review
         self._reviewer = reviewer
         self._factory = reviewer_factory
@@ -80,19 +80,27 @@ class ReviewService:
         self._recover_usage()
 
     def _recover_usage(self) -> None:
-        """Rebuild the counters from the durable budget ledger.
+        """Rebuild the counters from the stored reviews.
 
-        A restart must not hand out a fresh `max_model_calls` and a fresh `budget_usd`, and a separately
-        invoked `opsbrain autonomy status` must report what the server actually spent. The ceilings are
-        only ceilings if they survive a restart and if every reserved attempt is in the ledger - including
-        the ones that went on to fail, since a failed attempt still cost money.
+        Without this a restart hands out a fresh `max_model_calls` and a fresh `budget_usd`, and a
+        separately invoked `opsbrain autonomy status` reports zero for work the server already did. The
+        ceilings are only ceilings if they survive a restart.
         """
-        ledger = self.ledger
+        rows = self.store.list(1_000_000)
+        calls = tokens_in = tokens_out = 0
+        for document in rows:
+            usage = document.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            if document.get("status") == RunnerStatus.OK.value or usage.get("calls"):
+                calls += 1
+            tokens_in += _counter(usage.get("input_tokens"))
+            tokens_out += _counter(usage.get("output_tokens"))
         with self._lock:
-            self._calls = ledger.calls
-            self._tokens_in = ledger.input_tokens
-            self._tokens_out = ledger.output_tokens
-            self._spend_usd = ledger.spend_usd
+            self._calls = calls
+            self._tokens_in = tokens_in
+            self._tokens_out = tokens_out
+            self._spend_usd = (tokens_in + tokens_out) / 1_000_000 * USD_PER_MILLION_TOKENS
 
     def _is_stub(self) -> bool:
         """True only for the built-in stub. A test that injects its own fake is a test, and must keep working."""
@@ -122,30 +130,28 @@ class ReviewService:
         return limit / 1_000_000 * USD_PER_MILLION_TOKENS
 
     def _reserve(self, request: ReviewRequest) -> None:
-        """Admit one attempt, against a balance every process can see.
+        """Counts a call before it happens, against both the call count and the projected spend.
 
-        Reserved per attempt, not per request: `run_review` may invoke the reviewer up to
-        `max_retries + 1` times, and one reservation per request would let three paid calls pass a single
-        check. The check and the record happen inside the ledger's lock, so a server and a CLI racing on
-        the same data directory cannot both be admitted against the same money.
+        Reserving per attempt, not per request: `run_review` may invoke the reviewer up to
+        `max_retries + 1` times, and a single reservation would let three paid calls pass one check.
         """
-        admitted, reason = self.ledger.admit(
-            self.projected_cost(request), kind="reserve",
-            max_calls=self.reviews.max_model_calls, max_spend=self.reviews.budget_usd)
         with self._lock:
-            self._calls = self.ledger.calls
-            self._spend_usd = self.ledger.spend_usd
-        if not admitted:
-            raise BudgetExceeded(reason)
+            if self._calls >= self.reviews.max_model_calls:
+                raise BudgetExceeded(f"model call budget exhausted ({self.reviews.max_model_calls} calls)")
+            if self.reviews.budget_usd:
+                projected = self._spend_usd + self.projected_cost(request)
+                if projected > self.reviews.budget_usd:
+                    raise BudgetExceeded(
+                        f"this call could cost up to ${self.projected_cost(request):.4f} and would take the "
+                        f"total to ${projected:.4f}, over budget_usd=${self.reviews.budget_usd:.2f}")
+            self._calls += 1
 
     def _charge(self, result: ReviewResult) -> None:
-        """Record what an admitted attempt actually cost, so the ceiling is measured against reality."""
-        self.ledger.reconcile(0.0, kind="settle",
-                              input_tokens=result.usage.input_tokens,
-                              output_tokens=result.usage.output_tokens)
         with self._lock:
-            self._tokens_in = self.ledger.input_tokens
-            self._tokens_out = self.ledger.output_tokens
+            self._tokens_in += result.usage.input_tokens
+            self._tokens_out += result.usage.output_tokens
+            tokens = result.usage.input_tokens + result.usage.output_tokens
+            self._spend_usd += tokens / 1_000_000 * USD_PER_MILLION_TOKENS
 
     def reset_usage(self) -> None:
         with self._lock:
@@ -170,8 +176,7 @@ class ReviewService:
                               auth=review.auth, timeout_s=review.timeout_s, max_parallel=review.max_parallel,
                               max_retries=review.max_retries, max_model_calls=review.max_model_calls,
                               budget_usd=review.budget_usd, snapshot_dir=review.snapshot_dir,
-                              scratch_home=review.scratch_home, sandbox=tuple(review.sandbox),
-                              api_key_env=review.api_key_env, live=review.live)
+                              scratch_home=review.scratch_home, sandbox=tuple(review.sandbox), live=review.live)
 
     def capabilities(self) -> dict[str, Any]:
         return probe_capabilities(self.settings())
@@ -198,15 +203,11 @@ class ReviewService:
         if clipped != request.context:
             request = ReviewRequest(**{**request.__dict__, "context": clipped})
         request = request.with_id()
-        # The lease has to outlive the whole retry window, or a redelivery arriving while the original
-        # attempt is still running sees a stale claim, starts a second paid review, and deduplication
-        # quietly stops deduplicating.
-        ttl = self.reviews.timeout_s * (self.reviews.max_retries + 1) + 60.0
         claim = self.root / "claims" / f"{request.review_id}.claim"
         # The lock covers the in-process race; the claim file covers two processes (a server and the CLI).
         # Either alone would still let a duplicate through.
         with self._id_lock(request.review_id):
-            if atomic_claim(claim, f"pid-{id(self)}", ttl) is None:
+            if atomic_claim(claim, f"pid-{id(self)}", TTL_S) is None:
                 return ReviewResult.failure(request, RunnerStatus.RUNNER_ERROR,
                                            "another worker is already reviewing this request; "
                                            "re-issue once it finishes")
@@ -301,15 +302,18 @@ class AutoService:
 
     def __init__(self, config: Config, *, reviewer: Reviewer | None = None, reviewer_factory: Any = None,
                  root: Path | None = None, collector: EvidenceCollector | None = None):
+        self.audit = AuditLog(config.data_path / "audit.jsonl")
         self.config = config
         self.auto: AutoConfig = config.auto
         self.root = root or (config.data_path / "auto")
         self.reviews = ReviewService(self.auto, self.root, reviewer=reviewer, reviewer_factory=reviewer_factory)
-        self.evidence = EvidenceStore(self.root / "evidence", max_artifact_bytes=self.auto.evidence.max_bundle_bytes)
-        self.audit = AuditLog(config.data_path / "audit.jsonl")
-        self._collector: EvidenceCollector | None = collector
+        self.evidence = EvidenceStore(self.root / "evidence",
+                                      max_artifact_bytes=self.auto.evidence.max_bundle_bytes)
+        self._collector = collector
+        self._preflight: Preflight | None = None
         self._verifier: Verifier | None = None
-        #: Bound by `Core` right after construction: the Verifier needs a Core, and Core builds this service.
+        #: Bound by `Core` right after construction. The Verifier needs a Core, and Core builds this
+        #: service, so the link is made explicitly by the owner rather than passed in and defaulted.
         self.core: Any = None
 
     @property
@@ -320,14 +324,22 @@ class AutoService:
     def autonomous(self) -> bool:
         return self.enabled and self.auto.decision.autonomous
 
+    def guard_enabled(self) -> None:
+        if not self.enabled:
+            raise OpsError("autonomous pipeline is disabled: set auto.enabled=true in the config")
+
     # -- evidence ---------------------------------------------------------------------------------
     def collector(self, *, allowed: Sequence[str], change_id: str = "") -> EvidenceCollector:
-        """A collector bound to an explicit capability allowlist; nothing else may be collected."""
+        """The collector is created with an explicit capability allowlist and nothing else.
+
+        A collector without a list of permitted probes would let any capability the service can reach end
+        up inside a bundle, so it is never defaulted: the caller has to say what may be collected.
+        """
         if not allowed:
             raise OpsError("evidence collection needs an explicit list of allowed capabilities")
         if self._collector is None:
             return EvidenceCollector(self.evidence, self.auto.evidence, allowed=allowed, change_id=change_id)
-        # An injected collector is a test double. Rebound to this request rather than returned as it was
+        # An injected collector is a test double. Rebind it to this request rather than returning it as
         # configured earlier, so the per-call allowlist and change binding cannot be quietly bypassed.
         self._collector.allowed = frozenset(allowed)
         self._collector.change_id = change_id
@@ -353,17 +365,33 @@ class AutoService:
     def evidence_list(self, limit: int = 20) -> Records:
         return self.evidence.list(limit)
 
-    def evidence_overview(self) -> dict[str, Any]:
-        bundles = self.evidence.list(1000)
-        return {"bundles": len(bundles), "fresh_window_s": self.auto.evidence.max_age_s,
-                "max_bundle_bytes": self.auto.evidence.max_bundle_bytes,
-                "require_inventory_hash": self.auto.evidence.require_inventory_hash,
-                "require_target_identity": self.auto.evidence.require_target_identity,
-                "recent": bundles[:5]}
+    # -- preflight --------------------------------------------------------------------------------
+    def preflight(self) -> Preflight:
+        if self._preflight is None:
+            self._preflight = Preflight(self.auto, self.reviews, self.root)
+        return self._preflight
+
+    def review_plan(self, plan: ChangePlan, *, evidence: str = "") -> dict[str, Any]:
+        """Review a plan before anything changes, and answer with the outcome, not a boolean.
+
+        `evidence` is a bundle id; when given, its redacted render travels with the plan so the reviewer
+        judges the plan against the observations it claims to rest on rather than against its own summary.
+        """
+        self.guard_enabled()
+        bundle = self.evidence.get(evidence) if evidence else None
+        result: PreflightResult = self.preflight().run(plan, bundle)
+        self.audit.record(event="preflight", plan=plan.id, outcome=result.outcome.value,
+                          approvable=result.approvable, reason=result.reason, review=result.review_id)
+        return result.to_dict()
+
+    def preflight_list(self, limit: int = 20) -> Records:
+        return self.preflight().list(limit)
+
+    def plan_summary(self, document: dict[str, Any]) -> dict[str, Any]:
+        return ChangePlan.from_dict(document).summary()
 
     # -- verification -----------------------------------------------------------------------------
     def verifier(self) -> Verifier:
-        """The Verifier needs a Core, and Core builds this service, so the link is made by the owner."""
         if self._verifier is None:
             if self.core is None:
                 raise OpsError("verification needs a Core; build OpsBrain, not AutoService alone")
@@ -385,17 +413,22 @@ class AutoService:
     def verify_overview(self) -> dict[str, Any]:
         if self.core is None:
             return {"bound": False}
+        verifier = self.verifier()
         return {
             "bound": True,
             "observation_s": self.auto.verify.observation_s,
             "require_observation": self.auto.verify.require_observation,
             "allow_state_changing_checks": self.auto.verify.allow_state_changing_checks,
-            "available": list(self.verifier().available()),
+            "available": list(verifier.available()),
         }
 
-    def guard_enabled(self) -> None:
-        if not self.enabled:
-            raise OpsError("autonomous pipeline is disabled: set auto.enabled=true in the config")
+    def evidence_overview(self) -> dict[str, Any]:
+        bundles = self.evidence.list(1000)
+        return {"bundles": len(bundles), "fresh_window_s": self.auto.evidence.max_age_s,
+                "max_bundle_bytes": self.auto.evidence.max_bundle_bytes,
+                "require_inventory_hash": self.auto.evidence.require_inventory_hash,
+                "require_target_identity": self.auto.evidence.require_target_identity,
+                "recent": bundles[:5]}
 
     def overview(self) -> dict[str, Any]:
         return {
@@ -410,4 +443,7 @@ class AutoService:
             "auth": self.auto.review.auth,
             "budget": self.reviews.usage(),
             "reviews": len(self.reviews.list(1000)),
+            "evidence": self.evidence_overview(),
+            "verify": self.verify_overview(),
+            "preflights": len(self.preflight().list(1000)),
         }
