@@ -143,10 +143,22 @@ class ChangeStore:
 
         Persisted rather than set in memory, because `consume` re-reads the change: an approval attached
         to an object that is never written down is an approval the gate will not see.
+
+        Under the same transition lock as `approve`, `discard` and `consume`, with the whole read-modify-
+        write inside it. Without it a redelivered issuance could read `pending`, wait for a `consume` to
+        write `applied`, and then write its own stale copy back - putting `pending` and an approval on a
+        change that had already run, which is a second run waiting to happen. Attaching to a change that
+        is no longer open is refused rather than resurrecting it.
         """
-        change = self.get(change_id)
-        change.engine_approval = approval_id
-        self._save(change)
+        with self._transition(change_id):
+            change = self.get(change_id)
+            if change.state not in (PENDING, APPROVED):
+                raise OpsError(f"change {change_id} is already {change.state}; an approval attached to it "
+                               f"would authorise a second run")
+            if change.expired:
+                raise OpsError(f"change {change_id} has expired; plan again")
+            change.engine_approval = approval_id
+            self._save(change)
         return change
 
     # `Sequence`, not `list`: inside this class body the bare name `list` is `ChangeStore.list`, so a

@@ -133,6 +133,10 @@ class DecisionConfig(_Model):
     max_spend_usd: float = Field(default=0.0, ge=0, le=10_000)
     allow_destructive: bool = False  # autonomous execution of a destroying change stays off by default
     emergency_stop: bool = False  # one switch that blocks every autonomous decision
+    #: How many successful, agreeing reviews a change must actually have before the engine may approve it.
+    #: Counted, not inferred: a profile that asks for a second review and gets none must block, because
+    #: "the second field was empty" and "the second review passed" are different facts.
+    required_reviews: int = Field(default=1, ge=1, le=5)
     policy_version: str = "v1"
     default_profile: str = "general"
 

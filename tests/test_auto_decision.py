@@ -38,7 +38,7 @@ def inputs(**overrides: Any) -> Inputs:
         "preflight_approvable": True, "evidence_reason": EvidenceReason.EVIDENCE_FRESH.value,
         "evidence_ids": ("ev-aaaaaaaabbbbbbbb",), "review_verdict": "PASS", "review_status": "OK",
         "policy_allows": True, "target_in_scope": True, "verification": report(CheckStatus.PASS),
-        "policy_version": "v1",
+        "policy_version": "v1", "reviews_passed": 1,
     }
     return Inputs(**{**base, **overrides})
 
@@ -290,14 +290,14 @@ def test_an_approval_is_issued_only_for_an_approval(tmp_path: Any) -> None:
     change = changes.create("tofu.apply", "proxmox", "x", "ph-1")
     binding = bound_for(change)
     # issued from an autonomous decision: a human-approved one in manual mode also qualifies
-    assert issuing.issue("pl-1", "ah-1", binding, record=decide_for(change))
+    assert issue_for(issuing, change, binding)
     blocked_dir = tmp_path / "blocked"
     blocked_dir.mkdir()
     blocked_engine = ApprovalEngine(AutoConfig(enabled=True, autonomy_token=TOKEN), ApprovalStore(blocked_dir))
     blocked_engine.install(ChangeStore(tmp_path / "blocked-changes", 3600))
     blocked = decide(verification=report(CheckStatus.FAIL))
     with pytest.raises(OpsError, match="refusing to issue"):
-        blocked_engine.issue("pl-1", "ah-1", binding, record=blocked)
+        blocked_engine.issue(change.id, "", binding, record=blocked)
     assert not list(blocked_dir.glob("ap-*.json")), "a refused decision leaves nothing to spend"
 
 
@@ -356,6 +356,21 @@ def test_a_hand_approval_does_not_open_the_autonomous_path(ops, tmp_path) -> Non
         ops.changes.consume(change.id, "tofu.apply", "proxmox", needs_approval=True)
 
 
+def issue_for(engine: ApprovalEngine, change: Any, binding: Any, *, record: Any = None,
+              by: ApprovalEngine | None = None) -> str:
+    """`issue` called the way the service calls it, from the change's own facts.
+
+    `issue(plan_id, arguments_hash, ...)` takes the two values the decision was made about. Writing the
+    call by hand in every test meant the arguments hash drifted from the one `decide_for` computed, and the
+    new binding checks caught it - which is what they are for.
+    """
+    from opsbrain.changes import digest
+
+    arguments = digest({k: v for k, v in sorted(change.args.items())}) if change.args else ""
+    return engine.issue(change.id, arguments, binding,
+                        record=record if record is not None else decide_for(change, by=by))
+
+
 def bound_for(change: Any, evidence_ids: Sequence[str] = ("ev-aaaaaaaabbbbbbbb",), **overrides: Any) -> Any:
     """A binding that actually matches the change it authorises.
 
@@ -383,7 +398,7 @@ def test_an_engine_approval_opens_it(ops, tmp_path) -> None:  # type: ignore[no-
     ops, engine = _autonomous_ops(ops, tmp_path)
     change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1",
                                 args={"plan_file": ".opsbrain/j-1234abcd.tfplan"})
-    approval = engine.issue(change.id, change.hash, bound_for(change), record=decide_for(change))
+    approval = issue_for(engine, change, bound_for(change))
     ops.changes.attach_approval(change.id, approval)
     assert ops.changes.consume(change.id, "tofu.apply", "proxmox", needs_approval=True).state == "applied"
 
@@ -400,7 +415,7 @@ def test_a_binding_that_names_neither_the_arguments_nor_the_evidence_is_refused(
                                 args={"plan_file": ".opsbrain/j-1234abcd.tfplan"})
     lazy = bound_for(change, arguments_hash="", evidence_ids=())
     with pytest.raises(OpsError, match="refusing to issue"):
-        engine.issue(change.id, change.hash, lazy, record=decide_for(change))
+        issue_for(engine, change, lazy)
     assert not change.engine_approval, "nothing was attached, so nothing can be executed under it"
 
 
@@ -409,8 +424,7 @@ def test_an_approval_stops_covering_a_change_whose_arguments_moved(ops, tmp_path
     ops, engine = _autonomous_ops(ops, tmp_path)
     change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1",
                                 args={"plan_file": ".opsbrain/j-1234abcd.tfplan"})
-    ops.changes.attach_approval(change.id, engine.issue(change.id, change.hash, bound_for(change),
-                                                        record=decide_for(change)))
+    ops.changes.attach_approval(change.id, issue_for(engine, change, bound_for(change)))
     ops.changes.update_args(change.id, {"plan_file": ".opsbrain/j-deadbeef.tfplan"})
     with pytest.raises(OpsError, match="STALE"):
         ops.changes.consume(change.id, "tofu.apply", "proxmox", needs_approval=True)
@@ -420,7 +434,7 @@ def test_a_revoked_approval_does_not_open_the_gate(ops, tmp_path) -> None:  # ty
     """`get()` returns a revoked approval perfectly happily. The gate has to notice."""
     ops, engine = _autonomous_ops(ops, tmp_path)
     change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1")
-    approval = engine.issue(change.id, change.hash, bound_for(change), record=decide_for(change))
+    approval = issue_for(engine, change, bound_for(change))
     ops.changes.attach_approval(change.id, approval)
     assert engine.approvals is not None
     engine.approvals.revoke(approval)
@@ -432,7 +446,7 @@ def test_a_spent_approval_does_not_open_a_second_run(ops, tmp_path) -> None:  # 
     """A lease is spent once. The gate must not treat a CONSUMED approval as authority again."""
     ops, engine = _autonomous_ops(ops, tmp_path)
     change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1")
-    approval = engine.issue(change.id, change.hash, bound_for(change), record=decide_for(change))
+    approval = issue_for(engine, change, bound_for(change))
     assert engine.approvals is not None
     from opsbrain.changes import digest
 
@@ -452,8 +466,11 @@ def test_an_approval_issued_for_another_change_is_refused(ops, tmp_path) -> None
     mine = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1")
     theirs = ops.changes.create("tofu.apply", "prod", "y", "ph-2")
     binding = bound_for(theirs)
-    ops.changes.attach_approval(mine.id, engine.issue(mine.id, mine.hash, binding,
-                                                      record=decide_for(theirs)))
+    from opsbrain.changes import digest as _digest
+
+    ops.changes.attach_approval(mine.id, engine.issue(
+        theirs.id, _digest({k: v for k, v in sorted(theirs.args.items())}) if theirs.args else "",
+        binding, record=decide_for(theirs)))
     with pytest.raises(OpsError, match="was issued for"):
         ops.changes.consume(mine.id, "tofu.apply", "proxmox", needs_approval=True)
 
@@ -463,7 +480,7 @@ def test_a_stale_approval_no_longer_opens_the_gate(ops, tmp_path) -> None:  # ty
     ops, engine = _autonomous_ops(ops, tmp_path)
     change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1")
     binding = bound_for(change, plan_hash="ph-original")
-    ops.changes.attach_approval(change.id, engine.issue(change.id, change.hash, binding, record=decide_for(change)))
+    ops.changes.attach_approval(change.id, issue_for(engine, change, binding))
     ops.changes.update_hash(change.id, "ph-swapped")  # the plan was replaced after the decision
     with pytest.raises(OpsError, match="STALE"):
         ops.changes.consume(change.id, "tofu.apply", "proxmox", needs_approval=True)
@@ -483,7 +500,7 @@ def test_an_engine_that_was_never_installed_refuses_to_issue(tmp_path: Any) -> N
     change = changes.create("tofu.apply", "proxmox", "x", "ph-1")
     engine = ApprovalEngine(AutoConfig(enabled=True, autonomy_token=TOKEN), ApprovalStore(tmp_path))
     with pytest.raises(OpsError, match="not installed"):
-        engine.issue(change.id, change.hash, bound_for(change), record=decide_for(change))
+        issue_for(engine, change, bound_for(change))
 
 
 def test_manual_mode_leaves_the_human_path_working(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -599,7 +616,7 @@ def test_an_engine_approved_apply_does_not_stop_to_ask_a_human(ops, tmp_path) ->
     change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1",
                                 args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
                                 details={"plan_sha256": "ab" * 32})
-    approval = engine.issue(change.id, change.hash, bound_for(change), record=decide_for(change, by=engine))
+    approval = issue_for(engine, change, bound_for(change))
     ops.changes.attach_approval(change.id, approval)
     ops.exec.on(r"tofu apply", "@@OPSBRAIN-PLAN-MISMATCH " + "ab" * 32 + "@@\n", rc=78)
     out = ops.tofu_apply(change.id)
@@ -612,7 +629,7 @@ def test_an_engine_approved_destructive_change_applies_without_a_human_flag(ops,
     change = ops.changes.create("tofu.apply", "proxmox", "destroy", "ph-1", dangerous=True,
                                 args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
                                 details={"plan_sha256": "ab" * 32})
-    approval = engine.issue(change.id, change.hash, bound_for(change),
+    approval = issue_for(engine, change, bound_for(change),
                             record=decide_for(change, by=engine, destructive=True))
     ops.changes.attach_approval(change.id, approval)
     ops.exec.on(r"tofu apply", "@@OPSBRAIN-PLAN-MISMATCH " + "ab" * 32 + "@@\n", rc=78)
@@ -706,3 +723,72 @@ def test_a_change_with_no_reviewed_plan_cannot_be_decided(ops, tmp_path) -> None
     change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1")
     with pytest.raises(OpsError, match="no preflight record"):
         ops.auto.decide_change(change.id, "pl-nonexistent")
+
+
+# ------------------------------------------------------------------ the new refusals, tested on their own
+def test_attaching_an_approval_to_a_spent_change_is_refused(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Attachment used to rewrite the whole change without the transition lock.
+
+    A redelivered issuance could read `pending`, wait for a `consume` to write `applied`, then write its
+    own stale copy back - putting `pending` and a live approval on a change that had already run.
+    """
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1")
+    ops.changes.attach_approval(change.id, "ap-0000000000000000")
+    ops.changes.consume(change.id, "tofu.apply", "proxmox", needs_approval=False)
+    with pytest.raises(OpsError, match="already applied"):
+        ops.changes.attach_approval(change.id, "ap-1111111111111111")
+    assert ops.changes.get(change.id).engine_approval == "ap-0000000000000000", "the first one stands"
+
+
+def test_a_decision_that_names_no_change_cannot_authorise_anything(tmp_path: Any) -> None:
+    """`change_id` defaults to empty, so a guard that skips empty values compares nothing at all."""
+    from opsbrain.auto.approval import ApprovalStore
+    from opsbrain.changes import ChangeStore
+
+    changes = ChangeStore(tmp_path / "changes", 3600)
+    engine = ApprovalEngine(AutoConfig(enabled=True, autonomy_token=TOKEN), ApprovalStore(tmp_path))
+    engine.install(changes)
+    change = changes.create("tofu.apply", "proxmox", "x", "ph-1")
+    nameless = decide_for(change)
+    stripped = DecisionRecord(**{**{field: getattr(nameless, field)
+                                      for field in DecisionRecord.__dataclass_fields__},
+                                 "change_id": ""})
+    with pytest.raises(OpsError, match="does not name the change"):
+        engine.issue(change.id, "", bound_for(change), record=stripped)
+
+
+def test_an_approve_for_one_plan_cannot_issue_a_binding_for_another(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    _ops, engine = _autonomous_ops(ops, tmp_path)
+    first = ops.changes.create("tofu.apply", "proxmox", "a", "ph-1")
+    second = ops.changes.create("tofu.apply", "prod", "b", "ph-2")
+    record = decide_for(first)
+    with pytest.raises(OpsError, match="authorises"):
+        issue_for(engine, second, bound_for(second), record=record)
+    # The change matches, so only the plan id can catch it now: an APPROVE for plan A replayed as plan B.
+    with pytest.raises(OpsError, match="names plan"):
+        engine.issue("pl-someother", "", bound_for(first), record=record)
+
+
+def test_a_profile_that_asks_for_two_reviews_blocks_on_one() -> None:
+    """A missing review is not a passing one.
+
+    The secondary branch only ran when the secondary status was populated, so a profile demanding two
+    reviews whose second was never invoked got through on the strength of the first.
+    """
+    strict = engine(required_reviews=2)
+    one = strict.decide(inputs(reviews_passed=1), "pl-1", "ah-1", review_ids=("rv-0000abcd",))
+    assert one.decision is Decision.BLOCKED_AUTONOMOUSLY
+    assert one.reason is Reason.REVIEW_MISSING
+    assert "1 review(s) completed, 2 required" in one.detail
+    two = strict.decide(inputs(reviews_passed=2), "pl-1", "ah-1",
+                        review_ids=("rv-0000abcd", "rv-0000dcba"))
+    assert two.decision is Decision.APPROVE
+
+
+def test_an_unreported_review_count_blocks_when_the_profile_requires_more() -> None:
+    """`reviews_passed` defaults to 0, so a caller that never counted reports none - and is refused."""
+    strict = engine(required_reviews=2)
+    record = strict.decide(inputs(reviews_passed=0), "pl-1", "ah-1", review_ids=("rv-0000abcd",))
+    assert record.decision is Decision.BLOCKED_AUTONOMOUSLY
+    assert "required" in record.detail

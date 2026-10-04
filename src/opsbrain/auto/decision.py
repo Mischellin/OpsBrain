@@ -91,6 +91,10 @@ class Inputs:
     review_status: str = ""
     secondary_review_verdict: str = ""
     secondary_review_status: str = ""
+    #: How many reviews actually ran and returned OK, counted by the caller that ran them. The engine
+    #: compares this with `required_reviews` rather than inferring the number from which fields happen to
+    #: be populated: an unmapped second review and a second review that passed look identical otherwise.
+    reviews_passed: int = 0
     #: Both are tri-state for the same reason. Defaulting them to `True` meant a caller who forgot to run
     #: or map the policy lookup got an affirmative policy decision it never made.
     policy_allows: bool | None = None
@@ -363,6 +367,17 @@ class ApprovalEngine:
         if inputs.review_verdict != "PASS":
             return (Decision.BLOCKED_AUTONOMOUSLY, Reason.REVIEW_MISSING,
                     f"the reviewer answered {inputs.review_verdict or 'nothing'}", "revise the plan")
+        # Every other branch above ends in a refusal, so reaching here means the primary review passed and
+        # the secondary one is either absent or in agreement. Count what actually ran and compare with what
+        # the profile demands. A profile that requires two reviews and got one blocks, rather than
+        # treating the empty second field as a review that happened to pass.
+        required = self.config.decision.required_reviews
+        passed = max(1, inputs.reviews_passed) if not inputs.secondary_review_status else inputs.reviews_passed
+        if passed < required:
+            return (Decision.BLOCKED_AUTONOMOUSLY, Reason.REVIEW_MISSING,
+                    f"{passed} review(s) completed, {required} required: the reviews that were asked for "
+                    f"did not happen, and a missing review is not a passing one",
+                    f"run {required} reviews and decide again")
 
         # ---- the plan itself
         if inputs.preflight_outcome is None:
@@ -443,10 +458,23 @@ class ApprovalEngine:
         # ignoring `plan_id`/`arguments_hash` let an APPROVE produced for one plan authorise an arbitrary
         # binding for another change - the record said yes to something, and the approval said yes to
         # whatever the caller handed over.
-        if record.change_id and binding.change_id != record.change_id:
+        #
+        # Every one of these is required, not skipped when absent. `change_id` defaults to empty, so
+        # `if record.change_id and ...` compared nothing at all for a record that did not name its change -
+        # and that is exactly the record an APPROVE for plan A becomes when it is replayed against plan B.
+        if not record.change_id:
+            raise OpsError("refusing to issue: the decision does not name the change it was made about, "
+                           "so nothing ties this approval to anything")
+        if binding.change_id != record.change_id:
             raise OpsError(f"refusing to issue: the binding authorises {binding.change_id!r} but the "
                            f"decision was made about {record.change_id!r}")
-        if record.arguments_hash and binding.arguments_hash != record.arguments_hash:
+        if not record.plan_id:
+            raise OpsError("refusing to issue: the decision does not name the plan it was made about, "
+                           "so nothing ties this approval to anything")
+        if plan_id != record.plan_id:
+            raise OpsError(f"refusing to issue: issuance names plan {plan_id!r} but the decision was "
+                           f"made about {record.plan_id!r}")
+        if arguments_hash != record.arguments_hash:
             raise OpsError(f"refusing to issue: the binding carries arguments {binding.arguments_hash!r} "
                            f"but the decision was about {record.arguments_hash!r}")
         if binding.policy_version != record.policy_version:
