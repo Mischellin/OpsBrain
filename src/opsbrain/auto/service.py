@@ -34,7 +34,6 @@ from .review import (
 )
 from .runners import CodexReviewer, FakeReviewer, RunnerSettings, probe_capabilities, run_review
 from .store import RecordStore, atomic_claim, release_claim
-from .verify import Target, VerificationReport, Verifier
 
 if TYPE_CHECKING:  # `config` imports this package; keep the edge one-directional
     from ..config import Config
@@ -308,9 +307,6 @@ class AutoService:
         self.evidence = EvidenceStore(self.root / "evidence", max_artifact_bytes=self.auto.evidence.max_bundle_bytes)
         self.audit = AuditLog(config.data_path / "audit.jsonl")
         self._collector: EvidenceCollector | None = collector
-        self._verifier: Verifier | None = None
-        #: Bound by `Core` right after construction: the Verifier needs a Core, and Core builds this service.
-        self.core: Any = None
 
     @property
     def enabled(self) -> bool:
@@ -327,8 +323,6 @@ class AutoService:
             raise OpsError("evidence collection needs an explicit list of allowed capabilities")
         if self._collector is None:
             return EvidenceCollector(self.evidence, self.auto.evidence, allowed=allowed, change_id=change_id)
-        # An injected collector is a test double. Rebound to this request rather than returned as it was
-        # configured earlier, so the per-call allowlist and change binding cannot be quietly bypassed.
         self._collector.allowed = frozenset(allowed)
         self._collector.change_id = change_id
         return self._collector
@@ -360,38 +354,6 @@ class AutoService:
                 "require_inventory_hash": self.auto.evidence.require_inventory_hash,
                 "require_target_identity": self.auto.evidence.require_target_identity,
                 "recent": bundles[:5]}
-
-    # -- verification -----------------------------------------------------------------------------
-    def verifier(self) -> Verifier:
-        """The Verifier needs a Core, and Core builds this service, so the link is made by the owner."""
-        if self._verifier is None:
-            if self.core is None:
-                raise OpsError("verification needs a Core; build OpsBrain, not AutoService alone")
-            self._verifier = Verifier(self.auto, self.core)
-        return self._verifier
-
-    def verification_checks(self) -> Records:
-        """What verification can currently demand, with each check's own statement of its purpose."""
-        return self.verifier().describe()
-
-    def verify_change(self, change_id: str, targets: Sequence[Target], **kwargs: Any) -> dict[str, Any]:
-        """Run the post-change checks for one change and answer with the report, not with a boolean."""
-        self.guard_enabled()
-        report: VerificationReport = self.verifier().verify(change_id, targets, **kwargs)
-        self.audit.record(event="verified", change=change_id, status=report.status.value,
-                          checks=len(report.results), observation_s=round(report.observation_s, 3))
-        return report.brief()
-
-    def verify_overview(self) -> dict[str, Any]:
-        if self.core is None:
-            return {"bound": False}
-        return {
-            "bound": True,
-            "observation_s": self.auto.verify.observation_s,
-            "require_observation": self.auto.verify.require_observation,
-            "allow_state_changing_checks": self.auto.verify.allow_state_changing_checks,
-            "available": list(self.verifier().available()),
-        }
 
     def guard_enabled(self) -> None:
         if not self.enabled:
