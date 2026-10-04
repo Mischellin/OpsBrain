@@ -133,3 +133,74 @@ for a clipped one, silently skipping whatever the wider window would have added.
 Two requests for the same id cannot both reach the reviewer: an in-process lock per id covers one server,
 and an atomic claim file covers a second process. The loser is told to re-issue rather than being charged
 for a duplicate.
+
+## Scopes: what a profile authorises
+
+A profile is what stops "the plan was reviewed" from meaning "anything may now run". It is keyed on the
+plan's `profile` and says, in advance, what that class of work is allowed to touch:
+
+| field | what it requires of the plan |
+|---|---|
+| `classification` | `low` / `medium` / `high`; the bucket the other requirements are drawn from |
+| `allowed_capabilities` | the operations this class may use at all |
+| `allowed_targets` | the targets it may use them on; an empty list means no target is covered |
+| `require_evidence` | evidence a plan of this class must cite |
+| `require_preconditions` | preconditions it must state |
+| `require_verification` | checks it must authorise, by the verifier's own check names |
+| `extra_reviews` | how many independent review sessions this class needs |
+| `recovery_actions` | what the bounded recovery loop may try when an attempt fails |
+| `irreversible` | whether work in this class may be accepted as unrecoverable |
+
+Two things follow from this that are easy to get wrong. A capability or target a profile does not name is
+not "allowed by default" — it is not covered, and the engine blocks on it. And `extra_reviews` is counted,
+not inferred: until that many reviews have actually run, the decision blocks rather than proceeding on
+however many happened to be present.
+
+`decision.default_profile` must name a profile that exists, or the configuration is rejected at load time
+rather than at the first decision.
+
+## Emergency stop
+
+One switch blocks **every** autonomous decision:
+
+```yaml
+auto:
+  decision:
+    mode: autonomous
+    emergency_stop: true
+```
+
+In the engine it is checked before any of the review, evidence, plan or verification work, so a stop
+applies to work already mid-loop and not merely to work about to start, whatever the inputs look like. It
+is *not* the very first check: an unrecognised `mode`, a mode that differs from the configured one, and a
+policy `deny` are settled before it, because those are answers in their own right - a forbidden change is
+`DENY` whether or not the emergency stop is set. The reasons it emits are `emergency_stop` and
+`autonomy_off`; both are terminal, and neither ever turns into a retry.
+
+The neighbouring switches are deliberately narrower:
+
+- `autonomy_token` — presence is required for autonomous mode at all. It is read from the operator's
+  configuration and never from a model's output, so a model cannot grant itself the ability to decide.
+- `allow_destructive` — off by default. Without it, a change that destroys or replaces resources stays with
+  a person, whatever the rest of the decision says.
+- `mode: manual` — the operator's escape hatch. The engine is installed in front of the change store
+  regardless, but in manual mode it does not decide, and the human path works exactly as it always did.
+
+Turning the whole subsystem off is `auto.enabled: false`. Every other setting is inert in that case,
+including the emergency stop, which then has nothing to stop.
+
+## What is actually verified, and on what
+
+Honest accounting, because the difference matters more than the list of features:
+
+| | status |
+|---|---|
+| The review, decision, evidence and verification pipeline | covered by the offline suite: `pytest` runs it end to end with the deterministic `fake` runner, no token, no network |
+| Ruff and `mypy --strict` | green on every PR |
+| Live review against the real `codex` runner | **not run in CI and not run here.** `OPSBRAIN_LIVE_REVIEW` is opt-in and needs a real token |
+| Live OpenTofu / Ansible / kubectl against real infrastructure | **not run.** No live check was performed in this work, and none is claimed |
+| The stub guard | a plan judged by the default `fake` runner comes back `REVIEW_FAILED`, so no verdict can be manufactured offline |
+
+So the "no human `yes`" path is demonstrated in tests and by construction, not against a live cluster. The
+first thing to do before trusting it on real infrastructure is a live review smoke test with a real runner,
+and then one deliberately-refused change to confirm the refusals are refusals and not slow approvals.
