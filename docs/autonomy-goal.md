@@ -18,9 +18,9 @@ Epic: [#3](https://github.com/Mischellin/OpsBrain/issues/3). База — [#2](h
 | 5 | OPS-AUTO-02 — Evidence Bundle | `auto/evidence.py` | [#16](https://github.com/Mischellin/OpsBrain/pull/16) | 228 тестов, 2 круга замечаний закрыто |
 | 8 | OPS-AUTO-07 — проверка фактического состояния | `auto/verify.py` | [#17](https://github.com/Mischellin/OpsBrain/pull/17) | 246 тестов, 4 круга замечаний закрыто |
 | 6 | OPS-AUTO-03 — preflight плана | `auto/plan.py`, `auto/preflight.py` | [#18](https://github.com/Mischellin/OpsBrain/pull/18) | 343 теста, 4 круга замечаний закрыто |
-| 14 | OPS-AUTO-05 — STALE approval, optimistic locking, single-use lease | `auto/approval.py` | [#19](https://github.com/Mischellin/OpsBrain/pull/19) | 384 теста, 14 находок Codex закрыто |
-| — | три P1 из v1 (P1-фиксы базы) | `redact.py`, `readers.py`, `changes.py`, `operators.py` | [#20](https://github.com/Mischellin/OpsBrain/pull/20) | 399 тестов, 5 находок Codex закрыто |
-| 7 | OPS-AUTO-04 — ApprovalEngine | `auto/decision.py` | [#21](https://github.com/Mischellin/OpsBrain/pull/21) | 472 теста, 26 находок Codex закрыто |
+| 14 | OPS-AUTO-05 — STALE approval, optimistic locking, single-use lease | `auto/approval.py` | [#19](https://github.com/Mischellin/OpsBrain/pull/19) | 389 тестов, 18 находок Codex закрыто |
+| — | три P1 из v1 (P1-фиксы базы) | `redact.py`, `readers.py`, `changes.py`, `operators.py` | [#20](https://github.com/Mischellin/OpsBrain/pull/20) | 404 теста, 5 находок Codex закрыто |
+| 7 | OPS-AUTO-04 — ApprovalEngine | `auto/decision.py` | [#21](https://github.com/Mischellin/OpsBrain/pull/21) | 480 тестов, 30 находок Codex закрыто |
 | 9 | OPS-AUTO-10 — policy profiles | `auto/profiles.py` | — | не начато |
 | 10 | OPS-AUTO-08 — Codex postflight | `auto/postflight.py` | — | не начато |
 | 11 | OPS-AUTO-06 — canary rollout | `auto/rollout.py` | — | не начато |
