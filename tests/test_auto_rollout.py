@@ -119,12 +119,20 @@ def test_an_ineligible_host_is_refused_with_the_reason_it_was_given() -> None:
 
 
 # ------------------------------------------------------------------ which changes may be staged at all
-def test_an_opentofu_plan_is_not_stageable_and_says_why() -> None:
-    """`-target` does not make an apply gradual; it makes it decide less."""
+def test_an_opentofu_rollout_advances_saved_plans_and_never_a_target() -> None:
+    """`-target` does not make an apply gradual; it makes it decide less.
+
+    Staging OpenTofu is legitimate, and the way to do it is a sequence of independently saved plans, each
+    applied whole - each planned, reviewed and verified on its own. What the refusal has to catch is the
+    shortcut, because a `-target` rollout looks identical from the outside and silently skips validating
+    the part of the graph it did not select.
+    """
+    assert stageable("tofu.apply", strategy="saved_plans") == ""
     reason = stageable("tofu.apply", strategy="-target=web-1")
-    assert "not stageable" in reason
     assert "-target" in reason, "the refusal names the thing that would have been tempting"
-    assert stageable("tofu.apply", strategy="apply") != ""
+    assert "decides strictly less" in reason, reason
+    assert stageable("tofu.apply", strategy="apply") != "", "and anything else is refused too"
+    assert stageable("tofu.apply") != "", "including no strategy at all"
 
 
 def test_ansible_advances_host_groups_and_nothing_else() -> None:

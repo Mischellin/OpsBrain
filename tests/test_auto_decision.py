@@ -332,8 +332,9 @@ def _autonomous_ops(ops: Any, tmp_path: Any, **decision: Any) -> tuple[Any, Appr
     # rebuilding the config silently dropped them, which is how a scope test could pass a gate that
     # never had a profile to refuse it.
     auto = type(existing)(enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
-                          decision={"mode": "autonomous",
-                                    "default_profile": existing.decision.default_profile, **decision},
+                          verify=existing.verify, decision={"mode": "autonomous",
+                                                            "default_profile": existing.decision.default_profile,
+                                                            **decision},
                           profiles=list(existing.profiles))
     # `Config` is frozen too, so the pipeline is switched on by building a new one rather than by
     # assigning into it - which is also what an operator does when they edit the YAML.

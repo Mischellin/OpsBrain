@@ -174,17 +174,25 @@ def stageable(capability: str, *, strategy: str = "", stateful: bool = False,
     applying the whole thing and calling it gradual.
 
     * **Ansible** groups hosts and can walk them. Anything else is not a staged Ansible rollout.
-    * **OpenTofu** applies a saved plan as a unit. `-target` selects a subset of the graph for the
-      operator's convenience; it does not validate the rest of the plan against the new state, so a
-      rollout built from it decides nothing about whether the full apply would have worked.
+    * **OpenTofu** is staged by *independently saved plans*, one per stage, each applied whole. What is
+      refused is `-target`: it selects a subset of the graph for the operator's convenience and does not
+      validate the rest of the plan against the new state, so a rollout built from it decides nothing
+      about whether the full apply would have worked. A sequence of saved plans decides that - each one
+      was planned, reviewed and verified on its own.
     * **Kubernetes** depends on the workload. A `StatefulSet` with a read-write-once volume has an
       identity that a second pod cannot stand in for, and a pod disruption budget with `minAvailable` at
       or near the replica count leaves no room for a canary at all. There is no universal canary for an
       arbitrary resource, and claiming one is how a rollout ends up deleting data.
     """
     if capability == "tofu.apply":
-        return (f"an OpenTofu plan is not stageable: {strategy or 'the plan'} applies the saved plan as a "
-                "unit, and -target does not make it gradual - it only decides less")
+        if strategy == "-target" or strategy.startswith("-target"):
+            return (f"{strategy} is not a rollout: it selects a subset of the graph without validating the "
+                    "rest against the new state, so it decides strictly less than a full apply and nothing "
+                    "about whether that apply would have worked")
+        if strategy != "saved_plans":
+            return (f"an OpenTofu rollout advances independently saved plans, each applied whole; "
+                    f"{strategy or 'no strategy'} is not one")
+        return ""
     if capability == "ansible.apply":
         if strategy != "host_groups":
             return f"an Ansible rollout advances host groups; {strategy or 'no strategy'} is not one"
