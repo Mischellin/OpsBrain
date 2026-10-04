@@ -1824,6 +1824,81 @@ def test_a_class_floor_is_met_by_actually_running_the_reviews(ops, tmp_path) -> 
     assert out["decision"]["decision"] == "APPROVE", out["decision"].get("detail", out)
 
 
+def test_a_configured_review_floor_is_satisfiable_when_the_reviews_really_ran(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`decision.required_reviews` was compared against a number nothing ever set.
+
+    `Inputs.reviews_passed` is the value the engine measures the requirement with, and the service left
+    it at 0 on every call. A `max(1, ...)` fallback in the engine then answered "one review" whatever
+    actually ran, which made the setting unusable in both directions: a floor of two blocked every
+    decision however many reviews had passed, and nothing else could satisfy it either. The floor a
+    *profile* sets is checked separately and was always right - which is why the gap survived, since the
+    profile path is the one exercised on every run.
+    """
+    from opsbrain.auto.config import AutoConfig, PolicyProfileConfig
+
+    ops.config = ops.config.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
+        decision={"mode": "autonomous", "default_profile": "secrets", "required_reviews": 2},
+        profiles=[PolicyProfileConfig(name="secrets", classification="medium", extra_reviews=2,
+                                      allowed_targets=["proxmox"], allow_autonomous=True)])})
+    # Through `_autonomous_ops`, which rebuilds the config the way an operator editing YAML would - and
+    # which forwards only the decision fields it is told. Written into `ops.config` alone the setting
+    # would not survive, and this test would have passed against the broken code for that reason alone.
+    _autonomous_ops(ops, tmp_path, required_reviews=2)
+    assert ops.auto.reviews.config.decision.required_reviews == 2, "the floor the engine will read is 2"
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id), profile="secrets")
+    ops.auto.review_plan(plan)
+    assert len(ops.auto.preflight().get_by_plan(plan.id)["review_refs"]) == 2, "two reviews really ran"
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "APPROVE", (
+        f"two reviews passed and the floor is two: {out['decision'].get('detail', out)}")
+
+
+def test_two_reviews_that_disagree_block_the_decision(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The engine has a `VERDICT_DISAGREEMENT` branch, and the service could never reach it.
+
+    Two independent reviews that disagree are not a tie to be broken by taking the later one - and that
+    is exactly what happened: `PreflightResult` holds the *last* pass, so the earlier review was stored,
+    counted against the profile, and then never shown to anything. The plan looked approvable because
+    the answer that happened to be last said `PASS`.
+
+    The runner is scripted by call order because `FakeReviewer` matches on request text, and both passes
+    carry identical text - they differ only in rubric, which is what makes them independent and is
+    invisible to a text-matching stub.
+    """
+    from opsbrain.auto.config import AutoConfig, PolicyProfileConfig
+    from opsbrain.auto.runners import FakeReviewer
+
+    class Disagreeing(FakeReviewer):
+        def review(self, request: Any) -> str:  # type: ignore[override]
+            self.requests.append(request)
+            verdict = "NEEDS_CHANGES" if len(self.requests) == 1 else "PASS"
+            return json.dumps({"contract_version": request.contract_version, "review_id": request.review_id,
+                               "subject": request.subject.value, "subject_ref": request.subject_ref,
+                               "status": "OK", "verdict": verdict, "findings": [],
+                               "unverified_claims": [], "next_checks": []})
+
+    ops.config = ops.config.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
+        decision={"mode": "autonomous", "default_profile": "secrets"},
+        profiles=[PolicyProfileConfig(name="secrets", classification="medium", extra_reviews=2,
+                                      allowed_targets=["proxmox"], allow_autonomous=True)])})
+    _autonomous_ops(ops, tmp_path)
+    ops.auto.reviews._reviewer = Disagreeing()
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id), profile="secrets")
+    ops.auto.review_plan(plan)
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY", (
+        "the last review passing does not make two disagreeing reviews agree")
+    assert "disagree" in out["decision"]["detail"], out["decision"]["detail"]
+
+
 def test_a_floor_the_runner_cannot_meet_still_blocks(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
     """If the second session cannot be produced, the class floor is not quietly waived."""
     from opsbrain.auto.config import AutoConfig, PolicyProfileConfig

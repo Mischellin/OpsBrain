@@ -572,6 +572,24 @@ class AutoService:
                 review_status = str(live.get("status") or review_status)
                 review_verdict = str(live.get("verdict") or "")
             review_ids = tuple(result.review_ids) or (result.review_id,)
+        # How many reviews actually passed, counted from the stored records rather than from how many ids
+        # the preflight happened to keep. The engine's `reviews_passed` is the number it compares with the
+        # required one, and nothing set it: every call reported 0, and a `max(1, ...)` fallback hid the gap
+        # by answering "one" whatever really ran. A configuration asking for two reviews was therefore
+        # unsatisfiable and blocked every decision, and the answer was the fallback's rather than the
+        # reviews'.
+        reviews_passed = sum(1 for rid in review_ids if self._review_state(rid, plan_id) == "passing")
+        # The engine is what decides what two independent answers mean - agreement, or a block - and it
+        # can only do that when told both. `result` is the *last* pass, so the earlier one was stored,
+        # counted against the profile, and then never compared against anything.
+        secondary_verdict, secondary_status = "", ""
+        if len(review_ids) > 1:
+            try:
+                other = self.reviews.store.get(review_ids[0])
+                secondary_status = str(other.get("status") or "")
+                secondary_verdict = str(other.get("verdict") or "")
+            except OpsError:
+                secondary_status, secondary_verdict = "", ""
         unmet = self._profile_gaps(plan, change, review_ids=review_ids)
         if unmet:
             return self._decision_refused(change_id, plan_id,
@@ -626,6 +644,9 @@ class AutoService:
             evidence_ids=evidence_ids,
             review_verdict=review_verdict,
             review_status=review_status,
+            secondary_review_verdict=secondary_verdict,
+            secondary_review_status=secondary_status,
+            reviews_passed=reviews_passed,
             policy_allows=access is not Access.DENY,
             target_in_scope=profile is None or self.autonomous_for(change, profile),
             destructive=bool(change.dangerous),
