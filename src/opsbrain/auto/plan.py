@@ -269,6 +269,11 @@ class ChangePlan:
             versions=dict(data.get("versions", {})), risk=Risk(risk), profile=str(data.get("profile", "general")))
         if plan.id and plan.id != f"pl-{plan.compute_arguments_hash()[:16]}":
             raise PlanError("plan id does not match its arguments hash: the record was altered")
+        if plan.plan_hash and plan.plan_hash != plan.compute_plan_hash():
+            # `arguments_hash` covers the commands, not the argument for them. Rewriting the diagnosis
+            # therefore leaves the id untouched, and a plan whose reasoning was swapped would still be
+            # accepted under the id that vouched for the original reasoning.
+            raise PlanError("plan hash does not match its contents: the record was altered")
         return plan
 
     # -- presentation ------------------------------------------------------------------------------

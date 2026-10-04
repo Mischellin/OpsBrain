@@ -144,12 +144,14 @@ def test_a_plan_survives_a_round_trip_and_detects_tampering() -> None:
     plan = good_plan()
     reloaded = ChangePlan.from_dict(json.loads(json.dumps(plan.to_dict())))
     assert reloaded.plan_hash == plan.plan_hash
+    assert reloaded.compute_plan_hash() == plan.compute_plan_hash()
+    # `arguments_hash` covers the commands and the id derives from it, so a rewritten diagnosis leaves both
+    # untouched. `plan_hash` is the only thing standing between that edit and an approval granted for the
+    # reasoning it replaced.
     document = plan.to_dict()
     document["diagnosis"] = "something else entirely"
-    document["id"] = document["id"]  # id is derived from arguments, which did not change
-    tampered = ChangePlan.from_dict(document)
-    assert tampered.compute_plan_hash() != plan.plan_hash, "the digest must notice the edited diagnosis"
-    assert tampered.plan_hash == plan.plan_hash, "the stored hash is a record of what was reviewed"
+    with pytest.raises(PlanError, match="plan hash does not match"):
+        ChangePlan.from_dict(document)
 
 
 def test_a_forged_plan_id_is_refused() -> None:
@@ -424,3 +426,12 @@ def test_a_plan_survives_the_service_boundary(tmp_path: Path) -> None:
 
     auto = AutoService(_config(tmp_path), reviewer=FakeReviewer())
     assert auto.plan_summary(good_plan().to_dict())["plan"] == good_plan().id
+
+
+def test_a_plan_whose_reasoning_was_rewritten_is_refused_even_when_the_hashes_look_consistent() -> None:
+    plan = good_plan()
+    document = plan.to_dict()
+    document["diagnosis"] = "a justification invented after the approval was granted"
+    assert document["id"] == plan.id, "the id is derived from arguments, and the commands did not change"
+    with pytest.raises(PlanError, match="plan hash does not match"):
+        ChangePlan.from_dict(document)
