@@ -126,14 +126,43 @@ class Operators(Core):
         return {**out, "changes": True, **summary, "dangerous": dangerous, "change": change.id,
                 "next": f"tofu action=apply change_id={change.id} (after a human approves it)"}
 
+    def _plan_fingerprint(self, config: Any, plan_file: str) -> str:
+        """The digest of the saved plan, read from the runner immediately before the approval is spent.
+
+        The plan lives where `tofu plan` wrote it, on the runner, so it is hashed there. A local read would
+        either fail or - worse - silently hash nothing and let a replaced plan through under an approval a
+        human gave for the original resource actions.
+        """
+        binary = shlex.quote(config.binary)
+        result = self.exec.run_ssh(
+            config.runner,
+            f"{self._tofu_prefix(config)}{binary} show -json {shlex.quote(plan_file)}",
+            timeout=60)
+        if not result.ok:
+            raise OpsError(f"the saved plan is unreadable: {clip(result.out.strip(), 120)}")
+        # `tofu show` can print a warning before the document, so the first `{` line wins - the same
+        # tolerance the plan path already applies, rather than a stricter rule that would fail on a warning.
+        for line in result.out.splitlines():
+            if line.startswith("{"):
+                try:
+                    return digest(parsers.tofu_fingerprint(json.loads(line)))
+                except ValueError:
+                    break
+        raise OpsError(f"the saved plan is unreadable: {clip(result.out.strip(), 120)}")
+
     def tofu_apply(self, change_id: str, wait_s: int | None = None) -> dict[str, Any]:
         pending = self.changes.get(change_id)
         name, config = self._stack(pending.target)
         access = self.require("tofu.apply", name)
         if pending.state == "pending" and (access is Access.CONFIRM or pending.dangerous):
             return self.approval_needed(pending)
-        change = self.changes.consume(change_id, "tofu.apply", name, needs_approval=access is Access.CONFIRM)
-        plan_file = str(change.args["plan_file"])
+        # The saved plan is re-read and re-fingerprinted immediately before the approval is spent.
+        # Without it the plan file can be replaced between plan and apply and still run under an
+        # approval a human gave for the original resource actions.
+        plan_file = str(pending.args["plan_file"])
+        change = self.changes.consume(change_id, "tofu.apply", name,
+                                      needs_approval=access is Access.CONFIRM,
+                                      content_hash=self._plan_fingerprint(config, plan_file))
         if not re.fullmatch(r"\.opsbrain/j-[0-9a-f]{8}\.tfplan", plan_file):
             raise OpsError("corrupt change record")
         binary = shlex.quote(config.binary)

@@ -7,9 +7,13 @@ approved by a human with `opsbrain approve <id>` on a terminal. A change is sing
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import os
 import re
+import time
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -109,23 +113,57 @@ class ChangeStore:
 
     def consume(self, change_id: str, capability: str, target: str, *, needs_approval: bool,
                 content_hash: str | None = None) -> Change:
-        """Validates and burns the change. Raises unless everything matches."""
-        change = self.get(change_id)
-        if change.capability != capability or change.target != target:
-            raise OpsError(f"change {change_id} is for {change.capability}:{change.target}")
-        if change.expired:
-            raise OpsError(f"change {change_id} has expired; plan again")
-        if change.state == APPLIED:
-            raise OpsError(f"change {change_id} was already applied (single use)")
-        if change.state == DISCARDED:
-            raise OpsError(f"change {change_id} was discarded")
-        if content_hash is not None and content_hash != change.hash:
-            raise OpsError(f"change {change_id}: the code or arguments changed since it was planned; plan again")
-        if change.dangerous and not change.allow_dangerous:
-            raise OpsError(f"change {change_id} is destructive: a human must run "
-                           f"`opsbrain approve {change_id} --allow-destroy`")
-        if needs_approval and change.state != APPROVED:
-            raise OpsError(f"change {change_id} is not approved: a human must run `opsbrain approve {change_id}`")
-        change.state, change.decided_at = APPLIED, now()
-        self._save(change)
-        return change
+        """Validates and burns the change, atomically. Raises unless everything matches.
+
+        The read-check-write is one critical section. Two HTTP requests, or two OpsBrain processes, both
+        used to read APPROVED before either wrote APPLIED, and both ran the mutation - which breaks the
+        single-use guarantee in exactly the case it exists for: a retry, or a double submit.
+        """
+        with self._transition(change_id):
+            change = self.get(change_id)
+            if change.capability != capability or change.target != target:
+                raise OpsError(f"change {change_id} is for {change.capability}:{change.target}")
+            if change.expired:
+                raise OpsError(f"change {change_id} has expired; plan again")
+            if change.state == APPLIED:
+                raise OpsError(f"change {change_id} was already applied (single use)")
+            if change.state == DISCARDED:
+                raise OpsError(f"change {change_id} was discarded")
+            if content_hash is not None and content_hash != change.hash:
+                raise OpsError(
+                    f"change {change_id}: the code or arguments changed since it was planned; plan again")
+            if change.dangerous and not change.allow_dangerous:
+                raise OpsError(f"change {change_id} is destructive: a human must run "
+                               f"`opsbrain approve {change_id} --allow-destroy`")
+            if needs_approval and change.state != APPROVED:
+                raise OpsError(f"change {change_id} is not approved: a human must run `opsbrain approve "
+                               f"{change_id}`")
+            change.state, change.decided_at = APPLIED, now()
+            self._save(change)
+            return change
+
+    @contextlib.contextmanager
+    def _transition(self, change_id: str) -> Iterator[None]:
+        """Exclusive over the whole store directory, so two processes cannot consume one change.
+
+        A lock left behind by a crash is reclaimed after a minute rather than wedging every later
+        approval behind a process that no longer exists.
+        """
+        lock = self.root / f"{change_id}.consume.lock"
+        self.root.mkdir(parents=True, exist_ok=True)
+        while True:
+            try:
+                handle = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                with contextlib.suppress(OSError):
+                    if time.time() - lock.stat().st_mtime > 60:
+                        lock.unlink()
+                time.sleep(0.005)
+                continue
+            break
+        try:
+            yield
+        finally:
+            os.close(handle)
+            with contextlib.suppress(OSError):
+                lock.unlink()

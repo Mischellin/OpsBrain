@@ -45,6 +45,9 @@ def test_tofu_apply_requires_human_approval_and_applies_the_saved_plan(ops, fake
     assert not any("tofu apply" in script for _, script in fake.calls)
 
     approve(ops, plan["change"])
+    # The apply re-reads the saved plan and re-fingerprints it before spending the approval, so a plan
+    # replaced in between is caught rather than run under an approval for the original actions.
+    fake.on(r"tofu show -json", f"Warning: deprecated attribute\n{PLAN_JSON}\n")
     fake.on(r"tofu apply", "Apply complete! Resources: 0 added, 1 changed, 0 destroyed.\n@@OPSBRAIN-POSTPLAN 0@@\n")
     applied = ops.tofu_apply(plan["change"])
     assert applied["ok"] and applied["applied"]["changed"] == 1 and applied["post_plan_clean"] is True
