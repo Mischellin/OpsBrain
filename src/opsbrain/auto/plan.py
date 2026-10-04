@@ -80,6 +80,13 @@ class ProposedChange:
     #: The verification check this step authorises, by name (`systemd:unit-start`). A profile is a class of
     #: checks; only this names one, so a step never sweeps in an action by matching vocabulary.
     declared_check: str = ""
+    #: What the step acts on, spelled out. A `Target` needs a host, a resource and an expectation, and
+    #: none of them can be recovered from a single label: `target="web-1"` with a drop-in and a unit name
+    #: in `how` is three different things. Verification is only offered where these are stated.
+    host: str = ""
+    resource: str = ""
+    expectation: str = ""
+    expected_revision: str = ""
 
     def __post_init__(self) -> None:
         if not self.capability or not self.target:
@@ -102,6 +109,8 @@ class ProposedChange:
     def to_dict(self) -> dict[str, Any]:
         return {"capability": self.capability, "target": self.target, "how": self.how,
                 "reversible": self.reversible.value, "undo": self.undo, "profile": self.profile,
+                "declared_check": self.declared_check, "host": self.host, "resource": self.resource,
+                "expectation": self.expectation, "expected_revision": self.expected_revision,
                 "irreversible_reason": self.irreversible_reason, "state_changing": self.state_changing}
 
     @staticmethod
@@ -117,7 +126,9 @@ class ProposedChange:
             undo=str(data.get("undo", "") or ""), irreversible_reason=str(data.get("irreversible_reason", "") or ""),
             state_changing=bool(data.get("state_changing", True)),
             profile=str(data.get("profile", "") or ""),
-            declared_check=str(data.get("declared_check", "") or ""))
+            declared_check=str(data.get("declared_check", "") or ""), host=str(data.get("host", "") or ""),
+            resource=str(data.get("resource", "") or ""), expectation=str(data.get("expectation", "") or ""),
+            expected_revision=str(data.get("expected_revision", "") or ""))
 
 
 @dataclass(frozen=True)

@@ -63,7 +63,9 @@ def good_plan(**overrides: Any) -> ChangePlan:
         "diagnosis": "the timer is enabled but its drop-in directory is wrong, so the unit runs with the "
                      "distribution defaults and never rotates",
         "changes": [unit_change()],
-        "evidence_refs": ["ev-0000abcd"],
+        # A review reference, not a bundle: an `ev-` id nobody can resolve is a structural gap
+        # in its own right, and the test for that is below rather than every test here.
+        "evidence_refs": ["rv-0000abcd"],
         "versions": {"systemd": "252", "logrotate": "3.21.0"},
         "post_checks": ["systemctl show logrotate.service -p FragmentPath,DropInPaths",
                         "logrotate --debug /etc/logrotate.conf"],
@@ -336,11 +338,10 @@ def test_absence_in_one_directory_is_not_proof_of_absence(tmp_path: Path) -> Non
 
 # ------------------------------------------------------------------- probes: read-only vs experiment
 def test_a_state_changing_request_is_not_filed_as_a_read_only_probe() -> None:
-    read_only, acting = split_probes([
-        "systemctl show logrotate.service -p FragmentPath",
-        "journalctl -u logrotate.timer --since -1h",
-        "restart logrotate.timer to see whether the symptom disappears",
-    ])
+    declared = ["systemctl show logrotate.service -p FragmentPath",
+                "journalctl -u logrotate.timer --since -1h"]
+    read_only, acting = split_probes([*declared, "restart logrotate.timer to see whether the symptom disappears"],
+                                     allowlist=declared)
     assert len(read_only) == 2
     assert acting == ("restart logrotate.timer to see whether the symptom disappears",)
 
@@ -559,19 +560,19 @@ def test_a_mutation_not_on_any_verb_list_is_still_an_experiment(check: str) -> N
     assert acting == (check,), f"{check!r} changes state and must not be filed as read-only"
 
 
-@pytest.mark.parametrize("check", [
-    "systemctl show caddy.service -p FragmentPath",
-    "kubectl get pods -n prod",
-    "cat /etc/os-release",
-    "df -h /var",
-])
-def test_declared_read_only_probes_stay_read_only(check: str) -> None:
+@pytest.mark.parametrize("check", ["systemctl show", "kubectl get", "cat", "df", "kubectl get pods -o yaml"])
+def test_bare_read_only_names_stay_read_only(check: str) -> None:
     read_only, acting = split_probes([check])
     assert read_only == (check,) and acting == ()
 
 
+def test_a_declared_command_with_its_arguments_stays_read_only() -> None:
+    read_only, acting = split_probes(["df -h /var"], allowlist=["df -h /var"])
+    assert read_only == ("df -h /var",) and acting == ()
+
+
 def test_an_operator_can_declare_extra_read_only_probes() -> None:
-    read_only, _ = split_probes(["coroot query --host web-1"], allowlist=["coroot query"])
+    read_only, _ = split_probes(["coroot query --host web-1"], allowlist=["coroot query --host web-1"])
     assert read_only == ("coroot query --host web-1",)
 
 
@@ -688,10 +689,12 @@ def test_verification_uses_the_targets_the_plan_declared(ops, fake, tmp_path: Pa
     runner.default = response_document(Verdict.PASS)
     auto = OpsBrain(_config(tmp_path, review={"runner": "codex"}), executor=fake,
                     http=ops.http, reviewer=runner).auto
-    plan = good_plan(changes=[unit_change(profile="systemd")])
+    plan = good_plan(changes=[unit_change(profile="systemd", host="web-1", resource="logrotate.service",
+                                        expectation="/etc/systemd/system/logrotate.service.d/10-ops.conf",
+                                        expected_revision="1.2.3")])
     auto.review_plan(plan)
     answer = auto.verify_plan(plan.id)
-    assert answer["status"] != "not_verifiable"
+    assert answer["status"] != "not_verifiable", "the plan stated its host, resource and expectation"
     assert answer["change"] == plan.id, "the report is attributed to the plan, not to a caller's change"
     assert answer["is_pass"] is False, "a run started at the moment of the change cannot claim a settled state"
 
@@ -701,7 +704,7 @@ def test_a_plan_with_no_verifiable_target_says_so_instead_of_passing(tmp_path: P
 
     auto = AutoService(_config(tmp_path, review={"runner": "codex"}), reviewer=FakeReviewer())
     auto.reviews.reviewer().default = response_document(Verdict.PASS)
-    plan = good_plan(changes=[unit_change()])  # no profile
+    plan = good_plan(changes=[unit_change(profile="systemd")])  # profile but no resource
     auto.review_plan(plan)
     answer = auto.verify_plan(plan.id)
     assert answer["status"] == "not_verifiable"
@@ -764,3 +767,54 @@ def test_no_frozen_record_in_the_pipeline_carries_a_mutable_mapping() -> None:
             if f.name.endswith(("_versions", "metadata", "versions")):
                 default = f.default_factory() if f.default_factory is not dataclasses.MISSING else f.default  # type: ignore[misc]
                 assert not isinstance(default, dict), f"{record.__name__}.{f.name} defaults to a mutable dict"
+
+
+def test_a_plan_citing_evidence_nobody_can_resolve_is_not_approvable() -> None:
+    """The reviewer would receive bare id strings and could still answer PASS."""
+    from opsbrain.auto.preflight import Outcome
+
+    runner = FakeReviewer()
+    runner.default = response_document(Verdict.PASS)
+    engine, plan = preflight(Path(tempfile.mkdtemp(prefix="opsbrain-pf-")), runner,
+                             good_plan(evidence_refs=["ev-does-not-exist"]))
+    result = engine.run(plan)
+    assert result.outcome is Outcome.INCOMPLETE
+    assert result.approvable is False
+    assert any("cannot be resolved" in gap for gap in result.structural_gaps)
+
+
+def test_the_record_names_the_evidence_the_verdict_rests_on() -> None:
+    """Without the bundle id a later reader cannot recheck that the evidence is still fresh."""
+    runner = FakeReviewer()
+    runner.default = response_document(Verdict.PASS)
+    engine, plan = preflight(Path(tempfile.mkdtemp(prefix="opsbrain-pf-")), runner)
+    result = engine.run(plan)
+    assert result.evidence_ids == ("rv-0000abcd",)
+    assert engine.get(plan.plan_hash)["evidence_ids"] == ["rv-0000abcd"]
+
+
+def test_plan_text_is_redacted_before_it_reaches_the_reviewer() -> None:
+    """A token pasted into `diagnosis` must not travel to the external reviewer."""
+    engine, plan = preflight(Path(tempfile.mkdtemp(prefix="opsbrain-pf-")), FakeReviewer(),
+                             good_plan(diagnosis="the unit is stuck; token=ghp_" + "f" * 36))
+    request = engine.build_request(plan)
+    assert "ghp_" not in request.context
+    assert "ghp_" not in request.objective
+
+
+def test_a_target_is_never_synthesised_from_a_single_label() -> None:
+    """`target="web-1"` is a host, not a unit, a drop-in path and a revision at once."""
+    from opsbrain.auto.preflight import unverifiable_steps, verification_targets
+
+    vague = good_plan(changes=[unit_change(profile="systemd", target="web-1")])
+    assert verification_targets(vague) == ()
+    assert unverifiable_steps(vague) == ("ansible.apply:web-1",)
+
+    stated = good_plan(changes=[unit_change(profile="systemd", host="web-1", resource="logrotate.service",
+                                             expectation="/etc/systemd/system/logrotate.service.d/10-ops.conf",
+                                             expected_revision="1.2.3")])
+    targets = verification_targets(stated)
+    assert len(targets) == 1
+    assert targets[0].name == "logrotate.service" and targets[0].host == "web-1"
+    assert targets[0].expected_revision == "1.2.3"
+    assert targets[0].expect("drop_in") == "/etc/systemd/system/logrotate.service.d/10-ops.conf"

@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from ..redact import redact_text
 from ..util import OpsError, now
 from .config import AutoConfig
 from .evidence import EvidenceBundle, render_for_reviewer
@@ -83,6 +84,12 @@ class PreflightResult:
     requested_probes: tuple[str, ...]
     state_changing_probes: tuple[str, ...]
     structural_gaps: tuple[str, ...]
+    #: The state-changing checks this plan authorised, in the verifier's vocabulary. Verification compares
+    #: its own declarations against this rather than against a caller-supplied list.
+    declared_checks: tuple[str, ...]
+    #: The evidence that actually travelled with the request. Without it a later reader cannot tell which
+    #: bundle produced this verdict, nor recheck that bundle's freshness.
+    evidence_ids: tuple[str, ...]
     arguments_hash: str
     plan_hash: str
     created: float = 0.0
@@ -106,6 +113,8 @@ class PreflightResult:
             "requested_probes": list(self.requested_probes),
             "state_changing_probes": list(self.state_changing_probes),
             "structural_gaps": list(self.structural_gaps),
+            "declared_checks": list(self.declared_checks),
+            "evidence_ids": list(self.evidence_ids),
             "arguments_hash": self.arguments_hash,
             "plan_hash": self.plan_hash,
             "created": round(self.created, 3),
@@ -156,21 +165,37 @@ def split_probes(checks: Sequence[str], allowlist: Sequence[str] = ()) -> tuple[
     return tuple(read_only), tuple(acting)
 
 
-#: Characters that turn one command into several. An allowed prefix does not make these safe: a request
-#: that begins with a read-only command and continues into a second one is not a read-only request.
+#: Characters that turn one command into several. Nothing about a leading read-only name makes these safe.
 _SHELL_OPERATORS = (";", "&&", "||", "|", "`", "$(", ">", "<")
+
+#: Flags that mutate state on a binary whose bare invocation reads. `journalctl --rotate` and
+#: `openssl x509 -out FILE` both pass a prefix test and both write.
+#: Long flags only. A short `-o` is how kubectl and journalctl say "write to", but it is also how
+#: `kubectl get pods -o yaml` says "read from", so short flags cannot be judged without knowing the binary.
+_MUTATING_FLAGS = frozenset({"--rotate", "--vacuum", "--vacuum-time", "--vacuum-size", "--force", "--delete",
+                             "--purge", "--overwrite", "--rebuild", "--in-place", "--output", "--sign",
+                             "--generate", "--setup", "--create", "--remove"})
 
 
 def _is_read_only(check: str, allowed: frozenset[str]) -> bool:
-    """Prefix match on whitespace-collapsed text, so `ls` matches and `lsof -p 1` does not.
+    """Exact match against the allowlist, after checking the arguments.
 
-    A shell operator disqualifies the request outright. Whoever runs these later may or may not use a
-    shell, and refusing the ambiguous string is the only answer that is right either way.
+    Prefix matching was the defect: it treats every invocation of a read-only executable as read-only,
+    so the flags that *do* mutate pass through. A bare name is allowed - the operator has declared that
+    reading with no arguments is safe - but anything with arguments has to be declared in full, because
+    knowing which flags of which binary mutate is not something this module can guess.
     """
     collapsed = " ".join(check.lower().split())
     if any(operator in collapsed for operator in _SHELL_OPERATORS):
         return False
-    return any(collapsed == prefix or collapsed.startswith(f"{prefix} ") for prefix in allowed)
+    tokens = collapsed.split()
+    if any(token in _MUTATING_FLAGS for token in tokens):
+        return False
+    # A bare name is safe because the operator declared the reading. A name with arguments is safe only
+    # if the operator declared *that command*, since which flags mutate is not knowable from here.
+    if collapsed in allowed:
+        return True
+    return any(collapsed.startswith(f"{prefix} ") for prefix in allowed if not collapsed.startswith(f"{prefix} -"))
 
 
 class Preflight:
@@ -193,6 +218,7 @@ class Preflight:
                                     review_status=RunnerStatus.UNAVAILABLE, verdict=None, findings=(),
                                     unverified_claims=plan.unverified_claims, requested_probes=(),
                                     state_changing_probes=(), structural_gaps=plan.incomplete(),
+                                    declared_checks=declared_state_changing(plan), evidence_ids=(),
                                     arguments_hash=plan.arguments_hash, plan_hash=plan.plan_hash, created=now(),
                                     note=reason)
         self.store.put(f"pf-{plan.plan_hash[:16]}", {**preflight.to_dict(), "plan_document": plan.to_dict()})
@@ -207,7 +233,7 @@ class Preflight:
 
     def build_request(self, plan: ChangePlan, bundle: EvidenceBundle | None = None, *,
                       subject_ref: str | None = None) -> ReviewRequest:
-        context = [untrusted(plan.render_for_reviewer())]
+        context = [untrusted(redact_text(plan.render_for_reviewer()))]
         if bundle is not None:
             payloads, _ = self.evidence.load_artifacts(bundle)
             context.append("")
@@ -220,6 +246,7 @@ class Preflight:
 
     def run(self, plan: ChangePlan, bundle: EvidenceBundle | None = None, *,
             subject_ref: str | None = None) -> PreflightResult:
+        request_bundle_id = bundle.id if bundle is not None else ""
         if self.reviews.is_stub():
             # The stub answers PASS to anything, so with the default configuration every plan would be
             # approvable without anybody having looked at it. Autonomy is the one thing a stub must never
@@ -234,7 +261,11 @@ class Preflight:
                                "only saw part of")
         result: ReviewResult = self.reviews.review(request)
         read_only, acting = split_probes(result.next_checks, self.auto.evidence.read_only_probes)
-        gaps = plan.incomplete()
+        # A plan may cite evidence nobody can resolve. Those references are not evidence: without this the
+        # reviewer receives bare id strings and a PASS still comes back approvable.
+        unresolved = tuple(ref for ref in plan.evidence_refs if ref.startswith("ev-") and ref != request_bundle_id)
+        gaps = (*plan.incomplete(),
+                *((f"cites evidence that cannot be resolved: {', '.join(unresolved[:4])}",) if unresolved else ()))
         outcome = self._outcome(result, gaps)
         preflight = PreflightResult(
             plan_id=plan.id, outcome=outcome, reason=REASON_BY_OUTCOME[outcome], review_id=result.review_id,
@@ -243,6 +274,7 @@ class Preflight:
             unverified_claims=tuple(dict.fromkeys(plan.unverified_claims + result.unverified_claims)),
             requested_probes=read_only,
             state_changing_probes=acting, structural_gaps=gaps,
+            declared_checks=declared_state_changing(plan), evidence_ids=request.evidence_refs,
             arguments_hash=plan.arguments_hash, plan_hash=plan.plan_hash, created=now())
         self.store.put(f"pf-{plan.plan_hash[:16]}", {**preflight.to_dict(), "plan_document": plan.to_dict()})
         return preflight
@@ -313,6 +345,15 @@ def unmatched_declarations(plan: ChangePlan) -> tuple[str, ...]:
 
 #: `ChangePlan.targets` is a set of host or workload names; which kind each one is comes from the step
 #: that names it. A name that appears only in an untyped step stays untyped and is reported, not guessed.
+def unverifiable_steps(plan: ChangePlan) -> tuple[str, ...]:
+    """Steps that name a profile but not the parts a `Target` needs, so nothing can be checked about them."""
+    from .verify import REGISTRY
+
+    profiles = {REGISTRY[name].profile for name in REGISTRY if REGISTRY[name].state_changing}
+    return tuple(sorted({f"{change.capability}:{change.target}" for change in plan.changes
+                         if change.profile in profiles and not change.resource}))
+
+
 def verification_targets(plan: ChangePlan) -> tuple[Target, ...]:
     """The targets verification is asked about, derived from the plan's own steps.
 
@@ -322,15 +363,30 @@ def verification_targets(plan: ChangePlan) -> tuple[Target, ...]:
     logs" has not said what should be checked afterwards, and inventing the target would let verification
     pass against something nobody planned for.
     """
-    from .verify import unit_target
+    from .verify import Target as VTarget
+    from .verify import http_target, repo_target, unit_target
 
     profiles = {REGISTRY[name].profile for name in REGISTRY if REGISTRY[name].state_changing}
     targets: list[Target] = []
     for change in plan.changes:
-        if change.profile not in profiles or not change.target:
+        if change.profile not in profiles or not change.resource:
+            # A `Target` needs a host, a resource and an expectation, and none of them can be recovered
+            # from one label: `target="web-1"` is a hostname, not a unit, a drop-in path and a revision.
+            # Filling a label into all three produces a check that inspects a unit named after a host and
+            # compares its start timestamp against a plan id, which nothing applied can ever satisfy.
             continue
-        targets.append(unit_target(change.target, change.target, drop_in=change.target,
-                                   expected_revision=plan.id))
+        if change.profile == "systemd":
+            targets.append(unit_target(change.host or change.target, change.resource,
+                                       drop_in=change.expectation or None,
+                                       expected_revision=change.expected_revision or None))
+        elif change.profile == "http":
+            targets.append(http_target(change.target, change.expectation or change.target))
+        elif change.profile == "drift":
+            targets.append(repo_target(change.target, change.expectation, host=change.host))
+        else:
+            targets.append(VTarget(change.profile, change.resource, change.host,
+                                   (("expectation", change.expectation),) if change.expectation else (),
+                                   change.expected_revision or None))
     return tuple(targets)
 
 
@@ -339,7 +395,7 @@ def unverified_targets(plan: ChangePlan) -> tuple[str, ...]:
 
     profiles = {REGISTRY[name].profile for name in REGISTRY if REGISTRY[name].state_changing}
     return tuple(sorted({f"{change.capability}:{change.target}" for change in plan.changes
-                         if change.profile not in profiles}))
+                         if change.profile in profiles and not change.resource}))
 
 
 def blocking_findings(result: ReviewResult) -> tuple[dict[str, Any], ...]:
