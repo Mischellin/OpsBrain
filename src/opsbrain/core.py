@@ -10,6 +10,7 @@ from typing import Any
 
 from .artifacts import ArtifactStore, raw_bytes
 from .audit import AuditLog
+from .auto.service import AutoService
 from .changes import Change, ChangeStore
 from .config import Access, Config
 from .executor import Executor
@@ -27,7 +28,7 @@ TAGS = re.compile(r"^[A-Za-z0-9_.,-]{1,200}$")
 
 class Core:
     def __init__(self, config: Config, *, executor: Executor | None = None, http: HttpClient | None = None,
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep, reviewer: Any = None):
         self.config = config
         self.exec = executor or Executor(config)
         self.http = http or HttpClient(verify_tls=config.observe.verify_tls)
@@ -37,6 +38,7 @@ class Core:
         self.changes = ChangeStore(data / "changes", config.limits.change_ttl_s)
         self.jobs = JobStore(data / "jobs")
         self.audit = AuditLog(data / "audit.jsonl")
+        self.auto = AutoService(config, reviewer=reviewer)
         self.finalizers: dict[str, Finalizer] = {}
 
     # -- helpers -----------------------------------------------------------------------------------

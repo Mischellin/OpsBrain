@@ -9,31 +9,25 @@ from __future__ import annotations
 
 import os
 import re
-from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
+
+from .auto.config import AutoConfig
+from .models import Access, _Model
 
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _RULE = re.compile(r"^(\*|[a-z0-9_-]+(\.[a-z0-9_-]+)*(\.\*)?)(:[A-Za-z0-9_.*/-]+)?$")
 
 DEFAULT_CONFIG = Path("~/.opsbrain/config.yaml")
 
+__all__ = ["Access", "Config", "ConfigError", "DEFAULT_CONFIG", "config_path", "load_config"]
+
 
 class ConfigError(Exception):
     pass
-
-
-class Access(StrEnum):
-    ALLOW = "allow"
-    CONFIRM = "confirm"
-    DENY = "deny"
-
-
-class _Model(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
 
 class HostConfig(_Model):
@@ -154,6 +148,7 @@ class Config(_Model):
     policy: dict[str, Access] = Field(default_factory=dict)
     limits: Limits = Field(default_factory=Limits)
     http: HttpConfig = Field(default_factory=HttpConfig)
+    auto: AutoConfig = Field(default_factory=AutoConfig)
 
     @model_validator(mode="after")
     def _check(self) -> Config:
