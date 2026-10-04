@@ -736,3 +736,31 @@ def test_a_truncated_evidence_render_is_refused_not_sent(tmp_path: Path) -> None
     # A budget too small for the evidence is refused too, whichever limit binds first.
     with pytest.raises(EvidenceError):
         render_for_reviewer(bundle, payloads, max_chars=200)
+
+
+def test_a_plan_cannot_have_its_versions_edited_after_construction() -> None:
+    """`frozen=True` blocks assignment and does nothing about a dict reached through the attribute.
+
+    The mapping is what `plan_hash` covers, so mutating it after construction would let the reviewer be
+    shown one set of versions while the stored hash vouches for another - the same defect class the
+    evidence bundle had, reproduced by copying the pattern instead of the invariant.
+    """
+    plan = good_plan()
+    with pytest.raises(TypeError):
+        plan.versions["systemd"] = "999"  # type: ignore[index]
+    assert "999" not in json.dumps(plan.to_dict())
+    assert plan.plan_hash == good_plan().plan_hash
+
+
+def test_no_frozen_record_in_the_pipeline_carries_a_mutable_mapping() -> None:
+    """One sweep, so the next module that grows a `versions` or `metadata` field is caught here."""
+    import dataclasses
+
+    from opsbrain.auto.evidence import EvidenceBundle
+    from opsbrain.auto.plan import ChangePlan
+
+    for record in (ChangePlan, EvidenceBundle):
+        for f in dataclasses.fields(record):  # type: ignore[arg-type]
+            if f.name.endswith(("_versions", "metadata", "versions")):
+                default = f.default_factory() if f.default_factory is not dataclasses.MISSING else f.default  # type: ignore[misc]
+                assert not isinstance(default, dict), f"{record.__name__}.{f.name} defaults to a mutable dict"

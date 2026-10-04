@@ -21,6 +21,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any
 
 from ..changes import digest
@@ -149,7 +150,11 @@ class ChangePlan:
     alternatives_rejected: tuple[str, ...] = ()
     unverified_claims: tuple[str, ...] = ()
     unknowns: tuple[str, ...] = ()
-    versions: Mapping[str, str] = field(default_factory=dict)
+    #: A `MappingProxyType`, not a dict. `frozen=True` stops assignment but does nothing about a dict
+    #: reached through the attribute - and this mapping is what `plan_hash` covers, so mutating it after
+    #: construction would let the reviewer be shown one set of versions while the stored hash vouches
+    #: for another.
+    versions: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
     risk: Risk = Risk.MEDIUM
     profile: str = "general"
     contract_version: str = CONTRACT_VERSION
@@ -193,7 +198,8 @@ class ChangePlan:
             preconditions=tuple(preconditions), post_checks=tuple(post_checks), rollback=rollback.strip(),
             reversibility=resolved, blast_radius=tuple(sorted(set(blast_radius))),
             alternatives_rejected=tuple(alternatives_rejected), unverified_claims=tuple(unverified_claims),
-            unknowns=tuple(unknowns), versions=dict(sorted((versions or {}).items())), risk=risk, profile=profile)
+            unknowns=tuple(unknowns), versions=MappingProxyType(dict(sorted((versions or {}).items()))),
+            risk=risk, profile=profile)
         return ChangePlan(**{**plan.__dict__, "id": f"pl-{plan.compute_arguments_hash()[:16]}",
                              "arguments_hash": plan.compute_arguments_hash(),
                              "plan_hash": plan.compute_plan_hash()})
