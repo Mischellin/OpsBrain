@@ -141,26 +141,42 @@ class Operators(Core):
                 "next": f"tofu action=apply change_id={change.id} (after a human approves it)"}
 
     def _plan_apply_script(self, config: Any, plan_file: str, expected_sha: str) -> str:
-        """One runner-side script: re-hash the saved plan, compare, and apply - in the same shell.
+        """One runner-side script: take an immutable copy of the plan, hash *that*, and apply *that*.
 
-        The digest used to be fetched in one command and the apply issued in another, which left a window:
-        anything that replaced the plan file in between had *its* plan applied under an approval a human
-        gave for the first one. Hashing the file and applying it are now one script, so the bytes that are
-        checked are the bytes that get applied.
+        Three defects, in the order they were found. The digest used to be fetched in one command and the
+        apply issued in another, so anything that replaced the plan between them had its plan applied
+        under an approval given for the first one. Hashing and applying in one shell closed the shell
+        boundary but not the pathname: `sha256sum` and `tofu apply` each open the same mutable path, so a
+        replacement between the two still ran unchecked bytes. The script therefore copies the plan to a
+        fresh name, drops write permission, and hashes and applies *the copy* - the path that gets applied
+        is the path that was checked, and its name is generated inside this shell rather than chosen by
+        whoever is trying to substitute it.
 
-        The hash covers the `.tfplan` file rather than `tofu show -json` output. It is the artifact that is
+        The `cd` into the stack directory comes first and applies to the hash as well as the apply. A
+        detached SSH job starts in the remote user's login directory, and the saved plan path is relative
+        to the stack, so hashing before the `cd` reported every valid plan as missing.
+
+        The hash covers the `.tfplan` file rather than `tofu show -json` output: it is the artifact that is
         actually applied, it needs no JSON parser on the runner, and it removes the "first line starting
-        with `{`" tolerance that a warning above the document used to require.
+        with `{`" tolerance a warning above the document used to require.
+
+        What this does not stop: another process running as the same user on the runner can still observe
+        the copy. Against a same-uid adversary on the runner no script-level arrangement helps, and the
+        runner's own isolation is the boundary - stated here so the limit is not mistaken for a guarantee.
         """
         binary = shlex.quote(config.binary)
         prefix = self._tofu_prefix(config)
         quoted = shlex.quote(plan_file)
         return (
-            f"actual=$(sha256sum {quoted} 2>/dev/null | cut -d' ' -f1); "
+            # A name from this shell, not from the request: the point is that a replacer cannot name it in
+            # advance, which is what the original shared path allowed.
+            f"held=.opsbrain/apply-$$-$(date +%s).tfplan; "
+            f"{prefix}cp -- {quoted} $held 2>/dev/null && chmod 400 $held; "
+            f"actual=$(sha256sum $held 2>/dev/null | cut -d' ' -f1); "
             f'if [ -z "$actual" ] || [ "$actual" != {shlex.quote(expected_sha)} ]; then '
-            f'echo "@@OPSBRAIN-PLAN-MISMATCH $actual@@"; exit 78; fi; '
-            f"{prefix}{binary} apply -input=false -no-color -lock-timeout=60s {quoted}; "
-            f"rc=$?; rm -f {quoted}; if [ $rc -eq 0 ]; then "
+            f'rm -f $held; echo "@@OPSBRAIN-PLAN-MISMATCH $actual@@"; exit 78; fi; '
+            f"{prefix}{binary} apply -input=false -no-color -lock-timeout=60s $held; "
+            f"rc=$?; rm -f $held; if [ $rc -eq 0 ]; then "
             f"{binary} plan -input=false -no-color -lock-timeout=60s -detailed-exitcode > /dev/null 2>&1; "
             "echo \"@@OPSBRAIN-POSTPLAN $?@@\"; fi; exit $rc")
 

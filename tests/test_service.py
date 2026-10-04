@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -31,6 +32,8 @@ def test_tofu_plan_without_changes(ops, fake) -> None:  # type: ignore[no-untype
 
 
 PLAN_SHA = "@@OPSBRAIN-PLAN-SHA " + "ab" * 32 + "@@"
+#: The saved-plan path, as it appears inside the generated shell script.
+PLAN_PATH_RE = re.compile(r"[.]opsbrain/j-[0-9a-f]{8}[.]tfplan")
 
 
 def test_tofu_apply_requires_human_approval_and_applies_the_saved_plan(ops, fake) -> None:  # type: ignore[no-untyped-def]
@@ -56,6 +59,18 @@ def test_tofu_apply_requires_human_approval_and_applies_the_saved_plan(ops, fake
     script = next(script for _, script in fake.calls if "tofu apply" in script)
     assert ".opsbrain/j-" in script and ".tfplan" in script
     assert "sha256sum" in script and "ab" * 32 in script, "the apply verifies the plan bytes it is about to run"
+    # The path that is hashed and the path that is applied must be the same object. Hashing the saved plan
+    # and applying the saved plan are two opens of one mutable name, so a replacement between them runs
+    # unchecked bytes under the approval that was just consumed. The copy's name comes from this shell, so
+    # a replacer cannot have chosen it in advance.
+    saved = PLAN_PATH_RE.search(script)
+    assert saved is not None, "the saved plan path is in the script"
+    assert f"cp -- {saved.group(0)} $held" in script, "the applied plan is a copy, not the saved path"
+    assert "sha256sum $held" in script, "the copy is what gets hashed"
+    assert "lock-timeout=60s $held" in script, "the copy is what gets applied"
+    # The `cd` into the stack has to come before the hash: a detached job starts in the login directory, and
+    # the plan path is relative to the stack, so hashing first reported every valid plan as missing.
+    assert script.index("cd ") < script.index("sha256sum"), "the hash runs inside the stack directory"
     with pytest.raises(OpsError, match="single use"):
         ops.tofu_apply(plan["change"])
 
