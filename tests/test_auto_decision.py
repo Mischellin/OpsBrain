@@ -1293,6 +1293,47 @@ def test_a_profile_that_excludes_the_capability_blocks_the_decision(ops, tmp_pat
     assert "does not cover tofu.apply" in out["decision"]["detail"]
 
 
+def test_the_two_scope_lists_are_independent_axes_and_an_empty_one_is_unscoped(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The one place an empty list widens access, pinned so it cannot drift again.
+
+    `docs/autonomy.md` once stated the opposite - that an empty list covers nothing - and nothing caught
+    it, because no test exercised an empty list and the prose was never read against the code. The
+    reading the table now states is the one the code has always had: a profile scoping one stack names
+    only `allowed_targets`, and an empty `allowed_capabilities` means that axis is not scoped.
+
+    The stricter reading is not better, merely safer-sounding: applied here it refuses every change on
+    the capability axis before the target is ever consulted, and the refusal names a capability the
+    operator never wrote. Two tests, because the hazard here is not that the code is wrong but that it
+    and the documentation could disagree without anything noticing.
+    """
+    from opsbrain.auto.config import AutoConfig
+
+    def decide_with(**profile_fields: Any) -> dict[str, Any]:
+        ops.config = ops.config.model_copy(update={"auto": AutoConfig(
+            enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
+            decision={"mode": "autonomous"}, profiles=[_profile(**profile_fields)])})
+        _autonomous_ops(ops, tmp_path)
+        change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                    args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                    details={"plan_sha256": "ab" * 32})
+        plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+        ops.auto.review_plan(plan)
+        return ops.auto.decide_change(change.id, plan.id)
+
+    # Scoped on one axis, unscoped on the other: the ordinary configuration, and it must work.
+    assert decide_with(allowed_targets=["proxmox"])["decision"]["decision"] == "APPROVE", (
+        "a profile that scopes targets is not also a profile that scopes capabilities")
+    assert decide_with(allowed_capabilities=["tofu.apply"])["decision"]["decision"] == "APPROVE"
+    # Scoped on both: only the named pair is covered.
+    narrowed = decide_with(allowed_capabilities=["tofu.apply"], allowed_targets=["web-1"])
+    assert narrowed["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY"
+    assert "proxmox" in narrowed["decision"]["detail"]
+
+    # And the refusal names the axis it stopped on, so an operator who empties a list is told the list
+    # was what stopped them - rather than left to assume a scope they never wrote.
+    assert "does not cover the target 'proxmox'" in narrowed["decision"]["detail"]
+
+
 def test_a_profile_that_forbids_autonomy_blocks_the_decision(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
     from opsbrain.auto.config import AutoConfig
 

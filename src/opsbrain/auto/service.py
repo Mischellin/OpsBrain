@@ -782,8 +782,13 @@ class AutoService:
     def autonomous_for(self, change: Any, profile: Any) -> bool:
         """Whether this profile covers this operation, on this target, for autonomous execution.
 
-        An empty `allowed_*` list means the operator did not restrict it. That is the only reading under
-        which an empty list is permission without becoming a default that grants authority nobody chose.
+        An empty `allowed_*` list means the operator did not restrict it - the scope this profile states,
+        and no more. The alternative reading, that an empty list covers nothing, was tried here and takes
+        the rest of the configuration with it: a profile that names targets but no capabilities - the
+        ordinary way to scope one stack - blocks every change before the target is ever consulted, and
+        the operator is told it covers a capability it never thought about. `docs/autonomy.md` stated
+        that stricter reading and was wrong; the two lists are independent scopes, and leaving one out
+        means "not scoped on this axis", not "nothing is allowed".
         """
         if not profile.allow_autonomous:
             return False
@@ -792,7 +797,12 @@ class AutoService:
         return not (profile.allowed_targets and change.target not in profile.allowed_targets)
 
     def _scope_reason(self, change: Any, profile: Any) -> str:
-        """Which of the three limits refused it, so the operator knows which one to change."""
+        """Which of the three limits refused it, so the operator knows which one to change.
+
+        An empty list is named as "anything" rather than left blank, because a refusal that says only
+        which target was excluded reads, to an operator who has just emptied the list, like a scope they
+        did not intend.
+        """
         if not profile.allow_autonomous:
             return f"profile {profile.name!r} does not allow autonomous execution"
         if profile.allowed_capabilities and change.capability not in profile.allowed_capabilities:

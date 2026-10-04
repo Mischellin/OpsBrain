@@ -143,7 +143,7 @@ plan's `profile` and says, in advance, what that class of work is allowed to tou
 |---|---|
 | `classification` | `low` / `medium` / `high`; the bucket the other requirements are drawn from |
 | `allowed_capabilities` | the operations this class may use at all |
-| `allowed_targets` | the targets it may use them on; an empty list means no target is covered |
+| `allowed_targets` | the targets it may use them on |
 | `require_evidence` | evidence a plan of this class must cite |
 | `require_preconditions` | preconditions it must state |
 | `require_verification` | checks it must authorise, by the verifier's own check names |
@@ -151,10 +151,20 @@ plan's `profile` and says, in advance, what that class of work is allowed to tou
 | `recovery_actions` | what the bounded recovery loop may try when an attempt fails |
 | `irreversible` | whether work in this class may be accepted as unrecoverable |
 
-Two things follow from this that are easy to get wrong. A capability or target a profile does not name is
-not "allowed by default" — it is not covered, and the engine blocks on it. And `extra_reviews` is counted,
-not inferred: until that many reviews have actually run, the decision blocks rather than proceeding on
-however many happened to be present.
+The two scope lists are **independent axes, and an empty one means "not scoped on this axis"** - every
+value is allowed. A profile that names `allowed_targets` but no `allowed_capabilities` covers any
+operation on those targets, and the reverse is equally true. Read that as "empty covers nothing" and the
+ordinary case - one stack, scoped - refuses every change on the *other* axis before reaching the target
+you configured, and names a capability you never mentioned in the refusal.
+
+This is the one place where an empty list widens access rather than narrowing it, so it is worth saying
+plainly: **emptying a scoped list removes the scope.** Removing the last entry from `allowed_targets`
+does not stop the work, it authorises it everywhere. The way to authorise work with no scope at all is
+to configure no profiles, which is the default and is handled before any profile is consulted.
+
+Everything else in the table is fail-closed: a capability or target a profile *does* name is a limit,
+`extra_reviews` is counted rather than inferred, and a requirement the plan does not meet blocks the
+decision instead of being read as satisfied.
 
 `decision.default_profile` must name a profile that exists, or the configuration is rejected at load time
 rather than at the first decision.
