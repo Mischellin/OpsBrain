@@ -120,9 +120,10 @@ def test_budget_telemetry_is_not_treated_as_a_credential(ops) -> None:  # type: 
     """`token` in a budget report is a count, and masking it replaces a number with a string.
 
     That breaks every client that reports usage and hides the field the operator is actually watching.
+    The redaction allowlist is a list of names, not a rule - so it also has to keep masking things that
+    merely look like accounting, which is what the neighbour test covers. Either half alone would pass
+    against a fix that had simply deleted the masking.
     """
-    from opsbrain.config import Access
-
     answer = ops.call("autonomy", {"action": "status"},
                       lambda: {"budget": {"input_tokens": 1200, "output_tokens": 340, "spend_usd": 0.04}})
     budget = json.loads(answer if isinstance(answer, str) else json.dumps(answer))["budget"]
