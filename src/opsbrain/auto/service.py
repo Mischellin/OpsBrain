@@ -25,7 +25,7 @@ from ..audit import AuditLog
 from ..util import OpsError, new_id, now
 from .approval import ApprovalStore, binding_for
 from .config import AutoConfig
-from .decision import ApprovalEngine
+from .decision import ApprovalEngine, Reason
 from .evidence import EvidenceBundle, EvidenceCollector, EvidenceStore, Observation, check_evidence, passed, reason_code
 from .ledger import BudgetLedger
 from .plan import ChangePlan
@@ -493,6 +493,16 @@ class AutoService:
         if self.core is None:
             raise OpsError("deciding needs a Core; build OpsBrain, not AutoService alone")
         change = self.core.changes.get(change_id)
+        if change.state not in ("pending", "approved"):
+            return self._decision_refused(change_id, plan_id,
+                                          f"the change is {change.state}; a decision about work that has "
+                                          f"already run, or was discarded, authorises nothing",
+                                          review_id="")
+        if change.expired:
+            return self._decision_refused(change_id, plan_id, "the change has expired; plan again",
+                                          review_id="")
+        self._mark_workflow_start(change_id)
+        change = self.core.changes.get(change_id)
         record = self.preflight().get_by_plan(plan_id)
         plan = ChangePlan.from_dict(record["plan_document"])
         # The outer record is selected by plan id, but a nested document that parses is not thereby the
@@ -615,9 +625,13 @@ class AutoService:
             verification=report,
             attempts=self._repair_count(change),
             policy_version=self.auto.decision.policy_version,
-            calls_used=self.reviews.ledger.calls,
-            spend_usd=self.reviews.ledger.spend_usd,
-            elapsed_s=now() - change.created,
+            # Counted from this workflow's own baseline, not from the service's lifetime totals. The
+            # ledger is cumulative, so an unrelated earlier review against a stricter ceiling reported a
+            # *new* workflow as exhausted before it had spent anything, and elapsed time measured from
+            # change creation charged it for waiting.
+            calls_used=self.reviews.ledger.calls - int(change.details.get("baseline_calls", 0)),
+            spend_usd=self.reviews.ledger.spend_usd - float(change.details.get("baseline_spend", 0.0)),
+            elapsed_s=now() - float(change.details.get("workflow_started") or change.created),
         )
         # The change record is the authority for what an approval covers, so it is what both the record
         # and the binding name. The plan's own `arguments_hash` travels in the record for audit; the two
@@ -673,6 +687,18 @@ class AutoService:
         if any(str((finding or {}).get("severity", "")).upper() == "BLOCKER" for finding in findings):
             return None
         return "passing"
+
+    def _mark_workflow_start(self, change_id: str) -> None:
+        """Stamp the first attempt: what the ledger had already spent, and when this loop began.
+
+        Both are baselines, not totals. Without them a change that waited an hour before its first retry
+        was charged that hour, and any earlier review of anything counted against this decision's ceiling.
+        """
+        change = self.core.changes.get(change_id)
+        if change.details.get("workflow_started"):
+            return
+        self.core.changes.note_workflow_start(
+            change_id, calls=self.reviews.ledger.calls, spend=self.reviews.ledger.spend_usd, at=now())
 
     def _profile_gaps(self, plan: Any, change: Any, *,
                       review_ids: Sequence[str] = ()) -> str:
@@ -811,7 +837,8 @@ class AutoService:
         """A refusal recorded as a decision, so the audit trail has the same shape either way."""
         self.audit.record(event="decision", change=change_id, decision="BLOCKED_AUTONOMOUSLY",
                           reason="plan_changed", plan=plan_id, review=review_id)
-        return {"decision": {"decision": "BLOCKED_AUTONOMOUSLY", "reason": "plan_changed", "detail": detail}}
+        return {"decision": {"decision": "BLOCKED_AUTONOMOUSLY", "reason": Reason.PLAN_CHANGED.value,
+                            "detail": detail}}
 
     def verify_overview(self) -> dict[str, Any]:
         if self.core is None:

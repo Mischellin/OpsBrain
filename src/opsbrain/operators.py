@@ -225,8 +225,10 @@ class Operators(Core):
         practice, however correct the engine was. Returns False when the engine is not deciding, and lets
         the gate raise when it is and the change is not authorised.
         """
+        # A check, not a claim. `tofu_apply` asks first and consumes afterwards, and the claim happens
+        # inside `ChangeStore.consume` - if this spent the lease, the second call would find it consumed.
         gate = getattr(self.changes, "gate", None)
-        return bool(gate is not None and gate(change))
+        return bool(gate is not None and gate(change, spend=False))
 
     def tofu_apply(self, change_id: str, wait_s: int | None = None) -> dict[str, Any]:
         pending = self.changes.get(change_id)

@@ -43,6 +43,12 @@ class Core:
         # The engine goes in front of the change store, so an operator cannot approve by hand and skip
         # the machinery that exists to decide. Core owns both ends, so Core wires them.
         self.auto.engine().install(self.changes)
+        # The engine spends the lease when the gate opens; only here do we know the mutation ran, so the
+        # outcome is recorded from the change store rather than from the gate that cannot yet know.
+        approvals = self.auto.engine().approvals
+        if approvals is not None:
+            self.changes.on_executed = lambda _change, approval_id: approvals.record_outcome(
+                approval_id, {"state": "executed", "at": round(time.monotonic(), 3)})
         self.finalizers: dict[str, Finalizer] = {}
 
     # -- helpers -----------------------------------------------------------------------------------

@@ -68,6 +68,10 @@ class Reason(StrEnum):
     TARGET_NOT_IN_SCOPE = "target_not_in_scope"
     VERIFICATION_UNKNOWN = "verification_unknown"
     VERIFICATION_NOT_RUN = "verification_not_run"
+    #: `decide_change` refuses before the engine is reached, for reasons that belong to no other enum:
+    #: the plan, the profile, the evidence, the review reference and the change all moved. Enumerated
+    #: here so `autonomy action=reasons` can promise exhaustive handling and keep the promise.
+    PLAN_CHANGED = "plan_changed"
     RETRIES_EXHAUSTED = "retries_exhausted"
     AUTONOMY_OFF = "autonomy_off"
     AUTONOMY_REVOKED = "autonomy_revoked"
@@ -184,7 +188,7 @@ class ApprovalEngine:
         # approval nothing will later check.
         self.changes = changes
 
-    def gate(self, change: Any) -> bool:
+    def gate(self, change: Any, *, spend: bool = True) -> bool:
         """Refuse a change the engine has not authorised, when the engine is the one deciding.
 
         Returns True when the engine's own approval covers this change, which is what lets an autonomous
@@ -219,6 +223,18 @@ class ApprovalEngine:
             change, self.config.decision.policy_version, in_force))
         if reasons:
             raise OpsError(f"approval {approval.id} is STALE ({', '.join(reasons)})")
+        # Spent, not just read. Reading left the approval `ISSUED` after a successful apply, so `revoke`
+        # could still succeed and erase the fact that it had been used - and a revocation landing between
+        # this read and the mutation would not have stopped anything. Spending under the store's own lock
+        # closes that window; the outcome is recorded by `ChangeStore` when the change reaches APPLIED.
+        if spend:
+            # Already leased by a previous gate call on this same change - the operator's early check
+            # spends nothing, and only the one inside `ChangeStore.consume` actually claims it.
+            if approval.outcome.get("idempotency_key") == f"change:{change.id}":
+                return True
+            self.approvals.consume(approval.id, self._current_for(change, self.config.decision.policy_version,
+                                                                    in_force),
+                                   owner=f"engine:{change.id}", idempotency_key=f"change:{change.id}")
         return True
 
     @staticmethod
@@ -385,8 +401,11 @@ class ApprovalEngine:
         if inputs.review_status != "OK":
             return (Decision.BLOCKED_AUTONOMOUSLY, Reason.REVIEW_FAILED,
                     f"the reviewer could not answer: {inputs.review_status}", "a human looks at this")
-        if inputs.review_verdict == "DENY":
-            return (Decision.DENY, Reason.REVIEW_DENIED, "the reviewer denied the plan", "revise the plan")
+        # One explicit precedence over *both* reviews, not a check on the primary that returns before the
+        # secondary is read. Otherwise the same pair of answers decided differently depending on which
+        # runner got the primary slot: DENY-then-PASS returned DENY, PASS-then-DENY reached the
+        # disagreement branch and returned BLOCKED_AUTONOMOUSLY. The order below is fixed and does not
+        # consult which reviewer was which.
         if inputs.secondary_review_status:
             # Any populated non-OK secondary status has to be handled like the primary one. Handling only
             # a successful disagreement meant a required extra review that timed out vanished, and a
@@ -407,11 +426,17 @@ class ApprovalEngine:
                 return (Decision.BLOCKED_AUTONOMOUSLY, Reason.REVIEW_FAILED,
                         f"the second reviewer could not answer: {inputs.secondary_review_status}",
                         "a human looks at this")
-            if inputs.secondary_review_verdict != inputs.review_verdict:
-                # Two independent reviews that disagree are not a tie to break by preference.
-                return (Decision.BLOCKED_AUTONOMOUSLY, Reason.VERDICT_DISAGREEMENT,
-                        f"two reviews disagree: {inputs.review_verdict} against "
-                        f"{inputs.secondary_review_verdict}", "a human decides")
+        if "DENY" in (inputs.review_verdict, inputs.secondary_review_verdict):
+            # A denial from either reviewer is a denial. Checked after the retryable failures so a
+            # timed-out second reviewer is still a retry rather than being read as a denial.
+            return (Decision.DENY, Reason.REVIEW_DENIED,
+                    "a reviewer denied the plan" if inputs.review_verdict == "DENY"
+                    else "the second reviewer denied the plan", "revise the plan")
+        if inputs.secondary_review_status and inputs.secondary_review_verdict != inputs.review_verdict:
+            # Two independent reviews that disagree are not a tie to break by preference.
+            return (Decision.BLOCKED_AUTONOMOUSLY, Reason.VERDICT_DISAGREEMENT,
+                    f"two reviews disagree: {inputs.review_verdict} against "
+                    f"{inputs.secondary_review_verdict}", "a human decides")
         if inputs.review_verdict != "PASS":
             return (Decision.BLOCKED_AUTONOMOUSLY, Reason.REVIEW_MISSING,
                     f"the reviewer answered {inputs.review_verdict or 'nothing'}", "revise the plan")

@@ -1455,3 +1455,109 @@ def test_an_expired_approval_cannot_be_renewed_from_the_decision_that_granted_it
     with pytest.raises(OpsError, match="already issued the approval"):
         ops.auto.engine().issue(change.id, arguments, bound_for(change, created=now()),
                                 record=decide_for(change, by=ops.auto.engine()))
+
+
+def test_a_successful_apply_spends_the_approval(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The gate only *read* the approval, so a revocation could still land after it.
+
+    A successful apply left the lease `ISSUED`, which meant `revoke()` succeeded afterwards and erased
+    the fact that it had been used - and a revocation landing between the read and the mutation would not
+    have stopped anything. The lease is now spent under the store's lock when the gate opens, and its
+    outcome recorded when the change reaches APPLIED.
+    """
+    from opsbrain.auto.approval import ApprovalStore, LeaseState
+
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    ops.auto.review_plan(plan)
+    approval = ops.auto.decide_change(change.id, plan.id)["approval"]
+    store = ApprovalStore(ops.auto.root / "approvals")
+    assert store.get(approval).state is LeaseState.ISSUED, "issuing alone does not spend"
+
+    ops.exec.on(r"tofu apply", "Apply complete! Resources: 0 added, 1 changed, 0 destroyed.\n"
+                               "@@OPSBRAIN-POSTPLAN 0@@\n")
+    assert ops.tofu_apply(change.id)["ok"] is True
+    spent = store.get(approval)
+    assert spent.state is LeaseState.CONSUMED, "and the apply spent it"
+    assert spent.outcome.get("executed") is True, "recording what ran"
+    with pytest.raises(OpsError, match="was revoked|consumed|already spent"):
+        store.revoke(approval, "too late")
+
+
+def test_the_pair_of_review_answers_decides_the_same_way_in_either_slot() -> None:
+    """A denial from either reviewer is a denial, whichever slot the runner was given.
+
+    The primary `DENY` branch returned before the secondary was read, so `DENY`+`PASS` gave DENY while
+    `PASS`+`DENY` reached the disagreement branch and blocked. The same two answers, two outcomes.
+    """
+    first = engine().decide(inputs(review_verdict="DENY", secondary_review_status="OK",
+                                   secondary_review_verdict="PASS", reviews_passed=2),
+                            "pl-1", "ah-1", review_ids=("rv-0000abcd", "rv-0000dcba"))
+    second = engine().decide(inputs(review_verdict="PASS", secondary_review_status="OK",
+                                    secondary_review_verdict="DENY", reviews_passed=2),
+                             "pl-1", "ah-1", review_ids=("rv-0000abcd", "rv-0000dcba"))
+    assert first.decision is Decision.DENY
+    assert second.decision is Decision.DENY, "the answer does not depend on which reviewer ran first"
+    assert first.reason is second.reason is Reason.REVIEW_DENIED
+
+
+def test_a_retryable_failure_still_outranks_a_denial_from_the_other_reviewer() -> None:
+    """Ordering fixed, and fixed deliberately: a reviewer that timed out is a retry, not a denial."""
+    record = engine().decide(inputs(review_verdict="DENY", secondary_review_status="TIMEOUT",
+                                    secondary_review_verdict="", reviews_passed=1, attempts=0),
+                             "pl-1", "ah-1", review_ids=("rv-0000abcd",))
+    assert record.decision is Decision.RETRY
+    assert record.reason is Reason.RETRYABLE_RUNNER_FAILURE
+
+
+def test_a_closed_change_cannot_be_decided_about(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """An APPROVE written into an APPLIED or DISCARDED record is an orphaned approval.
+
+    `attach_approval` refused only at the very end, after the approval had been issued and the decision
+    metadata written - leaving an issued approval and a durable decision for work that had already run.
+    """
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    ops.auto.review_plan(plan)
+    ops.changes.discard(change.id)
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY"
+    assert "discarded" in out["decision"]["detail"]
+
+
+def test_a_budget_ceiling_is_measured_from_this_workflow_not_from_the_service_lifetime(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`BudgetLedger` is cumulative by design, so a decision needs a baseline rather than a total.
+
+    Earlier unrelated reviews against a stricter ceiling reported a *new* workflow as exhausted before it
+    had spent anything of its own budget.
+    """
+    from opsbrain.auto.config import AutoConfig
+
+    ops.config = ops.config.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token=TOKEN, review={"runner": "codex", "max_model_calls": 50},
+        decision={"mode": "autonomous", "max_model_calls": 4})})
+    _autonomous_ops(ops, tmp_path)
+    for index in range(3):  # unrelated reviews that consume the service's shared ledger
+        ops.auto.review_plan(_plan_for_change(bundle_id=_bundle(ops, tmp_path, f"c-{index:08d}")))
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    ops.auto.review_plan(plan)
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "APPROVE", (
+        "three earlier reviews must not exhaust this decision's own ceiling")
+
+
+def test_the_refusal_code_is_one_a_client_can_enumerate() -> None:
+    """`_decision_refused` emitted a code belonging to no enum, so `autonomy action=reasons` lied."""
+    from opsbrain.auto.config import all_reason_codes
+    from opsbrain.auto.decision import Reason as DecisionReason
+
+    assert DecisionReason.PLAN_CHANGED.value in set(all_reason_codes())
