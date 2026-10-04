@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from ..changes import digest
 from ..util import OpsError, new_id, now
 from .approval import ApprovalBinding, ApprovalStore, StaleReason, stale_reasons
 from .config import AutoConfig
@@ -150,6 +151,7 @@ class ApprovalEngine:
     def __init__(self, config: AutoConfig, approvals: ApprovalStore | None = None):
         self.config = config
         self.approvals = approvals
+        self.changes: Any = None
 
     def install(self, changes: Any) -> None:
         """Put this engine in front of the change store, so the executor cannot skip it.
@@ -159,6 +161,10 @@ class ApprovalEngine:
         makes the engine's decision a precondition of executing, not advice next to it.
         """
         changes.gate = self.gate
+        # Kept so `issue` can record what the decision was made against. An engine that was never
+        # installed in front of a store has nothing to write to, and must say so rather than issue an
+        # approval nothing will later check.
+        self.changes = changes
 
     def gate(self, change: Any) -> bool:
         """Refuse a change the engine has not authorised, when the engine is the one deciding.
@@ -178,12 +184,31 @@ class ApprovalEngine:
         if approval.binding.change_id != change.id:
             raise OpsError(f"approval {approval.id} was issued for {approval.binding.change_id}, "
                            f"not for {change.id}")
-        reasons = stale_reasons(approval.binding, {
-            "plan_hash": change.hash, "subject": f"{change.capability}:{change.target}",
-            "targets": [change.target], "policy_version": approval.binding.policy_version})
+        reasons = stale_reasons(approval.binding, self._current_for(change, approval.binding.policy_version))
         if reasons:
             raise OpsError(f"approval {approval.id} is STALE ({', '.join(reasons)})")
         return True
+
+    @staticmethod
+    def _current_for(change: Any, policy_version: str) -> dict[str, Any]:
+        """The change's own facts, as the approval must be checked against them.
+
+        Derived from the record, never from the binding: comparing `binding.evidence_ids` with
+        `binding.evidence_ids` proves nothing, and an absent field used to be read as "unchanged" - so a
+        binding could omit arguments and evidence and still open the gate. `arguments_hash` uses the same
+        derivation as `binding_for`, and evidence comes from what issuance recorded on the change, so a
+        change edited after the decision is stale on both counts.
+        """
+        recorded = list(change.details.get("evidence_ids") or ())
+        return {
+            "plan_hash": change.hash,
+            "arguments_hash": digest({key: value for key, value in sorted(change.args.items())})
+            if change.args else "",
+            "subject": f"{change.capability}:{change.target}",
+            "targets": [change.target],
+            "evidence_ids": recorded,
+            "policy_version": policy_version,
+        }
 
     def autonomous(self) -> bool:
         return self.config.decision.autonomous
@@ -319,16 +344,25 @@ class ApprovalEngine:
     # ------------------------------------------------------------------------------------- issuance
     def issue(self, plan_id: str, arguments_hash: str, binding: ApprovalBinding, *,
               record: DecisionRecord) -> str:
-        """Publish the approval the executor will spend, and attach it to the change it authorises.
+        """Publish the approval the executor will spend, and record what it was decided against.
 
-        Only an APPROVE reaches this, and the id is written back onto the change so `gate` can see that
-        the decision was made - by this engine, for this change, against these inputs.
+        Only an APPROVE reaches this. Issuance is also where the change learns which evidence and which
+        policy version the decision rested on: `gate` re-derives the change's own facts later and refuses
+        anything that moved. Recording them here is what makes that later check compare two real values
+        instead of the binding with itself.
         """
         if not record.approvable:
             raise OpsError(f"refusing to issue an approval for {record.decision.value}: {record.detail}")
         if self.approvals is None:
             raise OpsError("no approval store is configured, so there is nothing to spend")
-        return self.approvals.issue(binding).id
+        if self.changes is None:
+            raise OpsError("the engine is not installed in front of a change store, so an issued approval "
+                           "would record nothing for the gate to check later; call install() first")
+        approval_id = self.approvals.issue(binding).id
+        self.changes.record_decision_inputs(
+            binding.change_id, evidence_ids=list(binding.evidence_ids),
+            policy_version=binding.policy_version, plan_id=plan_id, decision=record.decision.value)
+        return approval_id
 
     # ----------------------------------------------------------------------------------------- audit
     @staticmethod

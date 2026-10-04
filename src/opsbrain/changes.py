@@ -12,7 +12,7 @@ import hashlib
 import json
 import re
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -136,6 +136,24 @@ class ChangeStore:
         change = self.get(change_id)
         change.engine_approval = approval_id
         self._save(change)
+        return change
+
+    # `Sequence`, not `list`: inside this class body the bare name `list` is `ChangeStore.list`, so a
+    # `list[str]` annotation here is not a type at all and mypy is right to say so.
+    def record_decision_inputs(self, change_id: str, *, evidence_ids: Sequence[str], policy_version: str,
+                              plan_id: str, decision: str) -> Change:
+        """Record what the decision engine decided against, so the gate can check it later.
+
+        Without this the gate had two options, both bad: trust the binding's own evidence list (which
+        proves nothing) or skip the comparison. The recorded values are what `stale_reasons` later
+        compares the binding to, so a change edited after the decision reads as stale.
+        """
+        with self._transition(change_id):
+            change = self.get(change_id)
+            change.details = {**change.details, "evidence_ids": list(evidence_ids),
+                              "policy_version": policy_version, "plan_id": plan_id,
+                              "decision": decision}
+            self._save(change)
         return change
 
     def discard(self, change_id: str) -> Change:

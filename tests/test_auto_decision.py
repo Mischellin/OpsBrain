@@ -10,6 +10,7 @@ not a gate.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import pytest
@@ -233,19 +234,22 @@ def test_the_record_carries_reasons_versions_and_references() -> None:
 
 
 def test_an_approval_is_issued_only_for_an_approval(tmp_path: Any) -> None:
-    from opsbrain.auto.approval import ApprovalBinding, ApprovalStore
+    from opsbrain.auto.approval import ApprovalStore
+    from opsbrain.changes import ChangeStore
     from opsbrain.util import OpsError
 
     store = ApprovalStore(tmp_path)
+    changes = ChangeStore(tmp_path / "changes", 3600)
     issuing = ApprovalEngine(AutoConfig(enabled=True, autonomy_token=TOKEN), store)
-    binding = ApprovalBinding(change_id="chg-1", subject="tofu.apply:proxmox", plan_hash="ph-1",
-                              arguments_hash="ah-1", targets=("proxmox",), evidence_ids=("ev-aaaaaaaabbbbbbbb",),
-                              policy_version="v1")
+    issuing.install(changes)
+    change = changes.create("tofu.apply", "proxmox", "x", "ph-1")
+    binding = bound_for(change)
     # issued from an autonomous decision: a human-approved one in manual mode also qualifies
     assert issuing.issue("pl-1", "ah-1", binding, record=decide())
     blocked_dir = tmp_path / "blocked"
     blocked_dir.mkdir()
     blocked_engine = ApprovalEngine(AutoConfig(enabled=True, autonomy_token=TOKEN), ApprovalStore(blocked_dir))
+    blocked_engine.install(ChangeStore(tmp_path / "blocked-changes", 3600))
     blocked = decide(verification=report(CheckStatus.FAIL))
     with pytest.raises(OpsError, match="refusing to issue"):
         blocked_engine.issue("pl-1", "ah-1", binding, record=blocked)
@@ -298,28 +302,59 @@ def test_a_hand_approval_does_not_open_the_autonomous_path(ops, tmp_path) -> Non
         ops.changes.consume(change.id, "tofu.apply", "proxmox", needs_approval=True)
 
 
-def test_an_engine_approval_opens_it(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
-    from opsbrain.auto.approval import ApprovalBinding
+def bound_for(change: Any, evidence_ids: Sequence[str] = ("ev-aaaaaaaabbbbbbbb",), **overrides: Any) -> Any:
+    """A binding that actually matches the change it authorises.
 
+    `arguments_hash` is derived exactly as the gate derives it. A hand-written constant only worked while
+    the gate compared a partial dict and read absent fields as "unchanged" - which is what let a binding
+    that named neither the arguments nor the evidence open the gate.
+    """
+    from opsbrain.auto.approval import ApprovalBinding
+    from opsbrain.changes import digest
+
+    fields: dict[str, Any] = {
+        "change_id": change.id,
+        "subject": f"{change.capability}:{change.target}",
+        "plan_hash": change.hash,
+        "arguments_hash": digest({k: v for k, v in sorted(change.args.items())}) if change.args else "",
+        "targets": (change.target,),
+        "evidence_ids": tuple(evidence_ids),
+        "policy_version": "v1",
+    }
+    fields.update(overrides)
+    return ApprovalBinding(**fields)
+
+
+def test_an_engine_approval_opens_it(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
     ops, engine = _autonomous_ops(ops, tmp_path)
-    change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1")
-    binding = ApprovalBinding(change_id=change.id, subject="tofu.apply:proxmox", plan_hash=change.hash,
-                              arguments_hash="ah-1", targets=("proxmox",), evidence_ids=("ev-aaaaaaaabbbbbbbb",),
-                              policy_version="v1")
-    approval = engine.issue(change.id, change.hash, binding, record=decide())
+    change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"})
+    approval = engine.issue(change.id, change.hash, bound_for(change), record=decide())
     ops.changes.attach_approval(change.id, approval)
     assert ops.changes.consume(change.id, "tofu.apply", "proxmox", needs_approval=True).state == "applied"
 
 
-def test_an_approval_issued_for_another_change_is_refused(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
-    from opsbrain.auto.approval import ApprovalBinding
+def test_a_binding_that_names_neither_the_arguments_nor_the_evidence_is_refused(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Omitting a field is not the same as it being unchanged.
 
+    The gate used to compare a dict the caller assembled field by field, and skip any it left out - so a
+    binding that named only the plan and the subject passed a five-field check. Every field is now derived
+    from the change, and a binding that does not match is STALE.
+    """
+    ops, engine = _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"})
+    lazy = bound_for(change, arguments_hash="", evidence_ids=())
+    ops.changes.attach_approval(change.id, engine.issue(change.id, change.hash, lazy, record=decide()))
+    with pytest.raises(OpsError, match="STALE"):
+        ops.changes.consume(change.id, "tofu.apply", "proxmox", needs_approval=True)
+
+
+def test_an_approval_issued_for_another_change_is_refused(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
     ops, engine = _autonomous_ops(ops, tmp_path)
     mine = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1")
     theirs = ops.changes.create("tofu.apply", "prod", "y", "ph-2")
-    binding = ApprovalBinding(change_id=theirs.id, subject="tofu.apply:prod", plan_hash=theirs.hash,
-                              arguments_hash="ah-1", targets=("prod",), evidence_ids=("ev-aaaaaaaabbbbbbbb",),
-                              policy_version="v1")
+    binding = bound_for(theirs)
     ops.changes.attach_approval(mine.id, engine.issue(mine.id, mine.hash, binding, record=decide()))
     with pytest.raises(OpsError, match="was issued for"):
         ops.changes.consume(mine.id, "tofu.apply", "proxmox", needs_approval=True)
@@ -327,18 +362,29 @@ def test_an_approval_issued_for_another_change_is_refused(ops, tmp_path) -> None
 
 def test_a_stale_approval_no_longer_opens_the_gate(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
     """The plan moved after the decision: the approval exists and the gate still refuses."""
-    from opsbrain.auto.approval import ApprovalBinding
-
     ops, engine = _autonomous_ops(ops, tmp_path)
     change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1")
-    binding = ApprovalBinding(change_id=change.id, subject="tofu.apply:proxmox", plan_hash="ph-original",
-                              arguments_hash="ah-1", targets=("proxmox",), evidence_ids=("ev-aaaaaaaabbbbbbbb",),
-                              policy_version="v1")
-    ops.changes.attach_approval(change.id, engine.issue(change.id, change.hash, binding,
-                                                                  record=decide()))
+    binding = bound_for(change, plan_hash="ph-original")
+    ops.changes.attach_approval(change.id, engine.issue(change.id, change.hash, binding, record=decide()))
     ops.changes.update_hash(change.id, "ph-swapped")  # the plan was replaced after the decision
     with pytest.raises(OpsError, match="STALE"):
         ops.changes.consume(change.id, "tofu.apply", "proxmox", needs_approval=True)
+
+
+def test_an_engine_that_was_never_installed_refuses_to_issue(tmp_path: Any) -> None:
+    """An approval nothing will later check is not an approval.
+
+    `issue` records what the decision rested on in the change store, and the gate compares against that
+    record. An engine not installed in front of a store would issue an approval with no counterpart, so
+    it says so instead of quietly producing one.
+    """
+    from opsbrain.auto.approval import ApprovalStore
+
+    engine = ApprovalEngine(AutoConfig(enabled=True, autonomy_token=TOKEN), ApprovalStore(tmp_path))
+    binding = bound_for(type("C", (), {"id": "c-00000000", "capability": "tofu.apply", "target": "p",
+                                       "hash": "h", "args": {}})())
+    with pytest.raises(OpsError, match="not installed"):
+        engine.issue("pl-1", "ah-1", binding, record=decide())
 
 
 def test_manual_mode_leaves_the_human_path_working(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]

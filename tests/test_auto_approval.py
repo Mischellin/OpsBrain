@@ -157,12 +157,8 @@ def test_a_retry_with_the_same_key_is_answered_rather_than_re_executed(tmp_path:
     """A restart that retries must get the earlier answer, not a second apply."""
     store = ApprovalStore(tmp_path)
     approval = store.issue(a_binding())
-<<<<<<< HEAD
     first = store.consume(approval.id, current(), owner="worker-1", idempotency_key="job-42")
     store.record_outcome(approval.id, {"state": "executed", "at": now()})
-=======
-    store.consume(approval.id, current(), owner="worker-1", idempotency_key="job-42")
->>>>>>> e41a12a (7: feat: OPS-AUTO-04 - deterministic ApprovalEngine (#7))
     again = store.consume(approval.id, current(), owner="worker-2", idempotency_key="job-42")
     assert first.outcome.get("replayed") is None, "the first spend is the real one"
     assert again.state is LeaseState.CONSUMED
