@@ -10,15 +10,13 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
-import os
 import re
-import time
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .util import OpsError, compact, new_id, now, write_private
+from .util import OpsError, compact, file_lock, new_id, now, write_private
 
 _ID = re.compile(r"^c-[0-9a-f]{8}$")
 #: The id becomes a lock filename, so it is validated as one before it is used as one.
@@ -156,27 +154,14 @@ class ChangeStore:
     def _transition(self, change_id: str) -> Iterator[None]:
         """Exclusive over the whole store directory, so two processes cannot consume one change.
 
-        A lock left behind by a crash is reclaimed after a minute rather than wedging every later
-        approval behind a process that no longer exists.
+        A kernel-held lock, not a lock file reclaimed by age. Reclaiming by mtime let a *slow* process -
+        a stalled write, a suspended one - lose its lock to a second writer, and when it finally ran its
+        cleanup it unlinked the replacement, admitting a third. Two read-modify-write passes then
+        interleaved on one record, which is the thing the lock exists to prevent. `flock` cannot fail that
+        way: the kernel drops it when the holder dies, so a crash needs no reclaim at all.
         """
         if not _CHANGE_ID.fullmatch(change_id):
             # The id reaches a filename, so it is checked before it is used as one.
             raise OpsError(f"invalid change id: {change_id!r}")
-        lock = self.root / f"{change_id}.transition.lock"
-        self.root.mkdir(parents=True, exist_ok=True)
-        while True:
-            try:
-                handle = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            except FileExistsError:
-                with contextlib.suppress(OSError):
-                    if time.time() - lock.stat().st_mtime > 60:
-                        lock.unlink()
-                time.sleep(0.005)
-                continue
-            break
-        try:
+        with file_lock(self.root / f"{change_id}.transition.lock"):
             yield
-        finally:
-            os.close(handle)
-            with contextlib.suppress(OSError):
-                lock.unlink()

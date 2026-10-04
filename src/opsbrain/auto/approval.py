@@ -22,8 +22,6 @@ from __future__ import annotations
 import contextlib
 import json
 import math
-import os
-import time
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -31,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from ..changes import digest
-from ..util import OpsError, new_id, now, write_private
+from ..util import OpsError, file_lock, new_id, now, write_private
 
 CONTRACT_VERSION = "1.0"
 
@@ -322,6 +320,17 @@ class ApprovalStore:
                 # crash. The same key replays the earlier answer; a different key takes the reclaimed lease
                 # over, which is the caller's decision to make explicitly.
                 if now() - float(approval.consumed_at or 0.0) > self.ttl_s:
+                    # A takeover is not an exemption. Reclaiming returned before the expiry and staleness
+                    # checks below, so a worker could pick up a lease whose plan, targets, evidence or
+                    # policy had moved during the TTL and execute without any of it being validated -
+                    # the dead owner had been the one whose checks would have run.
+                    if approval.binding.expired:
+                        raise OpsError(f"approval {approval_id} expired at {now():.0f}; review and "
+                                       f"approve again rather than taking the lease over")
+                    moved = stale_reasons(approval.binding, current)
+                    if moved:
+                        raise OpsError(f"approval {approval_id} is STALE ({', '.join(moved)}): review and "
+                                       f"approve again rather than taking the lease over")
                     reclaimed = Approval(
                         binding=approval.binding, state=LeaseState.CONSUMED, consumed_at=now(),
                         lease_owner=owner or new_id("lease"),
@@ -425,24 +434,13 @@ def execute_once(approval_id: str, store: ApprovalStore, current: dict[str, Any]
 
 @contextlib.contextmanager
 def _locked(path: Path) -> Iterator[None]:
-    """One writer at a time across processes. A lock left by a crash is taken over, not obeyed forever."""
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    while True:
-        try:
-            handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            with contextlib.suppress(OSError):
-                if time.time() - path.stat().st_mtime > 120:
-                    path.unlink()
-            time.sleep(0.005)
-            continue
-        break
-    try:
+    """One writer at a time across processes - a kernel lock, so a crash needs no reclaim.
+
+    Reclaiming an `O_EXCL` lock file by its mtime let a merely slow holder lose the lock, and its later
+    cleanup then removed whatever had replaced it.
+    """
+    with file_lock(path):
         yield
-    finally:
-        os.close(handle)
-        with contextlib.suppress(OSError):
-            path.unlink()
 
 
 def binding_for(change: Any, *, evidence_ids: Sequence[str] = (), policy_version: str,

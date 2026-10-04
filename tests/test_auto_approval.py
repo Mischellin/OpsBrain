@@ -643,3 +643,72 @@ def test_an_approval_for_another_change_is_stale(tmp_path: Path) -> None:
     assert StaleReason.CHANGE_SWAPPED.value in stale_reasons(
         a_binding(), current(change_id="c-99999999"))
     assert stale_reasons(a_binding(), current()) == (), "and the matching change is not stale"
+
+
+def test_a_slow_lock_holder_is_never_displaced(tmp_path: Path) -> None:
+    """The old lock was an `O_EXCL` file reclaimed by mtime, which fails in the worst direction.
+
+    A process that was merely slow - a stalled write, a suspended one - lost its lock to a second writer
+    after a minute, and when it finally ran its cleanup it unlinked the replacement, admitting a third.
+    Two read-modify-write passes then interleaved on one record, which is what the lock exists to prevent.
+    A kernel-held lock has no such case: the holder is never displaced, and a crash releases it itself.
+    """
+    import threading
+    import time as _time
+
+    from opsbrain.util import file_lock
+
+    lock = tmp_path / "x.lock"
+    inside, held = threading.Event(), threading.Event()
+
+    def slow_holder() -> None:
+        with file_lock(lock):
+            inside.set()
+            held.wait(2.0)
+
+    thread = threading.Thread(target=slow_holder)
+    thread.start()
+    assert inside.wait(2.0), "the first holder took the lock"
+    try:
+        acquired: list[bool] = []
+
+        def contend() -> None:
+            with file_lock(lock):
+                acquired.append(True)
+
+        contender = threading.Thread(target=contend)
+        contender.start()
+        _time.sleep(0.3)  # long past any mtime reclaim threshold
+        assert not acquired, "a live holder must not be displaced"
+        held.set()
+        thread.join(2.0)
+        contender.join(2.0)
+        assert acquired, "and the lock is available once it is really released"
+    finally:
+        held.set()
+        thread.join(2.0)
+
+
+def test_a_takeover_runs_the_same_checks_as_a_first_lease(tmp_path: Path) -> None:
+    """A takeover is not an exemption.
+
+    The reclaim path returned before the expiry and staleness checks, so a worker could pick up a lease
+    whose plan, targets, evidence or policy had moved during the TTL - the dead owner was the one whose
+    checks would have run.
+    """
+    store = ApprovalStore(tmp_path, ttl_s=1.0)
+    approval = store.issue(a_binding())
+    store.consume(approval.id, current(), owner="dead-worker", idempotency_key="job-42")
+    path = tmp_path / f"{approval.id}.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["consumed_at"] = round(now() - 3600.0, 3)
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(OpsError, match="STALE"):
+        store.consume(approval.id, current(targets=["somewhere-else"]), owner="taker",
+                      idempotency_key="another-job")
+    with pytest.raises(OpsError, match="expired"):
+        aged = json.loads(path.read_text(encoding="utf-8"))
+        aged["binding"]["created"] = round(now() - 10_000.0, 3)
+        path.write_text(json.dumps(aged), encoding="utf-8")
+        store.consume(approval.id, current(), owner="taker", idempotency_key="another-job")
