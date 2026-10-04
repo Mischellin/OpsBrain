@@ -53,6 +53,8 @@ from opsbrain.auto.evidence import (
     render_for_reviewer,
 )
 from opsbrain.auto.review import ReviewRequest, Subject, parse_review_response
+from opsbrain.auto.runners import FakeReviewer
+from opsbrain.config import Config
 from opsbrain.util import OpsError, now
 
 # Synthetic credentials, shaped so the real redaction patterns match them. Nothing here is a real secret.
@@ -525,8 +527,6 @@ def test_artifact_reference_is_validated_before_the_filesystem_is_touched(tmp_pa
 
 # ------------------------------------------------------------------------------ wiring into the service
 def _config(tmp_path: Path, **auto: Any) -> Any:
-    from opsbrain.config import Config
-
     return Config(repo=str(tmp_path), data_dir=str(tmp_path / "data"),
                   auto=AutoConfig(**{"enabled": True, **auto}))
 
@@ -605,7 +605,7 @@ def test_a_rewritten_bundle_cannot_keep_a_borrowed_id(tmp_path: Path) -> None:
     assert forged.digest == forged.compute_digest()
     object.__setattr__(forged, "id", original.id)  # borrow the identity of the reviewed bundle
     assert forged.id != id_for_digest(forged.digest)
-    assert reason_code(check_evidence(forged, {}, now_s=original.created)) == Reason.EVIDENCE_TAMPERED.value
+    assert reason_code(check_evidence(forged, {}, now_s=original.created + 1)) == Reason.EVIDENCE_TAMPERED.value
 
 
 def test_the_id_is_checked_against_the_digest_on_read(tmp_path: Path) -> None:
@@ -615,7 +615,7 @@ def test_the_id_is_checked_against_the_digest_on_read(tmp_path: Path) -> None:
     document["objective"] = "rewritten after the fact"
     document["digest"] = EvidenceBundle.from_dict(document).compute_digest()
     store.bundles.put(bundle.id, document)
-    assert reason_code(check_evidence(store.get(bundle.id), {}, now_s=bundle.created)) == \
+    assert reason_code(check_evidence(store.get(bundle.id), {}, now_s=bundle.created + 1)) == \
         Reason.EVIDENCE_TAMPERED.value
 
 
@@ -623,7 +623,7 @@ def test_an_honest_bundle_passes_the_same_check(tmp_path: Path) -> None:
     bundle = collected(tmp_path)
     store = store_for(tmp_path)
     payloads, _ = store.load_artifacts(bundle)
-    assert reason_code(check_evidence(bundle, payloads, now_s=bundle.created)) == Reason.EVIDENCE_FRESH.value
+    assert reason_code(check_evidence(bundle, payloads, now_s=bundle.created + 1)) == Reason.EVIDENCE_FRESH.value
 
 
 def test_unbound_evidence_is_not_evidence_for_a_change() -> None:
@@ -638,7 +638,7 @@ def test_unbound_evidence_is_not_evidence_for_a_change() -> None:
 def test_a_bound_entry_still_matches_its_own_change(tmp_path: Path) -> None:
     bundle = collected(tmp_path)
     payloads, _ = store_for(tmp_path).load_artifacts(bundle)
-    assert reason_code(check_evidence(bundle, payloads, now_s=bundle.created,
+    assert reason_code(check_evidence(bundle, payloads, now_s=bundle.created + 1,
                                       change_id="c-1a2b3c4d")) == Reason.EVIDENCE_FRESH.value
 
 
@@ -646,7 +646,7 @@ def test_an_entry_naming_no_target_is_not_inside_the_declared_scope() -> None:
     entry = EvidenceEntry(kind="log", target="", capability="log.journal", command_id="log.journal@?",
                           collector="ssh:ops@10.0.0.42", provenance=Provenance.OBSERVED)
     bundle = EvidenceBundle.build(objective="x", entries=[entry], targets=["ops"], inventory_hash="inv-9f8e")
-    assert reason_code(check_evidence(bundle, {}, now_s=bundle.created)) == Reason.TARGET_NOT_IN_SCOPE.value
+    assert reason_code(check_evidence(bundle, {}, now_s=bundle.created + 1)) == Reason.TARGET_NOT_IN_SCOPE.value
 
 
 def test_observed_content_without_an_artifact_is_missing_evidence() -> None:
@@ -654,7 +654,7 @@ def test_observed_content_without_an_artifact_is_missing_evidence() -> None:
     entry = EvidenceEntry(kind="log", target="ops", capability="log.journal", command_id="log.journal@ops",
                           collector="ssh:ops@10.0.0.42", provenance=Provenance.OBSERVED, content_retained=True)
     bundle = EvidenceBundle.build(objective="x", entries=[entry], targets=["ops"], inventory_hash="inv-9f8e")
-    assert reason_code(check_evidence(bundle, {}, now_s=bundle.created)) == Reason.EVIDENCE_MISSING.value
+    assert reason_code(check_evidence(bundle, {}, now_s=bundle.created + 1)) == Reason.EVIDENCE_MISSING.value
 
 
 def test_a_metadata_only_claim_without_an_artifact_is_not_missing_evidence() -> None:
@@ -666,7 +666,7 @@ def test_a_metadata_only_claim_without_an_artifact_is_not_missing_evidence() -> 
                                   created=moment)
     # A Secret metadata probe is real evidence that deliberately keeps no payload, so this must not be
     # downgraded to missing: the point of the rule is that it has nothing to re-hash, not that it is broken.
-    assert reason_code(check_evidence(bundle, {}, now_s=moment)) == Reason.EVIDENCE_FRESH.value
+    assert reason_code(check_evidence(bundle, {}, now_s=moment + 1)) == Reason.EVIDENCE_FRESH.value
 
 
 @pytest.mark.parametrize("kind", ["Secret", "SECRET", " secret ", "Key", "Private_Key_Metadata"])
@@ -687,7 +687,7 @@ def test_an_unlabelled_submission_is_not_an_observation() -> None:
     assert probe.provenance is Provenance.UNKNOWN
     store, collector = collector_for(tmp_path := Path(evidence_collect_tmp()))
     bundle = collector.collect(observations=[probe], objective="x", inventory_hash="inv-9f8e")
-    assert reason_code(check_evidence(bundle, {}, now_s=bundle.created)) == Reason.EVIDENCE_INCOMPLETE.value
+    assert reason_code(check_evidence(bundle, {}, now_s=bundle.created + 1)) == Reason.EVIDENCE_INCOMPLETE.value
     assert store is not None and tmp_path.exists()
 
 
@@ -698,7 +698,7 @@ def test_observation_time_must_be_declared() -> None:
     _, collector = collector_for(root)
     bundle = collector.collect(observations=[undated], objective="x", inventory_hash="inv-9f8e")
     payloads, _ = store_for(root).load_artifacts(bundle)
-    assert reason_code(check_evidence(bundle, payloads, now_s=bundle.created)) == Reason.EVIDENCE_INCOMPLETE.value
+    assert reason_code(check_evidence(bundle, payloads, now_s=bundle.created + 1)) == Reason.EVIDENCE_INCOMPLETE.value
 
 
 def test_freshness_is_measured_from_when_the_probe_ran(tmp_path: Path) -> None:
@@ -709,7 +709,7 @@ def test_freshness_is_measured_from_when_the_probe_ran(tmp_path: Path) -> None:
     # Same reading, dated now: fresh. The payload is identical, only the clock differs.
     fresh = collected(tmp_path / "fresh", observations=[log(observed_at=now())])
     payloads, _ = store_for(tmp_path / "fresh").load_artifacts(fresh)
-    assert reason_code(check_evidence(fresh, payloads, now_s=fresh.created)) == Reason.EVIDENCE_FRESH.value
+    assert reason_code(check_evidence(fresh, payloads, now_s=fresh.created + 1)) == Reason.EVIDENCE_FRESH.value
 
 
 def test_a_secret_with_a_recognisable_shape_is_redacted_out_of_observation_metadata(tmp_path: Path) -> None:
@@ -755,3 +755,95 @@ def test_the_freshness_window_travels_with_the_bundle() -> None:
     assert EvidenceLimits.from_config(EvidenceConfig(require_observation_time=False)).require_observation_time \
         is False
     assert EvidenceLimits(max_age_s=60).require_observation_time is True
+
+
+# ============================== P1 round 2 on #16: findings against the evidence fixes themselves
+def test_component_versions_cannot_be_edited_through_the_attribute(tmp_path: Path) -> None:
+    """`frozen=True` stops assignment but does nothing about a dict reached through the attribute."""
+    bundle = collected(tmp_path)
+    with pytest.raises(TypeError):
+        bundle.component_versions["caddy"] = "9.9.9"  # type: ignore[index]
+    assert "9.9.9" not in json.dumps(bundle.to_dict())
+
+
+def test_a_record_carrying_an_unknown_field_is_refused() -> None:
+    document = collected(Path(tempfile.mkdtemp(prefix="opsbrain-ev-"))).to_dict()
+    document["approved_by"] = "the operator, probably"
+    with pytest.raises(EvidenceError, match="fields this build does not know"):
+        EvidenceBundle.from_dict(document)
+
+
+def test_an_unknown_field_on_an_entry_is_refused() -> None:
+    document = collected(Path(tempfile.mkdtemp(prefix="opsbrain-ev-"))).to_dict()
+    document["entries"][0]["verdict"] = "PASS"
+    with pytest.raises(EvidenceError, match="fields this build does not know"):
+        EvidenceBundle.from_dict(document)
+
+
+def test_the_size_limit_counts_the_payloads_not_only_the_index(tmp_path: Path) -> None:
+    """A limit that ignores what the index points at is a limit on the index, not on the evidence."""
+    store = EvidenceStore(tmp_path / "small", max_artifact_bytes=1_000_000)
+    collector = EvidenceCollector(store, EvidenceConfig(max_bundle_bytes=4_096), allowed=("log.journal",))
+    with pytest.raises(EvidenceError, match="bytes, over"):
+        collector.collect(observations=[log(content="x" * 40_000)], objective="x", inventory_hash="inv")
+
+
+def test_a_future_dated_observation_is_refused_on_its_own() -> None:
+    """Taking the minimum first would let one future reading hide behind an older one."""
+    moment = now()
+    store = EvidenceStore(Path(tempfile.mkdtemp(prefix="opsbrain-ev-")))
+    saved = store.save_artifact("observed payload")
+    entry = EvidenceEntry(kind="log", target="ops", capability="log.journal", command_id="log.journal@ops",
+                          collector="ssh:ops@10.0.0.42", provenance=Provenance.OBSERVED,
+                          observed_at=moment - 600, captured=moment - 600, artifact=saved.id,
+                          content_hash=saved.content_hash)
+    bundle = EvidenceBundle.build(objective="x", entries=[entry], targets=["ops"], inventory_hash="inv",
+                                  created=moment - 600)
+    # checked *before* the reading it contains: a future-dated capture is not excused by an older one
+    payloads = {saved.id: "observed payload"}
+    assert reason_code(check_evidence(bundle, payloads, now_s=moment - 601)) == \
+        Reason.EVIDENCE_INCOMPLETE.value
+    assert reason_code(check_evidence(bundle, payloads, now_s=moment - 599)) == Reason.EVIDENCE_FRESH.value
+
+
+def test_a_bundle_file_that_exists_but_is_corrupt_is_tampering_not_absence(tmp_path: Path) -> None:
+    """Telling the reader to go and collect more evidence describes the wrong problem."""
+    bundle = collected(tmp_path)
+    store = store_for(tmp_path)
+    store.bundles._path(bundle.id).write_text("{ not json at all")
+    checks = store.verify(bundle.id)
+    assert reason_code(checks) == Reason.EVIDENCE_TAMPERED.value
+    assert "corrupt" in checks[0].detail or "record" in checks[0].detail
+
+
+def test_a_bundle_that_was_never_stored_is_missing_not_tampered(tmp_path: Path) -> None:
+    bundle = collected(tmp_path)
+    store = store_for(tmp_path)
+    (store.bundles.root / f"{bundle.id}.json").unlink()
+    assert reason_code(store.verify(bundle.id)) == Reason.EVIDENCE_MISSING.value
+
+
+def test_a_render_whose_framing_alone_exceeds_the_budget_says_so(tmp_path: Path) -> None:
+    bundle = collected(tmp_path)
+    rendered = render_for_reviewer(bundle, max_chars=40)
+    assert len(rendered) < 200, "a hard budget must be honoured even by the fixed framing"
+    assert "truncated" in rendered
+
+
+def test_an_observation_naming_no_command_is_refused(tmp_path: Path) -> None:
+    store, collector = collector_for(tmp_path)
+    with pytest.raises(EvidenceError, match="must name the command"):
+        collector.collect(observations=[log(command_id="")], objective="x", inventory_hash="inv")
+
+
+def test_an_injected_collector_is_rebound_to_each_request(tmp_path: Path) -> None:
+    """Otherwise a collector configured for one call silently keeps serving the next."""
+    from opsbrain.auto.service import AutoService
+
+    store, injected = collector_for(tmp_path)
+    auto = AutoService(Config(repo=str(tmp_path), data_dir=str(tmp_path / "data"),
+                              auto=AutoConfig(enabled=True)), reviewer=FakeReviewer(), collector=injected)
+    auto.evidence = store
+    rebased = auto.collector(allowed=("log.journal",), change_id="c-22222222")
+    assert rebased is injected
+    assert rebased.change_id == "c-22222222", "the per-call binding is not optional"

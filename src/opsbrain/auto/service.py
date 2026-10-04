@@ -13,13 +13,15 @@ Outside it, budgets do not exist and redelivery double-charges. Inside it:
 from __future__ import annotations
 
 import threading
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ..audit import AuditLog
 from ..util import OpsError, new_id
 from .config import AutoConfig
-from .evidence import EvidenceCollector, Observation, passed, reason_code
+from .evidence import EvidenceCollector, EvidenceStore, Observation, passed, reason_code
 from .ledger import BudgetLedger
 from .review import (
     CONTRACT_VERSION,
@@ -300,11 +302,11 @@ class AutoService:
                  root: Path | None = None, collector: EvidenceCollector | None = None):
         self.config = config
         self.auto: AutoConfig = config.auto
-        self.audit = AuditLog(config.data_path / "audit.jsonl")
         self.root = root or (config.data_path / "auto")
         self.reviews = ReviewService(self.auto, self.root, reviewer=reviewer, reviewer_factory=reviewer_factory)
         self.evidence = EvidenceStore(self.root / "evidence", max_artifact_bytes=self.auto.evidence.max_bundle_bytes)
-        self._collector = collector
+        self.audit = AuditLog(config.data_path / "audit.jsonl")
+        self._collector: EvidenceCollector | None = collector
 
     @property
     def enabled(self) -> bool:
@@ -321,7 +323,8 @@ class AutoService:
             raise OpsError("evidence collection needs an explicit list of allowed capabilities")
         if self._collector is None:
             return EvidenceCollector(self.evidence, self.auto.evidence, allowed=allowed, change_id=change_id)
-        # An injected collector is a test double, rebound to this request rather than served as configured.
+        # An injected collector is a test double. Rebound to this request rather than returned as it was
+        # configured earlier, so the per-call allowlist and change binding cannot be quietly bypassed.
         self._collector.allowed = frozenset(allowed)
         self._collector.change_id = change_id
         return self._collector

@@ -31,6 +31,7 @@ Three further rules are structural rather than advisory:
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import math
 import re
@@ -38,6 +39,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from ..changes import digest
@@ -88,6 +90,10 @@ class Reason(StrEnum):
     EVIDENCE_FOREIGN_CHANGE = "evidence_foreign_change"
     EVIDENCE_INCOMPLETE = "evidence_incomplete"
     TARGET_NOT_IN_SCOPE = "target_not_in_scope"
+
+    @property
+    def is_ok(self) -> bool:
+        return self is Reason.EVIDENCE_FRESH
 
 
 class EvidenceError(OpsError):
@@ -210,6 +216,7 @@ class EvidenceEntry:
     def from_dict(data: Any) -> EvidenceEntry:
         if not isinstance(data, dict):
             raise EvidenceError("evidence entry must be an object")
+        _reject_unknown(data, _known_fields(EvidenceEntry), "evidence entry")
         provenance = _text(data.get("provenance"), Provenance.UNKNOWN.value)
         try:
             kind = Provenance(provenance)
@@ -225,6 +232,8 @@ class EvidenceEntry:
             change_id=_text(data.get("change_id")), content_retained=bool(data.get("content_retained", True)),
             redactions=_int(data.get("redactions")), note=_text(data.get("note")),
         )
+
+
 
 
 @dataclass(frozen=True)
@@ -247,7 +256,9 @@ class EvidenceBundle:
     arguments_hash: str = ""
     targets: tuple[str, ...] = ()
     inventory_hash: str = ""
-    component_versions: Mapping[str, str] = field(default_factory=dict)
+    #: A `MappingProxyType`, not a dict. `frozen=True` stops attribute assignment but does nothing about a
+    #: dict reached through the attribute, and these versions are what a plan is bound to.
+    component_versions: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
     collector: str = ""
     #: Always False. A hash attests that a record was not altered, never that a claim is true.
     proves_truth: bool = False
@@ -280,7 +291,8 @@ class EvidenceBundle:
             created=_floor_ms(now() if created is None else created),
             limits=limits or EvidenceLimits(), digest="", change_id=change_id, plan_hash=plan_hash,
             arguments_hash=arguments_hash, targets=declared,
-            inventory_hash=inventory_hash, component_versions=dict(sorted((component_versions or {}).items())),
+            inventory_hash=inventory_hash,
+            component_versions=MappingProxyType(dict(sorted((component_versions or {}).items()))),
             collector=collector,
         )
         return EvidenceBundle(**{**draft.__dict__, "id": id_for_digest(draft.compute_digest()),
@@ -368,6 +380,7 @@ class EvidenceBundle:
     def from_dict(data: Any) -> EvidenceBundle:
         if not isinstance(data, dict):
             raise EvidenceError("evidence bundle must be an object")
+        _reject_unknown(data, _known_fields(EvidenceBundle), "evidence bundle")
         raw_limits = data.get("limits")
         if not isinstance(raw_limits, dict):
             raise EvidenceError("evidence bundle has no limits: a bundle without a freshness window is stale")
@@ -449,6 +462,32 @@ def _floor_ms(moment: float) -> float:
 def content_hash(text: str) -> str:
     """The hash of what is actually stored - the redacted text, not what was captured."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _known_fields(record: type) -> set[str]:
+    """Every key a record may carry: its declared fields plus the ones `to_dict` derives.
+
+    Derived from the class rather than from an instance, because both records have required fields and an
+    instance built only to read a key list is a field list that can drift from what is written.
+    """
+    names = {field.name for field in dataclasses.fields(record)}
+    return names | _DERIVED_KEYS.get(record.__name__, set())
+
+
+#: Keys `to_dict` emits that are not stored dataclass fields.
+_DERIVED_KEYS: dict[str, set[str]] = {"EvidenceEntry": {"observation_time_declared"}}
+
+
+def _reject_unknown(data: Any, known: set[str], what: str) -> None:
+    """Refuse a record carrying fields this build does not understand.
+
+    An unknown field is a field nobody validates and nobody reads, and a writer can add one without
+    touching anything the integrity check covers. Failing closed says the record was written by a different
+    version than the one being asked to trust it.
+    """
+    extra = sorted(set(data) - known)
+    if extra:
+        raise EvidenceError(f"{what} has fields this build does not know: {extra}")
 
 
 def id_for_digest(digest: str) -> str:
@@ -551,6 +590,18 @@ def check_evidence(bundle: EvidenceBundle, artifacts: Mapping[str, str] | None =
         failures.append(Check(Reason.EVIDENCE_INCOMPLETE,
                               f"no observation time declared for {', '.join(sorted(undated)[:4])}: the "
                               "freshness window cannot be evaluated from the moment of ingestion alone"))
+    # Checked per entry. Taking the minimum first would let one future-dated reading hide behind an older
+    # one: the oldest is in the past, so the bundle reads as fine while one observation claims to come from
+    # next week.
+    for entry in bundle.entries:
+        if entry.observed_at and entry.observed_at > moment:
+            failures.append(Check(Reason.EVIDENCE_INCOMPLETE,
+                                  f"{entry.command_id} is dated {entry.observed_at:.0f}, after the moment it was "
+                                  "checked: clocks disagree"))
+    if bundle.created > moment:
+        failures.append(Check(Reason.EVIDENCE_INCOMPLETE,
+                              f"the bundle is dated {bundle.created:.0f}, after the moment it was checked: "
+                              "clocks disagree"))
     oldest = min([bundle.created, *(entry.observed_at or entry.captured for entry in bundle.entries)])
     age = moment - oldest
     if age > bundle.limits.max_age_s:
@@ -640,6 +691,10 @@ def _assemble(header: str, body: str, footer: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     room = max(0, max_chars - len(header) - len(footer) - 48)
+    if room == 0:
+        # Header and footer alone exceed the budget. Truncating to nothing and still emitting them hands the
+        # model more text than it was allowed, so the fixed part is cut too and says so.
+        return f"[context truncated at {max_chars} chars: the fixed framing alone exceeds the budget]\n"
     return f"{header}{body[:room]}\n[context truncated at {max_chars} chars]{footer}\n"
 
 
@@ -743,6 +798,20 @@ class EvidenceStore:
                 blocked[artifact_id] = str(exc)
         return payloads, blocked
 
+    def read_or_explain(self, bundle: EvidenceBundle) -> tuple[dict[str, str], dict[str, str]]:
+        """As `load_artifacts`, but a reference that exists and cannot be parsed counts as tampering.
+
+        A corrupt record is not an absent one. Reporting it as `evidence_missing` tells the reader to go
+        and collect more evidence, when what actually happened is that this record was altered.
+        """
+        payloads, blocked = self.load_artifacts(bundle)
+        for artifact_id in bundle.artifact_ids():
+            if artifact_id in payloads or artifact_id in blocked:
+                continue
+            if (self._artifact_path(artifact_id)).is_file():
+                blocked[artifact_id] = "the stored artifact exists but cannot be read back"
+        return payloads, blocked
+
     # -- bundles ----------------------------------------------------------------------------------
     def save(self, bundle: EvidenceBundle) -> EvidenceBundle:
         """Persist an immutable bundle. Re-saving the same bundle is a no-op; saving a *different* one
@@ -779,11 +848,20 @@ class EvidenceStore:
 
     def verify(self, bundle_id: str, *, now_s: float | None = None, change_id: str | None = None) -> Checks:
         """Load a bundle from disk and re-run every check, so a substituted payload is caught here rather
-        than by whoever reads the verdict. A bundle that is not there is `evidence_missing`."""
+        than by whoever reads the verdict.
+
+        A bundle that is not there is `evidence_missing`. A bundle whose *file is there* and cannot be
+        parsed is `evidence_tampered`: those are different problems, and telling the reader to go and
+        collect more evidence describes the wrong one.
+        """
+        if not valid_id(bundle_id, ("ev",)) and not self.bundles.has(bundle_id):
+            return [Check(Reason.EVIDENCE_MISSING, f"not a bundle id: {bundle_id!r}")]
+        present = self.bundles.root / f"{bundle_id}.json"
         try:
             bundle = self.get(bundle_id)
         except (OpsError, EvidenceError) as exc:
-            return [Check(Reason.EVIDENCE_MISSING, str(exc))]
+            reason = Reason.EVIDENCE_TAMPERED if present.is_file() else Reason.EVIDENCE_MISSING
+            return [Check(reason, str(exc))]
         payloads, blocked = self.load_artifacts(bundle)
         return check_evidence(bundle, payloads, now_s=now_s, change_id=change_id, blocked=blocked)
 
@@ -812,13 +890,21 @@ class EvidenceCollector:
         for observation in observations:
             entries.append(self._entry(observation, collector))
         bundle = EvidenceBundle.build(
-            objective=objective, entries=entries, limits=EvidenceLimits.from_config(self.config),
-            change_id=self.change_id, plan_hash=plan_hash, arguments_hash=arguments_hash,
-            targets=targets or [entry.target for entry in entries if entry.target],
-            inventory_hash=inventory_hash, component_versions=component_versions, collector=collector,
-            created=created,
+            objective=_identity_field(objective, "")[:400], entries=entries,
+            limits=EvidenceLimits.from_config(self.config), change_id=self.change_id,
+            plan_hash=_identity_field(plan_hash, ""), arguments_hash=_identity_field(arguments_hash, ""),
+            targets=[_identity_field(item, "") for item in targets
+                     or [entry.target for entry in entries if entry.target]],
+            inventory_hash=_identity_field(inventory_hash, ""),
+            component_versions={_identity_field(key, ""): _identity_field(str(value), "")
+                                for key, value in (component_versions or {}).items()},
+            collector=_identity_field(collector, ""), created=created,
         )
+        # Counted over what is actually written: `to_dict` holds references, and a limit that ignores the
+        # payloads it points at is a limit on the index, not on the evidence.
         size = len(compact(bundle.to_dict()).encode("utf-8"))
+        for entry in entries:
+            size += entry.bytes
         if size > self.config.max_bundle_bytes:
             raise EvidenceError(f"evidence bundle is {size} bytes, over auto.evidence."
                                 f"max_bundle_bytes={self.config.max_bundle_bytes}: collect less per pass")
@@ -829,6 +915,10 @@ class EvidenceCollector:
             raise EvidenceError("no capabilities are allowed: evidence collection needs a policy first")
         if observation.capability not in self.allowed:
             raise EvidenceError(f"capability {observation.capability!r} is not an allowed probe")
+        if not _identity_field(observation.command_id, ""):
+            # Without it the record cannot say what ran, so a reader cannot tell this observation from any
+            # other, and re-running it is not possible either.
+            raise EvidenceError("an observation must name the command that produced it")
         # Framed into one line with the region delimiters removed: the note is the label the
         # reader sees, and a label that can close the fence undoes the fence.
         note = _identity_field(observation.note)[:400]
