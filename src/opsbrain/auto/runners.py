@@ -61,6 +61,7 @@ class RunnerSettings:
     snapshot_dir: str = ""  # directory the request is written into
     scratch_home: str = ""  # HOME for the reviewer: empty credentials, not the operator's
     sandbox: tuple[str, ...] = ()  # enforced confinement wrapper (e.g. sandbox-exec, bwrap, firejail)
+    api_key_env: str = ""  # which variable holds the API key when auth is `api`
     live: bool = False  # opt-in: without it no external binary is ever started
 
     def safe_env(self) -> dict[str, str]:
@@ -75,6 +76,30 @@ class RunnerSettings:
             home = str(Path(scratch).expanduser())
             env.update({"HOME": home, "XDG_CONFIG_HOME": f"{home}/.config", "XDG_CACHE_HOME": f"{home}/.cache",
                         "XDG_DATA_HOME": f"{home}/.local/share"})
+        return self._apply_auth(env)
+
+    def _apply_auth(self, env: dict[str, str]) -> dict[str, str]:
+        """Make `auth` decide which credentials the reviewer can see.
+
+        Stored and reported but never consulted, `auth` was a label on a setting that did nothing:
+        `api` and `subscription` launched the same command against the same inherited `HOME`, so the mode
+        picked whichever credentials the binary happened to find. Now the mode chooses the environment, and
+        an `api` run without its key named fails rather than silently falling back to a subscription login
+        the operator did not select.
+        """
+        if self.auth == "api":
+            if not self.api_key_env:
+                raise ReviewerError(
+                    "auto.review.auth is `api` but auto.review.api_key_env names no variable: the mode would "
+                    "be ignored and whichever credential the binary found would be used instead")
+            if self.api_key_env not in os.environ:
+                raise ReviewerError(
+                    f"auto.review.auth is `api` but {self.api_key_env} is not set: refusing to start "
+                    "rather than falling back to another account")
+            env[self.api_key_env] = os.environ[self.api_key_env]
+            return env
+        # A subscription login is a file under the reviewer's own scratch HOME, which the env allowlist
+        # never populated. Nothing is added, and nothing needs removing: the credentials are not inherited.
         return env
 
 
@@ -328,7 +353,9 @@ def run_review(reviewer: Any, request: ReviewRequest, *, retries: int = 0,
             last = ReviewResult.failure(request, RunnerStatus.RUNNER_ERROR, f"{type(exc).__name__}: {exc}"[:200])
         else:
             result = parse_review_response(request, payload)
-            if result.status is not RunnerStatus.INVALID_RESPONSE or attempt >= attempts:
+            # A well-formed *refusal* ends the review; a well-formed report that the attempt itself failed
+            # is a transport failure wearing a status code, and is exactly what a retry exists for.
+            if not _retryable(result) or attempt >= attempts:
                 return result
             last = result
         if attempt < attempts and _retryable(last):

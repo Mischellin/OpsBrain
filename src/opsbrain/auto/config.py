@@ -44,6 +44,7 @@ class ReviewConfig(_Model):
     snapshot_dir: str = ""
     scratch_home: str = ""  # HOME handed to the reviewer: empty, never the operator's
     sandbox: list[str] = Field(default_factory=list)  # enforced wrapper: sandbox-exec / bwrap / firejail
+    api_key_env: str = ""  # variable holding the key when auth is `api`; the mode is not a label
     live: bool = False
     require_allow: bool = True  # `allow` policy rows may not be resolved by the model alone
 
@@ -83,6 +84,9 @@ class ReviewConfig(_Model):
                              "firejail): a working directory does not confine a process")
         if self.sandbox and not self.live:
             raise ValueError("auto.review.sandbox only matters with auto.review.live=true")
+        if self.auth == "api" and self.live and not self.api_key_env:
+            raise ValueError("auto.review.auth is `api`, so name the credential in auto.review.api_key_env: "
+                             "without it the mode selects nothing and whichever login the binary finds is used")
         return self
 
 

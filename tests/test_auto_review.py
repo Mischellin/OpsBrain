@@ -395,7 +395,9 @@ def test_absurd_or_negative_reported_usage_is_refused_rather_than_charged(tmp_pa
         result = reviews.review(request_for())
         assert result.status is RunnerStatus.INVALID_RESPONSE, usage
         assert result.is_pass is False, usage
-        assert reviews.usage()["spend_usd"] == 0.0, f"{usage} must not move the budget"
+        # The reservation stays - the call was made and cost something - but a value the reviewer invented
+        # must not move the *measured* balance by a negative amount.
+        assert reviews.usage()["input_tokens"] == 0, f"{usage} must not move the token counters"
 
 
 def test_a_concurrent_duplicate_does_not_review_twice(tmp_path: Path) -> None:
@@ -486,11 +488,19 @@ def test_review_summary_counts_passes_separately_from_statuses() -> None:
 @pytest.mark.skipif(not os.environ.get("OPSBRAIN_LIVE_REVIEW"),
                     reason="opt-in: set OPSBRAIN_LIVE_REVIEW=<path to a runner argv file>")
 def test_live_smoke_opt_in(tmp_path: Path) -> None:
-    """Never runs in CI. Existence of the file is the whole opt-in switch, so no secret lives here."""
-    settings = RunnerSettings(command=tuple(Path(os.environ["OPSBRAIN_LIVE_REVIEW"]).read_text().split()),
-                              live=True, snapshot_dir=str(tmp_path))
+    """Never runs in CI, and it has to actually reach the runner.
+
+    A smoke test that asserts only "some status exists" passes on the very failure the sandbox
+    requirement introduces, so `OPSBRAIN_LIVE_REVIEW` could report a green live run that never started a
+    binary, never read a credential and never saw a model answer. It requires `OK` now, and it refuses to
+    pass on a status that means the runner never started.
+    """
+    argv = Path(os.environ["OPSBRAIN_LIVE_REVIEW"]).read_text().split()
+    settings = RunnerSettings(command=tuple(argv), live=True, snapshot_dir=str(tmp_path), sandbox=("bwrap",),
+                              scratch_home=str(tmp_path / "scratch"), model="", auth="subscription")
     result = run_review(CodexReviewer(settings), request_for())
-    assert result.status is not None, "a live runner still has to answer with a status"
+    assert result.status is RunnerStatus.OK, f"the live runner did not answer: {result.status} {result.note}"
+    assert result.verdict is not None, "a live run that produced no verdict tested nothing"
 
 
 # ------------------------------------------------------ live mode cannot be configured without a sandbox
@@ -611,3 +621,86 @@ def test_a_claim_is_single_use(tmp_path: Path) -> None:
     assert atomic_claim(path, "a", ttl_s=60.0) == "a"
     assert atomic_claim(path, "b", ttl_s=60.0) is None
     assert read_claim(path)["owner"] == "a"
+
+
+# ============================== P1 round 3 on #15: the budget, the lease, the auth mode and the smoke test
+def test_the_budget_is_shared_across_services(tmp_path: Path) -> None:
+    """Two ReviewServices over one data directory are a server and a CLI, and they share the money.
+
+    An in-memory counter cannot see the other process, so both were admitted against the same balance and
+    the documented hard ceiling was not one.
+    """
+    auto = AutoConfig(enabled=True, review={"runner": "codex", "max_model_calls": 2})
+    first = ReviewService(auto, tmp_path / "auto", reviewer=FakeReviewer())
+    second = ReviewService(auto, tmp_path / "auto", reviewer=FakeReviewer())
+    assert first.review(request_for(objective="a")).status is RunnerStatus.OK
+    assert second.review(request_for(objective="b")).status is RunnerStatus.OK
+    third = first.review(request_for(objective="c"))
+    assert third.status is RunnerStatus.BUDGET_EXCEEDED, "the third attempt was admitted anyway"
+    assert first.usage()["model_calls"] == 2 and second.usage()["model_calls"] == 2
+
+
+def test_every_reserved_attempt_survives_a_restart_including_the_failed_ones(tmp_path: Path) -> None:
+    """A request that failed twice and then succeeded is two paid attempts, and both reappear."""
+    runner = FakeReviewer()
+    calls = {"n": 0}
+    document = response_document(Verdict.PASS)
+
+    def flaky(request: ReviewRequest) -> str:
+        calls["n"] += 1
+        return json.dumps(document if calls["n"] == 3 else {"contract_version": CONTRACT_VERSION,
+                                                             "status": "TIMEOUT"})
+
+    auto = AutoConfig(enabled=True, review={"runner": "codex", "max_retries": 3, "max_model_calls": 10})
+    first = ReviewService(auto, tmp_path / "auto", reviewer=runner)
+    first._reviewer = None
+    first._factory = lambda _settings: type("R", (), {"name": "flaky", "review": staticmethod(flaky)})()
+    first.review(request_for())
+    assert first.usage()["model_calls"] == 3, "two failures and a success are three attempts"
+
+    restarted = ReviewService(auto, tmp_path / "auto", reviewer=FakeReviewer())
+    assert restarted.usage()["model_calls"] == 3, "a restart refunded two paid attempts"
+
+
+def test_the_claim_outlives_the_whole_retry_window(tmp_path: Path) -> None:
+    """A redelivery arriving while the original attempt still runs must not start a second paid review."""
+    auto = AutoConfig(enabled=True, review={"runner": "codex", "timeout_s": 600.0, "max_retries": 3})
+    reviews = ReviewService(auto, tmp_path / "auto", reviewer=FakeReviewer())
+    request = request_for()
+    claim = reviews.root / "claims" / f"{request.with_id().review_id}.claim"
+    assert atomic_claim(claim, "owner", 600.0 * 4 + 60.0) == "owner"
+    claim.unlink()
+    # the TTL the service derives must be at least the whole window, not the 900s default
+    assert reviews.reviews.timeout_s * (reviews.reviews.max_retries + 1) + 60.0 > 900.0
+    result = reviews.review(request)
+    assert result.status is RunnerStatus.OK, "the request must not be refused by its own stale claim"
+
+
+def test_auth_api_refuses_to_start_without_its_key(monkeypatch: Any) -> None:
+    """Silently falling back to whichever login the binary found is how a mode becomes a label."""
+    monkeypatch.delenv("CODEX_API_KEY", raising=False)
+    settings = RunnerSettings(command=("codex", "exec", "{prompt}"), auth="api", live=True, sandbox=("bwrap",),
+                              snapshot_dir="/tmp", api_key_env="CODEX_API_KEY")
+    with pytest.raises(ReviewerError, match="CODEX_API_KEY"):
+        CodexReviewer(settings).review(request_for())
+
+
+def test_auth_api_without_a_named_variable_is_refused() -> None:
+    settings = RunnerSettings(command=("codex", "exec", "{prompt}"), auth="api", live=True, sandbox=("bwrap",),
+                              snapshot_dir="/tmp")
+    with pytest.raises(ReviewerError, match="names no variable"):
+        CodexReviewer(settings).review(request_for())
+
+
+def test_auth_api_passes_only_its_own_key(monkeypatch: Any) -> None:
+    monkeypatch.setenv("CODEX_API_KEY", "sk-test")
+    monkeypatch.setenv("OTHER_SECRET", "nope")
+    env = RunnerSettings(auth="api", api_key_env="CODEX_API_KEY", snapshot_dir="/tmp").safe_env()
+    assert env["CODEX_API_KEY"] == "sk-test"
+    assert "OTHER_SECRET" not in env
+
+
+def test_auth_api_must_name_its_key_in_config() -> None:
+    with pytest.raises(ValidationError, match="api_key_env"):
+        AutoConfig(enabled=True, review={"live": True, "command": ["codex", "{prompt}"], "sandbox": ["bwrap"],
+                                         "auth": "api"})
