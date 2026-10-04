@@ -66,10 +66,11 @@ class ChangeStore:
     #: requirement for it. A gate that raises instead refuses; a gate that returns False only leaves the
     #: question of approval where it was.
     gate: Callable[[Change], bool] | None = None
-    #: Called with the change and the approval the engine spent, once the change reaches APPLIED. The
-    #: engine spends the lease when the gate opens so a concurrent revocation cannot land in between; the
-    #: outcome is only known here, after the mutation ran.
-    on_executed: Callable[[Change, str], None] | None = None
+    on_executed: Callable[[Change, str, dict[str, Any]], None] | None = None
+    #: The approval the engine spent, handed to the operator path so the *job* records the outcome.
+    #: `consume` runs before `start_job`, so claiming "executed" there would assert a mutation that may
+    #: never have been dispatched - and a lease recorded as executed is no longer reclaimable.
+    spent_approval: str = ""
 
     def __init__(self, root: Path, ttl_s: int):
         self.root, self.ttl_s = root, ttl_s
@@ -153,6 +154,15 @@ class ChangeStore:
                               "workflow_started": at}
             self._save(change)
         return change
+
+    def record_execution(self, change_id: str, outcome: dict[str, Any]) -> None:
+        """Record what the spent lease actually did, from the job that did it."""
+        with self._transition(change_id):
+            change = self.get(change_id)
+            spent = self.spent_approval or change.engine_approval
+            if spent and self.on_executed is not None:
+                with contextlib.suppress(Exception):  # a lost outcome must not undo the mutation
+                    self.on_executed(change, spent, outcome)
 
     def note_repair_cycle(self, change_id: str) -> Change:
         """Count one repair cycle durably.
@@ -281,11 +291,8 @@ class ChangeStore:
                                f"{change_id}`")
             change.state, change.decided_at = APPLIED, now()
             self._save(change)
-            spent = change.engine_approval if engine_approved else ""
-            if spent and self.on_executed is not None:
-                # The lease was already spent when the gate opened; only the outcome is known now.
-                with contextlib.suppress(Exception):  # a lost outcome must not undo the mutation
-                    self.on_executed(change, spent)
+            # Handed over, not recorded: the mutation has not been dispatched yet.
+            self.spent_approval = change.engine_approval if engine_approved else ""
             return change
 
     @contextlib.contextmanager

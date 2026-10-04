@@ -3,6 +3,7 @@ and related operations share one tool with an `action` argument."""
 
 from __future__ import annotations
 
+import json
 import secrets
 from collections.abc import Callable
 from pathlib import Path
@@ -14,8 +15,14 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .auto.config import all_reason_codes
+from .auto.plan import ChangePlan
 from .service import OpsBrain
 from .util import OpsError, write_private
+
+#: The steps a client performs to reach an autonomous apply, in order. The `autonomy` action table and the
+#: instructions below both name these, because a flow the client is told about and a surface that cannot
+#: carry it is worse than either one alone.
+AUTONOMOUS_FLOW = ("review-plan", "decide")
 
 _COMMON = (
     "OpsBrain operates the infrastructure with compact answers. Start with `overview`, then `docs action=status` for "
@@ -196,9 +203,10 @@ def build_server(ops: OpsBrain) -> MCPServer:
     @server.tool()
     def autonomy(action: Literal[  # noqa: A002
         "status", "capabilities", "reviews", "evidence", "bundles", "verify_evidence", "reasons", "checks",
-        "verify-plan", "decide"
-    ] = "status", limit: int = 20, id: str | None = None, plan: str | None = None) -> str:
-        """Autonomous pipeline, read-only, except `decide`.
+        "verify-plan", "review-plan", "decide"
+    ] = "status", limit: int = 20, id: str | None = None, plan: str | None = None,
+        document: str | None = None) -> str:
+        """Autonomous pipeline, read-only, except `review-plan` and `decide`.
 
         status: switches, mode, budget, evidence and verification overview
         capabilities: is the reviewer runnable; never claims a model it could not check
@@ -207,10 +215,12 @@ def build_server(ops: OpsBrain) -> MCPServer:
         reasons: every reason code the pipeline can emit
         checks: what verification can demand, each with its own statement of purpose
         verify-plan: verify a change from the targets its own plan declared
+        review-plan: submit a plan as JSON in `document` and review it, producing the preflight record
         decide: ask the engine about a pending change and, on APPROVE, issue the approval it authorises.
-            Needs `id` (the change) and `plan` (the reviewed plan); the apply then needs no human step.
+            Needs `id` (the change) and `plan` (the reviewed plan id); the apply then needs no human step.
         """
-        return ops.call("autonomy", {"action": action, "id": id, "plan": plan}, lambda: _dispatch(action, {
+        return ops.call("autonomy", {"action": action, "id": id, "plan": plan},
+                       lambda: _dispatch(action, {
             "status": ops.auto.overview,
             "capabilities": lambda: ops.auto.reviews.capabilities(),
             "reviews": lambda: {"items": ops.auto.reviews.list(limit)},
@@ -221,6 +231,11 @@ def build_server(ops: OpsBrain) -> MCPServer:
             "checks": lambda: {"observation": ops.auto.verify_overview(),
                                "available": ops.auto.verification_checks()},
             "verify-plan": lambda: ops.auto.verify_plan(_need(id, "id")),
+            # Without this the advertised flow could not start: `decide` needs a preflight record, and
+            # `review_plan` was reachable only from Python, so a client following the instructions always
+            # ended at "no preflight record".
+            "review-plan": lambda: ops.auto.review_plan(
+                ChangePlan.from_dict(json.loads(_need(document, "document")))),
             "decide": lambda: ops.auto.decide_change(_need(id, "id"), _need(plan, "plan"))}))
 
     return server

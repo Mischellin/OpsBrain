@@ -47,8 +47,8 @@ class Core:
         # outcome is recorded from the change store rather than from the gate that cannot yet know.
         approvals = self.auto.engine().approvals
         if approvals is not None:
-            self.changes.on_executed = lambda _change, approval_id: approvals.record_outcome(
-                approval_id, {"state": "executed", "at": round(time.monotonic(), 3)})
+            self.changes.on_executed = lambda change, approval_id, outcome: approvals.record_outcome(
+                approval_id, {**outcome, "at": round(time.monotonic(), 3)})
         self.finalizers: dict[str, Finalizer] = {}
 
     # -- helpers -----------------------------------------------------------------------------------

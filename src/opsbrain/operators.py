@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import io
 import json
@@ -257,6 +258,7 @@ class Operators(Core):
 
     def _done_tofu_apply(self, job: Job, rc: int, text: str) -> dict[str, Any]:
         meta = self.artifacts.save("tofu-apply", job.title, text)
+        self._settle_lease(job, rc)
         out: dict[str, Any] = {"stack": job.meta["stack"], "change": job.meta["change"], "artifact": meta.id,
                                "ok": rc == 0, **parsers.tofu_text(text)}
         if rc == PLAN_MISMATCH_RC and (mismatch := PLANMISMATCH.search(text)):
@@ -383,6 +385,20 @@ class Operators(Core):
         job = self.start_job("ansible.apply", f"ansible apply {playbook} {limit}", "local", command, cwd=directory,
                              env=self._ansible_env(), meta={"playbook": playbook, "limit": limit, "change": change.id})
         return self.wait(job, wait_s)
+
+    def _settle_lease(self, job: Job, rc: int) -> None:
+        """Release or complete the engine's lease, now that the job has actually finished.
+
+        The lease is spent when the gate opens - so a revocation cannot land between the check and the
+        mutation - but the outcome belongs here, where the command's fate is known. Recording it at
+        consume time would claim a mutation that had not been dispatched.
+        """
+        change_id = str(job.meta.get("change") or "")
+        if not change_id:
+            return
+        with contextlib.suppress(Exception):
+            self.changes.record_execution(change_id, {"state": "executed" if rc == 0 else "failed",
+                                                     "rc": rc})
 
     def _done_ansible(self, job: Job, rc: int, text: str) -> dict[str, Any]:
         meta = self.artifacts.save(job.kind, job.title, text)

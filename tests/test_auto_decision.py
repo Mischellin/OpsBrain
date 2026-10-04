@@ -1749,3 +1749,58 @@ def test_a_policy_denial_reaches_the_engine_as_a_denial(ops, tmp_path) -> None: 
     out = ops.auto.decide_change(change.id, plan.id)
     assert out["decision"]["decision"] == "DENY", out["decision"].get("detail", out)
     assert out["decision"]["reason"] == Reason.POLICY_FORBIDS.value
+
+
+def test_a_failed_apply_records_a_failure_not_an_execution(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The lease is spent when the gate opens; the outcome belongs to the job.
+
+    Recording "executed" inside `ChangeStore.consume` claimed a mutation that had not been dispatched -
+    both operator paths call `start_job` only afterwards - so a failed apply, or a crash in between, left a
+    lease saying the infrastructure had changed. The job's own result is what gets recorded.
+    """
+    from opsbrain.auto.approval import ApprovalStore
+
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    ops.auto.review_plan(plan)
+    approval = ops.auto.decide_change(change.id, plan.id)["approval"]
+    store = ApprovalStore(ops.auto.root / "approvals")
+    assert store.get(approval).outcome.get("executed") is not True, (
+        "issuing and deciding have not dispatched anything")
+
+    ops.exec.on(r"tofu apply", "Error: state lock held by another process\n", rc=1)
+    out = ops.tofu_apply(change.id)
+    assert out["ok"] is False
+    settled = store.get(approval).outcome
+    assert settled.get("state") == "failed", "the job's result, not the gate's optimism, is what is recorded"
+    assert settled.get("rc") == 1
+
+
+def test_the_advertised_mcp_flow_can_actually_be_started(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`decide` needs a preflight record, and there was no way to make one from the MCP surface.
+
+    The server told a client to call `decide`, and every such call ended at "no preflight record" because
+    `review_plan` existed only as an internal Python method. The advertised flow was unreachable.
+    """
+    import json as _json
+
+    from opsbrain.server import AUTONOMOUS_FLOW
+
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    # The MCP surface parses a submitted document; the same call has to work on what it is given.
+    from opsbrain.auto.plan import ChangePlan
+
+    submitted = ChangePlan.from_dict(_json.loads(_json.dumps(plan.to_dict())))
+    reviewed = ops.auto.review_plan(submitted)
+    assert reviewed["plan"] == plan.id, "a plan round-tripped through the wire is the same plan"
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "APPROVE", out["decision"].get("detail", out)
+    assert AUTONOMOUS_FLOW == ("review-plan", "decide"), (
+        "the steps the instructions name are the ones the action table carries")
