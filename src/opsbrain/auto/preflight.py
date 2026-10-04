@@ -15,7 +15,6 @@ Two failure modes get specific handling, because both are ways a bad plan slips 
 
 from __future__ import annotations
 
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -24,17 +23,21 @@ from typing import Any
 from ..util import now
 from .config import AutoConfig
 from .evidence import EvidenceBundle, render_for_reviewer
-from .plan import ChangePlan, PlanError
+from .plan import ChangePlan
 from .review import ReviewLimits, ReviewRequest, ReviewResult, RunnerStatus, Severity, Subject, Verdict
 from .store import RecordStore
 from .verify import Target
 
-#: Verbs that mean "this request is an experiment", not a probe. Matched on word boundaries, because a
-#: plain substring match files `cat /etc/logrotate.conf` as an action on account of the `rotate` inside
-#: "logrotate" - and a bucket that cries wolf gets ignored.
-_STATE_CHANGING = re.compile(
-    r"\b(restart|start|stop|reboot|apply|delete|write|create|patch|scale|sync|flush|rotate|unset|reconfigure"
-    r"|drop|enable|disable|reload|kill|reinstall|truncate|reset|revert)\b|\brm\b")
+#: An allowlist, not a denylist. A denylist of mutating verbs is always one verb short: `touch`, `chmod`,
+#: `chown`, `tee`, `sed -i`, `apt install` and a hundred others change state without appearing on it, and
+#: anything the list misses is treated as a harmless lookup. A request is read-only only when the operator
+#: has declared it so; everything else needs the plan to declare it before it may run.
+READ_ONLY_PROBES = frozenset({
+    "systemctl show", "systemctl status", "systemctl is-enabled", "systemctl is-active", "systemctl cat",
+    "journalctl", "cat", "ls", "stat", "df", "du", "free", "uname", "id", "ps", "ss", "ip -j addr",
+    "kubectl get", "kubectl describe", "kubectl logs", "kubectl version", "tofu show", "git log",
+    "git diff", "git show", "getent", "dig", "pgrep", "nproc", "openssl x509", "coroot query",
+})
 
 
 class Outcome(StrEnum):
@@ -83,6 +86,7 @@ class PreflightResult:
     arguments_hash: str
     plan_hash: str
     created: float = 0.0
+    note: str = ""
 
     @property
     def approvable(self) -> bool:
@@ -105,6 +109,7 @@ class PreflightResult:
             "arguments_hash": self.arguments_hash,
             "plan_hash": self.plan_hash,
             "created": round(self.created, 3),
+            "note": self.note,
         }
 
     def brief(self) -> dict[str, Any]:
@@ -125,27 +130,50 @@ class PreflightResult:
         return out
 
 
-def split_probes(checks: Sequence[str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+def split_probes(checks: Sequence[str], allowlist: Sequence[str] = ()) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Separate "go and look" from "go and change something", so a caller can only act on the first.
 
     A reviewer asking for a diagnostic is not asking for permission to run an experiment. An experiment
     has to be declared in the change plan like any other state change, so the request is surfaced
     separately and never quietly executed as a lookup.
     """
+    allowed = READ_ONLY_PROBES | frozenset(allowlist)
     read_only: list[str] = []
     acting: list[str] = []
     for check in checks:
-        (acting if _STATE_CHANGING.search(check.lower()) else read_only).append(check)
+        (read_only if _is_read_only(check, allowed) else acting).append(check)
     return tuple(read_only), tuple(acting)
+
+
+def _is_read_only(check: str, allowed: frozenset[str]) -> bool:
+    """Prefix match on whitespace-collapsed text, so `ls` matches and `lsof -p 1` does not."""
+    collapsed = " ".join(check.lower().split())
+    return any(collapsed == prefix or collapsed.startswith(f"{prefix} ") for prefix in allowed)
 
 
 class Preflight:
     """Runs one plan review and records the outcome. Holds no executor and mutates nothing."""
 
-    def __init__(self, auto: AutoConfig, reviews: Any, root: Any):
+    def __init__(self, auto: AutoConfig, reviews: Any, root: Any, evidence: Any = None):
         self.auto = auto
         self.reviews = reviews
+        self.evidence = evidence
+        self.evidence = evidence
         self.store = RecordStore(root / "preflight", ("pf",))
+
+    def _truncated(self, request: ReviewRequest) -> bool:
+        return len(request.context) > self.limits().context_chars
+
+    def refuse(self, plan: ChangePlan, outcome: Outcome, reason: str) -> PreflightResult:
+        """A recorded refusal, with the same shape as a reviewed one, so nothing downstream needs a special case."""
+        preflight = PreflightResult(plan_id=plan.id, outcome=outcome, reason="review_failed", review_id="",
+                                    review_status=RunnerStatus.UNAVAILABLE, verdict=None, findings=(),
+                                    unverified_claims=plan.unverified_claims, requested_probes=(),
+                                    state_changing_probes=(), structural_gaps=plan.incomplete(),
+                                    arguments_hash=plan.arguments_hash, plan_hash=plan.plan_hash, created=now(),
+                                    note=reason)
+        self.store.put(f"pf-{plan.plan_hash[:16]}", preflight.to_dict())
+        return preflight
 
     def limits(self) -> ReviewLimits:
         """The configured ceilings, in the contract's units. A plan longer than the context budget is
@@ -158,8 +186,9 @@ class Preflight:
                       subject_ref: str | None = None) -> ReviewRequest:
         context = [plan.render_for_reviewer()]
         if bundle is not None:
+            payloads, _ = self.evidence.load_artifacts(bundle)
             context.append("")
-            context.append(render_for_reviewer(bundle))
+            context.append(render_for_reviewer(bundle, payloads))
         refs = tuple(sorted(set(plan.evidence_refs) | ({bundle.id} if bundle else set())))
         return ReviewRequest(subject=Subject.INFRA_PLAN, subject_ref=subject_ref or plan.id,
                              objective=f"preflight: {plan.objective}", context="\n".join(context),
@@ -168,19 +197,28 @@ class Preflight:
 
     def run(self, plan: ChangePlan, bundle: EvidenceBundle | None = None, *,
             subject_ref: str | None = None) -> PreflightResult:
-        try:
-            request = self.build_request(plan, bundle, subject_ref=subject_ref)
-        except PlanError:
-            raise
+        if self.auto.review.runner == "fake":
+            # The stub answers PASS to anything, so with the default configuration every plan would be
+            # approvable without anybody having looked at it. Autonomy is the one thing a stub must never
+            # manufacture, so the outcome is a refusal and the reason says which runner produced nothing.
+            return self.refuse(plan, Outcome.REVIEW_FAILED,
+                               "auto.review.runner is `fake`: the stub cannot authorise a plan")
+        request = self.build_request(plan, bundle, subject_ref=subject_ref)
+        if len(request.context) > self.limits().context_chars:
+            return self.refuse(plan, Outcome.INCOMPLETE,
+                               f"the plan does not fit in the review context "
+                               f"({self.auto.review.context_chars} chars): a reviewer cannot judge a plan it "
+                               "only saw part of")
         result: ReviewResult = self.reviews.review(request)
-        read_only, acting = split_probes(result.next_checks)
+        read_only, acting = split_probes(result.next_checks, self.auto.evidence.read_only_probes)
         gaps = plan.incomplete()
         outcome = self._outcome(result, gaps)
         preflight = PreflightResult(
             plan_id=plan.id, outcome=outcome, reason=REASON_BY_OUTCOME[outcome], review_id=result.review_id,
             review_status=result.status, verdict=result.verdict,
             findings=tuple(finding.to_dict() for finding in result.findings),
-            unverified_claims=tuple(result.unverified_claims), requested_probes=read_only,
+            unverified_claims=tuple(dict.fromkeys(plan.unverified_claims + result.unverified_claims)),
+            requested_probes=read_only,
             state_changing_probes=acting, structural_gaps=gaps,
             arguments_hash=plan.arguments_hash, plan_hash=plan.plan_hash, created=now())
         self.store.put(f"pf-{plan.plan_hash[:16]}", preflight.to_dict())
@@ -208,8 +246,9 @@ class Preflight:
         return self.store.get(f"pf-{plan_hash[:16]}")
 
     def list(self, limit: int = 20) -> list[dict[str, Any]]:
-        return [{key: row[key] for key in ("plan", "outcome", "approvable", "reason", "verdict", "created")
-                 if key in row} for row in self.store.list(limit)]
+        return [{key: row[key] for key in ("plan", "plan_hash", "arguments_hash", "outcome", "approvable",
+                                           "reason", "verdict", "created") if key in row}
+                for row in self.store.list(limit)]
 
 
 def declared_state_changing(plan: ChangePlan) -> tuple[str, ...]:

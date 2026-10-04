@@ -150,7 +150,14 @@ class ChangePlan:
         if not changes:
             raise PlanError("a plan with no changes is not a plan")
         ordered = tuple(sorted(changes, key=lambda change: (change.target, change.capability, change.how)))
-        resolved = reversibility or _worst_reversibility(ordered)
+        derived = _worst_reversibility(ordered)
+        if reversibility is not None and reversibility is not derived:
+            # Accepting a *safer* label than the changes support is how an irreversible edit gets filed
+            # as reversible. The worst of the declared changes is the only value that may stand.
+            raise PlanError(
+                f"plan declares {reversibility.value} but its changes are {derived.value}: the reversibility "
+                "of a plan follows from what it does, not from what it is called")
+        resolved = derived
         if resolved is not Reversibility.IRREVERSIBLE and not rollback.strip():
             raise PlanError(f"a {resolved.value} plan must name its rollback")
         plan = ChangePlan(
@@ -224,12 +231,8 @@ class ChangePlan:
             gaps.append("no component versions: a plan against an unknown version cannot be reviewed")
         if not self.post_checks:
             gaps.append("no post-check: nothing would establish that the change worked")
-        if self.irreversible and not self.rollback:
-            gaps.append("marked irreversible: acceptable only with the reason spelled out in each change")
-        for change in self.changes:
-            if change.state_changing and not _DECLARED_REVERSIBLE.match(self.reversibility.value):
-                gaps.append(f"state-changing {change.capability}:{change.target} with no applicable undo")
-                break
+        if self.irreversible and not any(change.irreversible_reason.strip() for change in self.changes):
+            gaps.append("marked irreversible: every irreversible change must state why")
         return tuple(gaps)
 
     def blast(self) -> tuple[str, ...]:
@@ -267,6 +270,14 @@ class ChangePlan:
             alternatives_rejected=tuple(data.get("alternatives_rejected", [])),
             unverified_claims=tuple(data.get("unverified_claims", [])), unknowns=tuple(data.get("unknowns", [])),
             versions=dict(data.get("versions", {})), risk=Risk(risk), profile=str(data.get("profile", "general")))
+        for change in plan.changes:
+            ProposedChange.from_dict(change.to_dict())  # re-apply the per-change invariants
+        if plan.reversibility is not _worst_reversibility(plan.changes):
+            raise PlanError(
+                f"plan is filed as {plan.reversibility.value} but its changes are "
+                f"{_worst_reversibility(plan.changes).value}")
+        if plan.reversibility is not Reversibility.IRREVERSIBLE and not plan.rollback.strip():
+            raise PlanError(f"a {plan.reversibility.value} plan must name its rollback")
         if plan.id and plan.id != f"pl-{plan.compute_arguments_hash()[:16]}":
             raise PlanError("plan id does not match its arguments hash: the record was altered")
         if plan.plan_hash and plan.plan_hash != plan.compute_plan_hash():
@@ -354,9 +365,6 @@ class ChangePlan:
             "name any request that would change the host, because that is not read-only.",
         ]
         return "\n".join(lines)
-
-
-_DECLARED_REVERSIBLE = re.compile(r"^(rollback|compensate)$")
 
 
 def _worst_reversibility(changes: Sequence[ProposedChange]) -> Reversibility:

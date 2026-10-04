@@ -21,9 +21,9 @@ from typing import TYPE_CHECKING, Any
 from ..audit import AuditLog
 from ..util import OpsError, new_id
 from .config import AutoConfig
-from .evidence import EvidenceCollector, EvidenceStore, Observation, passed, reason_code
+from .evidence import EvidenceBundle, EvidenceCollector, EvidenceStore, Observation, check_evidence, passed, reason_code
 from .plan import ChangePlan
-from .preflight import Preflight, PreflightResult
+from .preflight import Outcome, Preflight, PreflightResult
 from .review import (
     CONTRACT_VERSION,
     Reviewer,
@@ -368,7 +368,7 @@ class AutoService:
     # -- preflight --------------------------------------------------------------------------------
     def preflight(self) -> Preflight:
         if self._preflight is None:
-            self._preflight = Preflight(self.auto, self.reviews, self.root)
+            self._preflight = Preflight(self.auto, self.reviews, self.root, self.evidence)
         return self._preflight
 
     def review_plan(self, plan: ChangePlan, *, evidence: str = "") -> dict[str, Any]:
@@ -378,7 +378,30 @@ class AutoService:
         judges the plan against the observations it claims to rest on rather than against its own summary.
         """
         self.guard_enabled()
-        bundle = self.evidence.get(evidence) if evidence else None
+        # The plan names its own evidence. Trusting only the caller's argument would let a plan that
+        # declares a bundle be reviewed against a different one - or against none at all.
+        bundle_id = evidence or plan.evidence_bundle
+        bundle: EvidenceBundle | None = None
+        if bundle_id:
+            try:
+                bundle = self.evidence.get(bundle_id)
+            except OpsError as exc:
+                # A plan that names a bundle nobody stored is not reviewable, and an exception here would
+                # leave the caller with a stack trace instead of a decision.
+                refused = self.preflight().refuse(plan, Outcome.INCOMPLETE,
+                                                  f"the plan names evidence {bundle_id}, which cannot be read: {exc}")
+                self.audit.record(event="preflight", plan=plan.id, outcome=refused.outcome.value,
+                                  approvable=False, reason=refused.reason, review="")
+                return refused.to_dict()
+            checks = check_evidence(bundle, self.evidence.load_artifacts(bundle)[0],
+                                    change_id=plan.id.split("-", 1)[0] or None)
+            if reason_code(checks) != "evidence_fresh":
+                refused = self.preflight().refuse(plan, Outcome.INCOMPLETE,
+                                                  f"the evidence bundle the plan names is {reason_code(checks)}: "
+                                                  f"{next((c.detail for c in checks if not c.ok), 'unusable')}")
+                self.audit.record(event="preflight", plan=plan.id, outcome=refused.outcome.value,
+                                  approvable=False, reason=refused.reason, review="")
+                return refused.to_dict()
         result: PreflightResult = self.preflight().run(plan, bundle)
         self.audit.record(event="preflight", plan=plan.id, outcome=result.outcome.value,
                           approvable=result.approvable, reason=result.reason, review=result.review_id)

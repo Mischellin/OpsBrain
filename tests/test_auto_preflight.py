@@ -55,8 +55,17 @@ def good_plan(**overrides: Any) -> ChangePlan:
     return ChangePlan.build(**{**base, **overrides})
 
 
+def _engine(tmp_path: Path, reviewer: Any) -> Preflight:
+    """A preflight wired to a stub reviewer but named `codex`, so the stub guard does not short-circuit
+    every verdict in these tests."""
+    auto = AutoConfig(enabled=True, review={"runner": "codex"})
+    return Preflight(auto, ReviewService(auto, tmp_path / "auto", reviewer=reviewer), tmp_path / "auto")
+
+
 def preflight(tmp_path: Path, reviewer: Any = None, plan: ChangePlan | None = None) -> Any:
-    auto = AutoConfig(enabled=True)
+    # runner `codex` with a stub reviewer injected: the runner name is what the stub guard looks at, and
+    # these tests are about the verdict mapping rather than about which runner is configured.
+    auto = AutoConfig(enabled=True, review={"runner": "codex"})
     reviews = ReviewService(auto, tmp_path / "auto", reviewer=reviewer or FakeReviewer())
     return Preflight(auto, reviews, tmp_path / "auto"), (plan or good_plan())
 
@@ -262,8 +271,7 @@ def test_a_drop_in_in_the_wrong_directory_does_not_pass(tmp_path: Path) -> None:
     plan = good_plan(changes=[unit_change(how="install a logrotate drop-in into /etc/logrotate.d/custom.conf",
                                            undo="rm -f /etc/logrotate.d/custom.conf")],
                      post_checks=["test -f /etc/logrotate.d/custom.conf"])
-    engine = Preflight(AutoConfig(enabled=True), ReviewService(AutoConfig(enabled=True), tmp_path / "auto",
-                                                                reviewer=runner), tmp_path / "auto")
+    engine = _engine(tmp_path, runner)
     result = engine.run(plan)
     assert result.outcome is Outcome.NEEDS_CHANGES
     assert result.approvable is False
@@ -277,8 +285,7 @@ def test_a_post_check_that_only_runs_the_command_is_visible_to_the_reviewer(tmp_
         Finding(Severity.MAJOR, "the only post-check runs the apply again; it never inspects the unit's "
                                 "effective configuration")]))
     plan = good_plan(post_checks=["ansible-playbook common.yml --check --diff"])
-    engine = Preflight(AutoConfig(enabled=True), ReviewService(AutoConfig(enabled=True), tmp_path / "auto",
-                                                                reviewer=runner), tmp_path / "auto")
+    engine = _engine(tmp_path, runner)
     result = engine.run(plan)
     assert result.approvable is False
     assert "never inspects" in result.findings[0]["summary"]
@@ -291,8 +298,7 @@ def test_base64_in_a_kubernetes_api_is_not_proof_of_encryption(tmp_path: Path) -
                                 "show storageClass.encrypted: true or a CSI driver")]))
     plan = good_plan(diagnosis="the PVC is unencrypted, as shown by the base64 data in the API",
                      post_checks=["kubectl get pvc -o yaml"])
-    engine = Preflight(AutoConfig(enabled=True), ReviewService(AutoConfig(enabled=True), tmp_path / "auto",
-                                                                reviewer=runner), tmp_path / "auto")
+    engine = _engine(tmp_path, runner)
     result = engine.run(plan)
     assert result.approvable is False
     assert "not encryption" in result.findings[0]["summary"]
@@ -304,8 +310,7 @@ def test_absence_in_one_directory_is_not_proof_of_absence(tmp_path: Path) -> Non
         "systemctl show logrotate.service -p DropInPaths",
         "ls -la /etc/systemd/system/logrotate.service.d/"]))
     plan = good_plan(diagnosis="the drop-in is missing, therefore the fix is absent")
-    engine = Preflight(AutoConfig(enabled=True), ReviewService(AutoConfig(enabled=True), tmp_path / "auto",
-                                                                reviewer=runner), tmp_path / "auto")
+    engine = _engine(tmp_path, runner)
     result = engine.run(plan)
     assert result.outcome is Outcome.NEEDS_EVIDENCE
     assert result.requested_probes
@@ -373,7 +378,8 @@ def test_preflight_changes_nothing(tmp_path: Path) -> None:
     engine.run(plan)
     assert not hasattr(engine, "exec")
     assert not hasattr(engine, "core")
-    assert set(vars(engine)) == {"auto", "reviews", "store"}
+    assert set(vars(engine)) <= {"auto", "reviews", "store", "evidence"}
+    assert not hasattr(engine, "exec") and not hasattr(engine, "core")
 
 
 def test_the_review_request_carries_the_plan_and_the_evidence(tmp_path: Path) -> None:
@@ -404,7 +410,7 @@ def test_reviewing_a_plan_through_the_service_records_the_outcome(tmp_path: Path
 
     runner = FakeReviewer()
     runner.default = response_document(Verdict.PASS)
-    auto = AutoService(_config(tmp_path), reviewer=runner)
+    auto = AutoService(_config(tmp_path, review={"runner": "codex"}), reviewer=runner)
     answer = auto.review_plan(good_plan())
     assert answer["approvable"] is True
     assert answer["outcome"] == "approvable"
@@ -435,3 +441,122 @@ def test_a_plan_whose_reasoning_was_rewritten_is_refused_even_when_the_hashes_lo
     assert document["id"] == plan.id, "the id is derived from arguments, and the commands did not change"
     with pytest.raises(PlanError, match="plan hash does not match"):
         ChangePlan.from_dict(document)
+
+
+# ============================================= P1 round 1 on #18: the findings Codex raised on preflight
+def test_the_stub_runner_cannot_authorise_a_plan(tmp_path: Path) -> None:
+    """`AutoService` defaults to the fake runner, which answers PASS to everything.
+
+    Left alone, that makes every plan approvable in the default configuration without anybody having
+    looked at it. Autonomy is the one thing a stub must never manufacture.
+    """
+    from opsbrain.auto.service import AutoService
+    from opsbrain.config import Config
+
+    auto = AutoService(Config(repo=str(tmp_path), data_dir=str(tmp_path / "data"),
+                              auto=AutoConfig(enabled=True)), reviewer=FakeReviewer())
+    answer = auto.review_plan(good_plan())
+    assert answer["approvable"] is False
+    assert "fake" in answer["note"]
+
+
+def test_a_plan_that_does_not_fit_the_review_context_is_refused(tmp_path: Path) -> None:
+    runner = FakeReviewer()
+    runner.default = response_document(Verdict.PASS)
+    auto = AutoConfig(enabled=True, review={"runner": "codex", "context_chars": 1_000})
+    from opsbrain.auto.service import ReviewService
+
+    engine = Preflight(auto, ReviewService(auto, tmp_path / "auto", reviewer=runner), tmp_path / "auto")
+    result = engine.run(good_plan(changes=[unit_change(how="x" * 900), unit_change(target="web-2", how="y" * 900)]))
+    assert result.outcome is Outcome.INCOMPLETE
+    assert result.approvable is False
+    assert "does not fit" in result.note
+
+
+def test_reversibility_cannot_be_declared_safer_than_the_changes_support() -> None:
+    with pytest.raises(PlanError, match="follows from what it does"):
+        good_plan(changes=[unit_change(reversible=Reversibility.IRREVERSIBLE, undo="",
+                                       irreversible_reason="destroys the state")],
+                  reversibility=Reversibility.ROLLBACK)
+
+
+def test_a_correctly_declared_irreversible_plan_is_not_flagged_incomplete() -> None:
+    plan = good_plan(changes=[unit_change(reversible=Reversibility.IRREVERSIBLE, undo="",
+                                        irreversible_reason="overwrites the data volume in place")],
+                     rollback="", reversibility=Reversibility.IRREVERSIBLE)
+    assert plan.irreversible is True
+    assert plan.incomplete() == ()
+
+
+def test_a_plan_filed_as_reversible_with_an_irreversible_change_is_refused_on_read() -> None:
+    """The dangerous direction: an edit that cannot be undone, filed as though it could be."""
+    document = good_plan().to_dict()
+    document["changes"][0]["reversible"] = Reversibility.IRREVERSIBLE.value
+    document["changes"][0]["undo"] = ""
+    document["changes"][0]["irreversible_reason"] = "overwrites the data volume in place"
+    document["reversibility"] = Reversibility.ROLLBACK.value  # the lie
+    with pytest.raises(PlanError, match="filed as"):
+        ChangePlan.from_dict(document)
+
+
+@pytest.mark.parametrize("check", [
+    "touch /tmp/marker", "chmod 777 /etc/shadow", "tee /etc/cron.d/x", "sed -i s/a/b/ /etc/hosts",
+    "apt install -y nginx", "systemctl restart caddy", "logrotate --force /etc/logrotate.conf",
+])
+def test_a_mutation_not_on_any_verb_list_is_still_an_experiment(check: str) -> None:
+    """The allowlist is the point: an unknown request is never assumed to be a lookup."""
+    _, acting = split_probes([check])
+    assert acting == (check,), f"{check!r} changes state and must not be filed as read-only"
+
+
+@pytest.mark.parametrize("check", [
+    "systemctl show caddy.service -p FragmentPath",
+    "kubectl get pods -n prod",
+    "cat /etc/os-release",
+    "df -h /var",
+])
+def test_declared_read_only_probes_stay_read_only(check: str) -> None:
+    read_only, acting = split_probes([check])
+    assert read_only == (check,) and acting == ()
+
+
+def test_an_operator_can_declare_extra_read_only_probes() -> None:
+    read_only, _ = split_probes(["coroot query --host web-1"], allowlist=["coroot query"])
+    assert read_only == ("coroot query --host web-1",)
+
+
+def test_the_plan_declares_its_own_evidence_and_the_service_uses_it(tmp_path: Path) -> None:
+    """Trusting only the caller's argument would let a plan that names a bundle be judged against another."""
+    from opsbrain.auto.service import AutoService
+    from opsbrain.config import Config
+
+    auto = AutoService(Config(repo=str(tmp_path), data_dir=str(tmp_path / "data"),
+                              auto=AutoConfig(enabled=True, review={"runner": "codex"})),
+                       reviewer=FakeReviewer())
+    runner = auto.reviews.reviewer()
+    runner.default = response_document(Verdict.PASS)
+    answer = auto.review_plan(good_plan(evidence_bundle="ev-0000000000000000"))
+    assert answer["approvable"] is False
+    assert "ev-0000000000000000" in answer["note"]
+
+
+def test_the_plan_declared_claims_survive_into_the_result(tmp_path: Path) -> None:
+    runner = FakeReviewer()
+    document = response_document(Verdict.PASS)
+    document["unverified_claims"] = ["the timer runs hourly"]
+    runner.default = document
+    engine, plan = preflight(tmp_path, runner, good_plan(unverified_claims=["nobody checked the drop-in path"]))
+    result = engine.run(plan)
+    assert "nobody checked the drop-in path" in result.unverified_claims
+    assert "the timer runs hourly" in result.unverified_claims
+
+
+def test_the_listing_carries_the_hash_that_get_needs(tmp_path: Path) -> None:
+    runner = FakeReviewer()
+    runner.default = response_document(Verdict.PASS)
+    engine, plan = preflight(tmp_path, runner)
+    result = engine.run(plan)
+    row = engine.list()[0]
+    assert row["plan_hash"] == plan.plan_hash
+    assert engine.get(row["plan_hash"])["plan"] == plan.id
+    assert result.review_id == "" or result.review_id
