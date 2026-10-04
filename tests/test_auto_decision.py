@@ -1709,3 +1709,43 @@ def test_a_profile_requirement_is_matched_against_its_field_not_against_prose(op
     out = ops.auto.decide_change(change.id, plan.id)
     assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY"
     assert "systemd:unit-start" in out["decision"]["detail"]
+
+
+def test_a_needs_evidence_verdict_reaches_the_retry_branch() -> None:
+    """`NEEDS_EVIDENCE` is a verdict, not a missing review.
+
+    Folded into the generic "not PASS" branch it returned BLOCKED_AUTONOMOUSLY, so the retry branch
+    further down could never run and the documented `RETRY` was unreachable for the one verdict that
+    exists to produce it.
+    """
+    from opsbrain.auto.review import Verdict
+
+    assert Verdict.NEEDS_EVIDENCE.value == "NEEDS_EVIDENCE"
+    retry = engine().decide(inputs(review_verdict="NEEDS_EVIDENCE", reviews_passed=1, attempts=0),
+                            "pl-1", "ah-1", change_id="c-1", review_ids=("rv-0000abcd",))
+    assert retry.decision is Decision.RETRY
+    assert retry.reason is Reason.RETRY_BUDGET_LEFT
+    spent = engine().decide(inputs(review_verdict="NEEDS_EVIDENCE", reviews_passed=1, attempts=9),
+                             "pl-1", "ah-1", change_id="c-1", review_ids=("rv-0000abcd",))
+    assert spent.decision is Decision.BLOCKED_AUTONOMOUSLY
+    assert spent.reason is Reason.RETRIES_EXHAUSTED
+
+
+def test_a_policy_denial_reaches_the_engine_as_a_denial(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`Core.require` raises on a denial, so `policy_allows` was always true and DENY unreachable.
+
+    The engine has a structured way to say "policy forbids this" and it could never be taken for a real
+    denied change - the caller saw an unstructured tool error instead of a decision that could be audited.
+    """
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "prod", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id), target="prod")
+    ops.auto.review_plan(plan)
+    from opsbrain.config import Access
+
+    ops.config = ops.config.model_copy(update={"policy": {"tofu.apply:prod": Access.DENY}})
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "DENY", out["decision"].get("detail", out)
+    assert out["decision"]["reason"] == Reason.POLICY_FORBIDS.value

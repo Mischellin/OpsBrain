@@ -450,6 +450,15 @@ class ApprovalEngine:
             return (Decision.BLOCKED_AUTONOMOUSLY, Reason.VERDICT_DISAGREEMENT,
                     f"two reviews disagree: {inputs.review_verdict} against "
                     f"{inputs.secondary_review_verdict}", "a human decides")
+        if inputs.review_verdict == "NEEDS_EVIDENCE":
+            # A verdict, not a missing review. Treated as "not PASS" above it was caught by the generic
+            # branch, which returns BLOCKED_AUTONOMOUSLY - so the retry branch further down could never run
+            # and the documented `RETRY` was unreachable for the one verdict that exists to produce it.
+            if inputs.attempts < self.config.decision.max_repair_cycles:
+                return (Decision.RETRY, Reason.RETRY_BUDGET_LEFT,
+                        "the reviewer asked for evidence this plan does not carry", "collect it and review again")
+            return (Decision.BLOCKED_AUTONOMOUSLY, Reason.RETRIES_EXHAUSTED,
+                    "the evidence the reviewer asked for never arrived", "a human looks at this")
         if inputs.review_verdict != "PASS":
             return (Decision.BLOCKED_AUTONOMOUSLY, Reason.REVIEW_MISSING,
                     f"the reviewer answered {inputs.review_verdict or 'nothing'}", "revise the plan")

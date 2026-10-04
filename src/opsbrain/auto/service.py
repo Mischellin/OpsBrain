@@ -577,7 +577,11 @@ class AutoService:
             return self._decision_refused(change_id, plan_id,
                                           f"profile {plan.profile!r} requires {unmet}, and this plan does "
                                           f"not state them", review_id=result.review_id)
-        access = self.core.require(change.capability, change.target)
+        # `Core.require` *raises* on a denial, so asking it left `policy_allows` permanently true and
+        # the engine's documented DENY/policy_forbids outcome unreachable for a real denied change -
+        # callers saw an unstructured tool error instead. The decision is taken here and the policy
+        # answered as data, so the engine gets to record why it refused.
+        access = self._access_for(change)
         if verification is not None:
             report = VerificationReport.from_dict(verification)
             # The report's identity is checked, not overwritten. It belongs to the change, while the
@@ -704,6 +708,15 @@ class AutoService:
             return
         self.core.changes.note_workflow_start(
             change_id, calls=self.reviews.ledger.calls, spend=self.reviews.ledger.spend_usd, at=now())
+
+    def _access_for(self, change: Any) -> Any:
+        """The policy's answer, as a value. `Core.require` raises, which is right for a tool call and
+        wrong here: the engine has a structured way to say "policy forbids this", and it is unreachable
+        if the denial has already become an exception.
+        """
+        from ..policy import decide as policy_decide
+
+        return policy_decide(self.core.config.policy, change.capability, change.target)
 
     def _required_runs(self, plan: Any) -> int:
         """How many independent reviews the plan's profile is worth."""
