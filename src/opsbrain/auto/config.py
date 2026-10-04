@@ -30,7 +30,7 @@ REASON_CODES = (
 class ReviewConfig(_Model):
     """How a review is obtained. A missing command means reviews are unavailable, not silently skipped."""
 
-    runner: str = "fake"  # fake | codex
+    runner: str = "fake"  # fake | codex; anything else is a config error, not a silent fallback
     command: list[str] = Field(default_factory=list)
     model: str = ""
     auth: str = "subscription"  # subscription | api
@@ -59,6 +59,15 @@ class ReviewConfig(_Model):
     def _auth(cls, value: str) -> str:
         if value not in ("subscription", "api"):
             raise ValueError("auth must be `subscription` or `api`")
+        return value
+
+    @field_validator("runner")
+    @classmethod
+    def _runner(cls, value: str) -> str:
+        # An unrecognised name used to fall through to the Codex branch, so a typo like "codexx" turned a
+        # working setup into a different runner with no error anywhere.
+        if value not in ("fake", "codex"):
+            raise ValueError(f"runner must be `fake` or `codex`, got {value!r}")
         return value
 
     @model_validator(mode="after")
@@ -183,8 +192,11 @@ class AutoConfig(_Model):
         default = self.decision.default_profile
         if self.profiles and default not in names:
             raise ValueError(f"decision.default_profile {default!r} has no matching profile")
-        if self.enabled and self.decision.autonomous and not self.autonomy_token:
-            raise ValueError("autonomous mode needs auto.autonomy_token: autonomy is never implicit")
+        if self.enabled and self.decision.autonomous and not valid_autonomy_token(self.autonomy_token):
+            # Presence is not a check. "x" enabled autonomy as readily as a 32-character secret, and a
+            # gate that accepts any non-empty string is not a gate.
+            raise ValueError("autonomous mode needs auto.autonomy_token of at least 16 characters from "
+                             "[A-Za-z0-9_-]: autonomy is never implicit, and a token is never a word")
         return self
 
     def profile(self, name: str) -> PolicyProfileConfig | None:

@@ -8,6 +8,7 @@ so a crafted id cannot walk out of the directory.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -103,17 +104,27 @@ def atomic_claim(path: Path, owner: str, ttl_s: float) -> str | None:
     try:
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
-        if _expired(path, ttl_s):
-            # Reclaim only when the recorded deadline has passed; the race is resolved by O_EXCL again.
-            try:
-                os.unlink(path)
-            except OSError:
-                return None
-            try:
-                descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            except FileExistsError:
-                return None
-        else:
+        if not _expired(path, ttl_s):
+            return None
+        # Reclaiming by unlink is a race: the holder whose lease just expired may have been replaced
+        # between our read and our unlink, and we would then delete the *new* owner's claim. So the file is
+        # renamed to a name of our own first - rename is atomic and cannot clobber a different name - and
+        # only what we successfully moved is treated as the expired lease.
+        stale = path.with_name(f"{path.name}.stale-{os.getpid()}")
+        try:
+            os.rename(path, stale)
+        except OSError:
+            return None
+        holder = read_claim(stale)
+        if holder is not None and not _expired_dict(holder, ttl_s):
+            # Somebody re-created it between the rename and here. Put it back if it is gone.
+            with contextlib.suppress(OSError):
+                os.rename(stale, path)
+            return None
+        stale.unlink(missing_ok=True)
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
             return None
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         handle.write(payload)
@@ -121,10 +132,14 @@ def atomic_claim(path: Path, owner: str, ttl_s: float) -> str | None:
 
 
 def _expired(path: Path, ttl_s: float) -> bool:
+    document = read_claim(path)
+    return True if document is None else _expired_dict(document, ttl_s)
+
+
+def _expired_dict(document: dict[str, Any], ttl_s: float) -> bool:
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
         return time.time() - float(document.get("acquired", 0)) > float(document.get("ttl_s", ttl_s))
-    except (OSError, ValueError, TypeError):
+    except (TypeError, ValueError):
         return True  # unreadable lease: treat as expired rather than wedged forever
 
 

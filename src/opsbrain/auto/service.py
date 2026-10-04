@@ -25,6 +25,7 @@ from .review import (
     ReviewRequest,
     ReviewResult,
     RunnerStatus,
+    Verdict,
     review_summary,
 )
 from .runners import CodexReviewer, FakeReviewer, RunnerSettings, probe_capabilities, run_review
@@ -44,6 +45,11 @@ USD_PER_MILLION_TOKENS = 2.50
 
 #: How long a single-review claim may be held before a crashed holder is treated as gone.
 TTL_S = 900.0
+
+
+def _has_blocker(findings: Any) -> bool:
+    return isinstance(findings, list) and any(
+        isinstance(finding, dict) and finding.get("severity") == "BLOCKER" for finding in findings)
 
 
 def _counter(value: Any) -> int:
@@ -89,6 +95,10 @@ class ReviewService:
             self._tokens_in = tokens_in
             self._tokens_out = tokens_out
             self._spend_usd = (tokens_in + tokens_out) / 1_000_000 * USD_PER_MILLION_TOKENS
+
+    def _is_stub(self) -> bool:
+        """True only for the built-in stub. A test that injects its own fake is a test, and must keep working."""
+        return type(self.reviewer()) is FakeReviewer
 
     def _id_lock(self, review_id: str) -> threading.Lock:
         """One lock per review id, so parallel redelivery of the same request does not review it twice."""
@@ -168,6 +178,16 @@ class ReviewService:
     # -- the one entry point ----------------------------------------------------------------------
     def review(self, request: ReviewRequest) -> ReviewResult:
         """Obtain, validate, record and return a review. Never raises for a runner failure."""
+        if not self.config.enabled:
+            # The master switch, enforced here as well as at the facade. This method is public, and a
+            # pipeline that is "off" but still answers review requests has a gate that is a convention.
+            raise OpsError("auto.enabled is false: the review pipeline is off")
+        if self.reviews.runner == "fake" and self._is_stub():
+            # The stub answers PASS to anything, and it is the documented default. With `auto.enabled:
+            # true` and nothing else configured, it would otherwise manufacture a permission.
+            return ReviewResult.failure(request, RunnerStatus.UNAVAILABLE,
+                                        "auto.review.runner is `fake`: a stub cannot issue a permission, so "
+                                        "configure a real runner before enabling autonomy")
         if request.contract_version != CONTRACT_VERSION:
             raise OpsError(f"review request built for contract {request.contract_version!r}, "
                            f"this build speaks {CONTRACT_VERSION!r}")
@@ -253,9 +273,15 @@ class ReviewService:
         return self.store.get(review_id)
 
     def list(self, limit: int = 20) -> Records:
-        return [{key: row[key] for key in ("review_id", "subject", "subject_ref", "status", "verdict",
-                                           "rubric_version", "model", "created") if key in row}
-                for row in self.store.list(limit)]
+        rows = self.store.list(limit)
+        return [{**{key: row[key] for key in ("review_id", "subject", "subject_ref", "status", "verdict",
+                                              "rubric_version", "model", "created") if key in row},
+                 # `status=OK, verdict=PASS` is not the same as a pass: a BLOCKER finding vetoes it, and a
+                 # listing that showed only the verdict would report a refusal as a permission.
+                 "is_pass": row.get("status") == RunnerStatus.OK.value
+                 and row.get("verdict") == Verdict.PASS.value
+                 and not _has_blocker(row.get("findings"))}
+                for row in rows]
 
     def summary(self, results: Results) -> dict[str, Any]:
         return {**review_summary(results), **self.usage()}

@@ -184,8 +184,15 @@ class CodexReviewer:
         directory = Path(self.settings.snapshot_dir or "~/.opsbrain/auto").expanduser()
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         path = directory / f"{request.review_id}.request.json"
-        path.write_text(self._payload(request), encoding="utf-8")
-        path.chmod(0o600)
+        # Created with the mode already set, and through a temp file: `write_text` would create it with the
+        # process umask and only chmod afterwards, leaving a window in which a request is world readable.
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(self._payload(request))
+        except OSError:
+            path.unlink(missing_ok=True)
+            raise
         return str(path)
 
     def _subprocess(self, argv: list[str], *, cwd: Path | None, env: dict[str, str], timeout: float,

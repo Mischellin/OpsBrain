@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from pydantic import ValidationError
 from opsbrain.auto.config import AutoConfig
 from opsbrain.auto.review import (
     CONTRACT_VERSION,
+    RUBRIC_VERSION,
     Finding,
     ReviewLimits,
     ReviewRequest,
@@ -41,7 +43,9 @@ from opsbrain.auto.runners import (
     run_review,
 )
 from opsbrain.auto.service import AutoService, ReviewService
+from opsbrain.auto.store import atomic_claim, read_claim, release_claim
 from opsbrain.config import Config
+from opsbrain.util import OpsError
 
 
 def request_for(**overrides: Any) -> ReviewRequest:
@@ -51,7 +55,15 @@ def request_for(**overrides: Any) -> ReviewRequest:
 
 
 def service(tmp_path: Path, reviewer: Any = None, **auto_overrides: Any) -> ReviewService:
-    auto = AutoConfig(enabled=True, **auto_overrides)
+    """A ReviewService with an injected reviewer.
+
+    The runner is named `codex` and the fake is passed in, so the stub guard does not fire: these tests are
+    about the contract and the accounting, not about which runner is configured. `test_the_stub_cannot_...`
+    covers the guard itself.
+    """
+    overrides = dict(auto_overrides)
+    overrides["review"] = {"runner": "codex", **overrides.get("review", {})}
+    auto = AutoConfig(enabled=True, **overrides)
     return ReviewService(auto, tmp_path / "auto", reviewer=reviewer or FakeReviewer())
 
 
@@ -503,3 +515,99 @@ def test_capability_probe_reports_the_sandbox_it_would_use(tmp_path: Path) -> No
     report = probe_capabilities(RunnerSettings(command=("echo",), live=True, sandbox=("bwrap", "--ro-bind", "/")))
     assert report["sandbox"] == ["bwrap", "--ro-bind", "/"]
     assert report["sandbox_required"] is True
+
+
+# ============================================ P1 round 2: findings Codex raised after the first fix round
+def test_a_disabled_pipeline_refuses_to_review(tmp_path: Path) -> None:
+    """The master switch belongs in the entry point, not only in the facade that usually calls it."""
+    auto = AutoConfig(enabled=False, review={"runner": "codex"})
+    reviews = ReviewService(auto, tmp_path / "auto", reviewer=FakeReviewer())
+    with pytest.raises(OpsError, match="auto.enabled is false"):
+        reviews.review(request_for())
+
+
+def test_the_stub_cannot_issue_a_permission(tmp_path: Path) -> None:
+    """`fake` is the documented default, so `auto.enabled: true` alone would otherwise authorise anything."""
+    auto = AutoConfig(enabled=True, review={"runner": "fake"})
+    reviews = ReviewService(auto, tmp_path / "auto")
+    result = reviews.review(request_for())
+    assert result.status is RunnerStatus.UNAVAILABLE
+    assert result.is_pass is False
+    assert "stub cannot issue a permission" in result.note
+
+
+def test_an_injected_test_double_is_not_treated_as_a_configured_stub(tmp_path: Path) -> None:
+    """A test that injects its own fake is a test; the guard is about the configured runner."""
+    reviews = service(tmp_path)
+    assert reviews.review(request_for()).status is RunnerStatus.OK
+
+
+def test_an_unknown_runner_name_is_a_config_error() -> None:
+    for name in ("codexx", "Codex", "", "openai"):
+        with pytest.raises(ValidationError, match="runner must be"):
+            AutoConfig(enabled=True, review={"runner": name})
+
+
+def test_a_short_autonomy_token_is_refused() -> None:
+    for token in ("", "x", "yes", "please enable"):
+        with pytest.raises(ValidationError, match="autonomy_token"):
+            AutoConfig(enabled=True, autonomy_token=token, decision={"mode": "autonomous"})
+    assert AutoConfig(enabled=True, autonomy_token="K7f2mQx9pR4tVw6nZs1b", decision={"mode": "autonomous"})
+
+
+def test_the_request_file_is_created_private_and_atomically(tmp_path: Path) -> None:
+    seen: dict[str, Any] = {}
+
+    def capture(argv: list[str], **kwargs: Any) -> Any:
+        seen["path"] = Path(argv[-1])
+        from opsbrain.result import Result
+
+        return Result(0, json.dumps(response_document(Verdict.PASS)))
+
+    settings = RunnerSettings(command=("codex", "exec", "{prompt}"), live=True, sandbox=("bwrap",),
+                              snapshot_dir=str(tmp_path), model="m")
+    run_review(CodexReviewer(settings, runner=capture), request_for())
+    assert seen["path"].stat().st_mode & 0o077 == 0
+    assert not list(tmp_path.glob("*.tmp*")), "no half-written request file may be left behind"
+
+
+def test_provenance_comes_from_the_request_not_the_answer() -> None:
+    """A reviewer that could restate the subject could answer about plan A and file it under plan B."""
+    runner = FakeReviewer()
+    document = response_document(Verdict.PASS)
+    document["subject_ref"] = "pl-ffffffffffffffff"
+    runner.default = document
+    result = parse_review_response(request_for(subject_ref="pl-0000abcd"), json.dumps(document))
+    assert result.subject_ref == "pl-0000abcd"
+    assert result.rubric_version == RUBRIC_VERSION
+
+
+def test_a_listing_reports_the_effective_pass_state(tmp_path: Path) -> None:
+    """`status=OK, verdict=PASS` with a BLOCKER is a refusal, and a listing must not read as a permission."""
+    runner = FakeReviewer()
+    runner.default = response_document(Verdict.PASS, [Finding(Severity.BLOCKER, "no rollback")])
+    reviews = service(tmp_path, runner)
+    reviews.review(request_for())
+    row = reviews.list()[0]
+    assert row["status"] == "OK" and row["verdict"] == "PASS"
+    assert row["is_pass"] is False, "a listing that showed only the verdict would read as an approval"
+
+
+def test_an_expired_lease_is_reclaimed_without_clobbering_a_new_owner(tmp_path: Path) -> None:
+    """Unlink-then-create is a race: the new owner's claim must not be deleted by a stale reclaimer."""
+    path = tmp_path / "lease.claim"
+    assert atomic_claim(path, "first", ttl_s=-1.0) == "first"  # already expired
+    time.sleep(0.01)
+    assert atomic_claim(path, "second", ttl_s=60.0) == "second"
+    owner = read_claim(path)
+    assert owner is not None and owner["owner"] == "second", "the live lease survived the reclaim"
+    assert release_claim(path, "second") is True
+    assert atomic_claim(path, "third", ttl_s=60.0) == "third"
+    assert not list(tmp_path.glob("*.stale-*")), "the stale file is cleaned up"
+
+
+def test_a_claim_is_single_use(tmp_path: Path) -> None:
+    path = tmp_path / "lease.claim"
+    assert atomic_claim(path, "a", ttl_s=60.0) == "a"
+    assert atomic_claim(path, "b", ttl_s=60.0) is None
+    assert read_claim(path)["owner"] == "a"
