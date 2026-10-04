@@ -71,8 +71,35 @@ def test_tofu_apply_requires_human_approval_and_applies_the_saved_plan(ops, fake
     # The `cd` into the stack has to come before the hash: a detached job starts in the login directory, and
     # the plan path is relative to the stack, so hashing first reported every valid plan as missing.
     assert script.index("cd ") < script.index("sha256sum"), "the hash runs inside the stack directory"
+    # The saved plan is removed with the copy, on every path. A saved plan left behind holds whatever the
+    # stack's variables were, on the runner, until some later plan happens to be a day old - or forever.
+    assert "held_gone" in script
+    assert "rc=$?; held_gone;" in script, "the apply path removes both files"
+    assert "held_gone; echo \"@@OPSBRAIN-PLAN-MISMATCH" in script, "so does the refusal path"
     with pytest.raises(OpsError, match="single use"):
         ops.tofu_apply(plan["change"])
+
+
+def test_the_reviewed_plan_is_one_artifact_hashed_shown_and_applied(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    """Hashing the file `tofu` wrote and then showing that file were two opens of one mutable path.
+
+    Replacing it in between gave the change record the checksum of plan A and the resource summary of
+    plan B, and restoring A before the apply passed the checksum guard with bytes nobody reviewed. So the
+    plan is written to a scratch name, copied to a held read-only artifact, and that one artifact is
+    hashed, shown and later applied.
+    """
+    fake.on(r"tofu plan", f"Plan: 0 to add, 1 to change, 0 to destroy.\n{PLAN_SHA}\n{JSON_MARK}\n{PLAN_JSON}\n", rc=2)
+    ops.tofu_plan()
+    script = next(script for _, script in fake.calls if "tofu plan" in script)
+    assert "-out=" in script
+    copy = re.search(r"cp -- (\S+) (\S+) && chmod 400 (\S+);", script)
+    assert copy is not None, "the plan is copied to a held, read-only artifact"
+    scratch, held, chmodded = copy.group(1), copy.group(2), copy.group(3)
+    assert scratch != held, "tofu writes to a scratch name; the held one is what everything else reads"
+    assert chmodded == held, "and the held artifact is the read-only one"
+    assert script.index(f"sha256sum {held}") < script.index(f"show -json {held}"), \
+        "the checksum and the document the approver reads come from the same bytes"
+    assert held in script.split("tofu show")[0], "and it is the one plan, not the scratch file"
 
 
 def test_a_replaced_plan_file_is_refused_instead_of_applied(ops, fake) -> None:  # type: ignore[no-untyped-def]

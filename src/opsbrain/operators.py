@@ -87,14 +87,21 @@ class Operators(Core):
         job = self.jobs.new("tofu.plan", f"tofu plan {name}", config.runner, self.config.remote_job_dir,
                             {"stack": name, "synced": synced})
         plan_file = f".opsbrain/{job.id}.tfplan"
+        scratch = f".opsbrain/{job.id}.partial"
         binary = shlex.quote(config.binary)
+        # `tofu plan` writes to a scratch name, and the plan the record is built from is a *copy* of it,
+        # made read-only in the same breath. Hashing the file `tofu` wrote and then showing that same file
+        # were two opens of one mutable path: replacing it between them gave the record the checksum of
+        # plan A and the resource summary of plan B - and restoring A before the apply would then pass the
+        # checksum guard with bytes the approver never saw. One held artifact is written, hashed, shown and
+        # later applied, so every one of those four steps reads the same bytes.
         script = (f"{self._tofu_prefix(config)}mkdir -p .opsbrain && chmod 700 .opsbrain && "
                   "find .opsbrain -name '*.tfplan' -mmin +1440 -delete; "
-                  f"{binary} plan -input=false -no-color -lock-timeout=60s -detailed-exitcode -out={plan_file}; rc=$?; "
-                  f"if [ $rc -eq 2 ]; then "
+                  f"{binary} plan -input=false -no-color -lock-timeout=60s -detailed-exitcode -out={scratch}; rc=$?; "
+                  f"if [ $rc -eq 2 ]; then cp -- {scratch} {plan_file} && chmod 400 {plan_file}; rm -f {scratch}; "
                   f"echo \"@@OPSBRAIN-PLAN-SHA $(sha256sum {plan_file} | cut -d' ' -f1)@@\"; "
                   f"echo {JSON_MARK}; {binary} show -json {plan_file}; "
-                  f"else rm -f {plan_file}; fi; exit $rc")
+                  f"else rm -f {scratch} {plan_file}; fi; exit $rc")
         job.meta["plan_file"] = plan_file
         self.jobs.save(job)
         self.exec.start_ssh(config.runner, script, job.log, job.rc_file)
@@ -171,12 +178,19 @@ class Operators(Core):
             # A name from this shell, not from the request: the point is that a replacer cannot name it in
             # advance, which is what the original shared path allowed.
             f"held=.opsbrain/apply-$$-$(date +%s).tfplan; "
+            # Both the temporary copy and the saved plan it came from are removed together, on every exit
+            # path including the refusal. A saved plan left behind holds whatever the stack's variables
+            # were, on the runner, until some later `tofu plan` happened to be more than a day old.
+            f"held_gone() {{ command rm -f $held {quoted}; }}; "
             f"{prefix}cp -- {quoted} $held 2>/dev/null && chmod 400 $held; "
             f"actual=$(sha256sum $held 2>/dev/null | cut -d' ' -f1); "
             f'if [ -z "$actual" ] || [ "$actual" != {shlex.quote(expected_sha)} ]; then '
-            f'rm -f $held; echo "@@OPSBRAIN-PLAN-MISMATCH $actual@@"; exit 78; fi; '
+            f'held_gone; echo "@@OPSBRAIN-PLAN-MISMATCH $actual@@"; exit 78; fi; '
             f"{prefix}{binary} apply -input=false -no-color -lock-timeout=60s $held; "
-            f"rc=$?; rm -f $held; if [ $rc -eq 0 ]; then "
+            # The saved plan goes with the copy. Leaving it behind kept potentially sensitive plan
+            # contents on the runner until some later `tofu plan` happened to be more than a day old -
+            # or forever, if no further plan ever ran.
+            f"rc=$?; held_gone; if [ $rc -eq 0 ]; then "
             f"{binary} plan -input=false -no-color -lock-timeout=60s -detailed-exitcode > /dev/null 2>&1; "
             "echo \"@@OPSBRAIN-POSTPLAN $?@@\"; fi; exit $rc")
 
