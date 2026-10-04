@@ -418,7 +418,14 @@ class Operators(Core):
             limit, tags = job.meta.get("limit"), job.meta.get("tags")
             line = f"ansible-playbook {job.meta['playbook']} --limit {limit or 'ALL'}: {summary['changed']} change(s)"
             change = self.changes.create("ansible.apply", job.meta["playbook"], line, job.meta["hash"],
-                                         args={"limit": limit, "tags": tags},
+                                         # The playbook is in `args` because that is the shape a plan's
+                                         # `ProposedChange.arguments` documents an Ansible operation in, and
+                                         # `decide_change` compares the two dictionaries exactly. Without it
+                                         # the comparison never matched for a change a real `ansible_check`
+                                         # produced, so an autonomous Ansible apply could never reach an
+                                         # approval - and the only test that applied one had been building
+                                         # its change by hand in the plan's shape rather than this one's.
+                                         args={"playbook": job.meta["playbook"], "limit": limit, "tags": tags},
                                          details={"changed_tasks": summary["changed_tasks"]})
             out["change"] = change.id
             out["next"] = f"ansible action=apply change_id={change.id} (after a human approves it)"

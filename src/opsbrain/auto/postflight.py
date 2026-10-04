@@ -141,12 +141,18 @@ def postflight(reviews: Any, *, change_id: str, plan_id: str, objective: str,
         return Postflight(change_id=change_id, plan_id=plan_id, outcome=Outcome.UNCLEAR,
                           reason=f"the reviewer reported {answer.status.value}: {answer.note or 'no answer'}",
                           evidence_refs=tuple(measured["evidence_refs"]))
-    if not answer.is_pass:
+    blockers = [finding.summary for finding in answer.findings
+                if finding.severity.value.upper() == "BLOCKER"]
+    if answer.verdict.value == "PASS" and blockers:
         # `PASS` with a BLOCKER finding is not a pass, and the review contract says so in exactly these
         # words. Mapping the raw verdict here would have told the operator to close the change while the
         # same response carried a blocker that vetoes its own verdict - the one contradiction the review
         # contract exists to make impossible to express.
-        blockers = [finding.summary for finding in answer.findings if finding.severity.value.upper() == "BLOCKER"]
+        #
+        # Narrowed to a `PASS`, because the same predicate is also false for every ordinary non-PASS
+        # verdict: taking it as "not a pass, therefore not met" turned `NEEDS_EVIDENCE` into "roll back",
+        # which is the wrong instruction for a reviewer asking for a measurement, and made
+        # `_VERDICT_MAP`'s `UNCLEAR` entry unreachable. Only the self-contradicting answer is special.
         return Postflight(change_id=change_id, plan_id=plan_id, outcome=Outcome.NOT_MET,
                           reason=(f"the reviewer answered {answer.verdict.value} and the same answer carries "
                                   f"{len(blockers)} BLOCKER finding(s); a pass that vetoes itself is not a pass"),

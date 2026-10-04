@@ -2196,3 +2196,137 @@ def test_an_autonomous_ansible_apply_settles_its_lease_when_the_job_finishes(ops
     assert settled.outcome.get("executed") is True, (
         f"the job ran and the record still says the approval was not executed: {settled.outcome}")
     assert settled.state.value == "consumed", settled.state
+
+
+def test_a_profile_that_does_not_allow_unrecoverable_work_refuses_a_plan_that_proposes_it(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`irreversible` says whether this class may accept unrecoverable work, so false has to refuse.
+
+    Read only as "must carry a reason", the flag let an `IRREVERSIBLE` step through every profile that
+    left it at its default - on the strength of the reason field the plan duly supplied. `change.dangerous`
+    is an independent field and need not catch it.
+    """
+    from opsbrain.auto.config import AutoConfig, PolicyProfileConfig
+    from opsbrain.auto.plan import ChangePlan, ProposedChange, Reversibility
+
+    def plan_with(bundle_id: str) -> Any:
+        return ChangePlan.build(
+            objective="drain the old nodes", diagnosis="they hold state nothing else has",
+            changes=[ProposedChange(capability="tofu.apply", target="web-1", how="drain and remove",
+                                    arguments=dict(PLAN_ARGS), reversible=Reversibility.IRREVERSIBLE,
+                                    irreversible_reason="state is not replicated anywhere else")],
+            evidence_refs=[bundle_id], evidence_bundle=bundle_id, targets=["web-1"],
+            post_checks=["systemctl show logrotate.service"], rollback="", versions={"systemd": "252"},
+            profile="secrets", created=1_700_000_000.0)
+
+    ops.config = ops.config.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
+        decision={"mode": "autonomous", "default_profile": "secrets"},
+        profiles=[PolicyProfileConfig(name="secrets", extra_reviews=1, allowed_targets=["web-1"],
+                                      irreversible=False)])})
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "web-1", "drain", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = plan_with(_bundle(ops, tmp_path, change.id))
+    ops.auto.review_plan(plan)
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY", out
+    assert "unrecoverable" in out["decision"]["detail"], out["decision"]["detail"]
+
+    # And a profile that does enable it is not blocked on the same plan.
+    ops.config = ops.config.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
+        decision={"mode": "autonomous", "default_profile": "secrets"},
+        profiles=[PolicyProfileConfig(name="secrets", extra_reviews=1, allowed_targets=["web-1"],
+                                      irreversible=True)])})
+    _autonomous_ops(ops, tmp_path)
+    other = ops.changes.create("tofu.apply", "web-1", "drain the old nodes", "ph-1",
+                               args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                               details={"plan_sha256": "ab" * 32})
+    permitted = plan_with(_bundle(ops, tmp_path, other.id))
+    allowed = ops.auto.review_plan(permitted)
+    assert allowed["outcome"] == "approvable", allowed
+    assert ops.auto.decide_change(other.id, permitted.id)["decision"]["decision"] == "APPROVE", (
+        "a profile that enables unrecoverable work is not blocked on the same plan")
+
+
+def test_turning_off_allow_destructive_invalidates_an_approval_that_was_minted_with_it_on(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """A kill switch that only applies to approvals issued after it flipped is not a kill switch.
+
+    Nothing in the binding or in `stale_reasons` carried the flag, so an approval minted while
+    `allow_destructive` was true stayed usable after the operator set it false - and the change reached
+    exactly the work the switch was turned off for, unless the operator also knew to bump the unrelated
+    manual `policy_version`.
+    """
+    from opsbrain.auto.config import AutoConfig
+
+    ops.config = ops.config.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
+        decision={"mode": "autonomous"})})
+    _autonomous_ops(ops, tmp_path, allow_destructive=True)
+    change = ops.changes.create("tofu.apply", "proxmox", "replace the disk", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32}, dangerous=True)
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    ops.auto.review_plan(plan)
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "APPROVE", out["decision"].get("detail", out)
+
+    ops.exec.on(r"tofu apply", "Apply complete! Resources: 1 added, 1 changed, 0 destroyed.\n"
+                                "@@OPSBRAIN-POSTPLAN 0@@\n")
+    # The operator pulls the switch before the apply runs.
+    # The service is handed the whole `Config` and the engine only the `auto` part of it, so pulling the
+    # switch means updating both copies - the gate reads the engine's, and the audit reads the service's.
+    engine = ops.auto.engine()
+    engine.config = engine.config.model_copy(
+        update={"decision": engine.config.decision.model_copy(update={"allow_destructive": False})})
+    ops.auto.config = ops.auto.config.model_copy(update={"auto": ops.auto.config.auto.model_copy(
+        update={"decision": engine.config.decision})})
+    with pytest.raises(OpsError, match="allow_destructive is now false"):
+        ops.tofu_apply(change.id)
+
+
+def test_a_change_a_real_ansible_check_produced_can_still_be_decided(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The change's arguments and the plan's have to be the same shape, or ansible never gets approved.
+
+    `_done_ansible` recorded `{"limit", "tags"}` while `ProposedChange.arguments` documents an Ansible
+    operation as including the playbook, and `decide_change` compares the two dictionaries exactly. The
+    mismatch meant a plan written the documented way could not authorise a change a real check produced -
+    and the test that applied one had been building its change by hand in the plan's shape.
+    """
+    ops.config = ops.config.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
+        decision={"mode": "autonomous"})})
+    _autonomous_ops(ops, tmp_path)
+    ops.exec.on(r"--check", "TASK [common : motd] ***\nchanged: [web]\nPLAY RECAP ***\n"
+                             "web : ok=5 changed=1 unreachable=0 failed=0 skipped=0\n")
+    check = ops.ansible_check("common", limit="web")
+    change_id = check["change"]
+    stored = ops.changes.get(change_id)
+    assert stored.args.get("playbook") == "common", stored.args
+
+    plan = _plan_for_change(target="common", capability="ansible.apply",
+                            arguments=dict(stored.args), bundle_id=_bundle(ops, tmp_path, change_id))
+    ops.auto.review_plan(plan)
+    out = ops.auto.decide_change(change_id, plan.id)
+    assert out["decision"]["decision"] == "APPROVE", out["decision"].get("detail", out)
+
+
+def test_a_postflight_is_refused_while_the_apply_is_still_only_authorised(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`applied` is written when the lease is consumed, which is before the detached job runs.
+
+    Refusing on every state but `discarded` let a caller submit a matching PASS report for a change still
+    in `pending` and be told the work succeeded. What settles it is a recorded execution result.
+    """
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    ops.auto.review_plan(plan)
+    ops.auto.decide_change(change.id, plan.id)
+
+    out = ops.auto.postflight(change.id, plan.id, verification=_passing_report(change.id))
+    assert out["outcome"] == "unclear", out
+    assert out["review_id"] == "", "nobody was asked about work that has not run"
+    assert "has not finished running" in out["reason"], out["reason"]

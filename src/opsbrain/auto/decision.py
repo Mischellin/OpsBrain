@@ -230,6 +230,17 @@ class ApprovalEngine:
             in_force_requirements))
         if reasons:
             raise OpsError(f"approval {approval.id} is STALE ({', '.join(reasons)})")
+        # The destructive opt-in, re-read at the moment the approval is spent. It is a kill switch, and a
+        # kill switch that only applies to approvals issued after it was flipped is not one: an approval
+        # minted while `allow_destructive` was true stayed usable after the operator set it false, and
+        # nothing in the binding or in `stale_reasons` carried the flag - so turning it off changed
+        # nothing for exactly the dangerous work it was turned off for, unless the operator also knew to
+        # bump the unrelated manual `policy_version`.
+        if change.dangerous and not self.config.decision.allow_destructive:
+            raise OpsError(
+                f"approval {approval.id} was issued while destructive work was allowed, and it is not any "
+                f"more: auto.decision.allow_destructive is now false, so {change.capability} on "
+                f"{change.target} stays with a person")
         # Spent, not just read. Reading left the approval `ISSUED` after a successful apply, so `revoke`
         # could still succeed and erase the fact that it had been used - and a revocation landing between
         # this read and the mutation would not have stopped anything. Spending under the store's own lock

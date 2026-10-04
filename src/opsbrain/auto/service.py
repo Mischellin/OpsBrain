@@ -987,6 +987,17 @@ class AutoService:
             missing.append(f"{needed} reviews ({profile.classification} class, {len(review_ids)} ran)")
         if profile.irreversible and not any(step.irreversible_reason for step in plan.changes):
             missing.append("an irreversible_reason on its steps")
+        # And the other direction, which the line above never covered. `irreversible` says whether this
+        # class may accept unrecoverable work, so a profile that does not enable it has to *refuse* a
+        # plan that proposes some - not merely stop asking for a reason. Reading the flag only as "must
+        # carry a reason" let an `IRREVERSIBLE` step through every profile, on the strength of the reason
+        # field it duly supplied, and `change.dangerous` is an independent field that need not catch it.
+        if not profile.irreversible:
+            unrecoverable = [step.how for step in plan.changes
+                             if step.reversible.value == Reversibility.IRREVERSIBLE.value]
+            if unrecoverable:
+                missing.append(f"profile {profile.name!r} does not accept unrecoverable work, and this plan "
+                               f"proposes {len(unrecoverable)}: {'; '.join(sorted(unrecoverable))[:120]}")
         return ", ".join(missing)
 
     @staticmethod
@@ -1050,6 +1061,23 @@ class AutoService:
         return (f"profile {profile.name!r} does not cover the target {change.target!r}; it covers "
                 f"{', '.join(sorted(profile.allowed_targets))}")
 
+    def _execution_recorded(self, change: Any) -> bool:
+        """Whether the spent lease has a recorded result, and therefore whether the work finished.
+
+        `applied` is written when the lease is consumed, which is before the detached job runs - it means
+        "authorised and dispatched", not "landed". The completion flag lives on the approval and is set
+        by `record_outcome` alone, so it is the one durable fact that distinguishes a finished execution
+        from a running one, and the only one a postflight may rely on.
+        """
+        approval_id = str(change.engine_approval or "")
+        if not approval_id or self.engine() is None or self.engine().approvals is None:
+            return False
+        try:
+            approval = self.engine().approvals.get(approval_id)  # type: ignore[union-attr]
+        except OpsError:
+            return False
+        return bool(approval.outcome.get("executed"))
+
     def postflight(self, change_id: str, plan_id: str, *,
                    verification: dict[str, Any] | None = None) -> dict[str, Any]:
         """Ask whether the change achieved its goal, and record the answer against the change.
@@ -1070,19 +1098,30 @@ class AutoService:
         if recorded and plan_id != recorded:
             raise OpsError(f"change {change_id} was decided under plan {recorded}, not {plan_id}; judging "
                            f"it against {plan_id} would be assessing one piece of work by another's criteria")
-        # A change that was never applied has no outcome to observe, and the one fact that says so is the
-        # change's own state - not the verification report. A report can be handed in for a change that
-        # was discarded, and every check in it will pass, because none of them ever touched anything.
-        if change.state == "discarded":
+        # A change that has not finished running has no outcome to observe. `applied` is not that fact:
+        # it is set when the lease is consumed, which happens *before* the detached job runs, so it
+        # means "authorised and dispatched" rather than "landed". Refusing on every state but `discarded`
+        # let a caller submit a matching PASS report for a change still sitting in `pending` and be told
+        # the work succeeded. What settles it is a recorded execution result.
+        outcome_recorded = self._execution_recorded(change)
+        if change.state != "applied" or not outcome_recorded:
             refused = unobserved(change_id, plan_id,
-                                 "the change was discarded, so nothing ran that a postflight could observe")
+                                 f"the change is {change.state} and "
+                                 f"{'its result was recorded' if outcome_recorded else 'nothing has recorded '
+                                    'its result yet'}; a postflight judges work that ran, and this has not "
+                                    f"finished running")
             self.audit.record(event="postflight", change=change_id, plan=plan_id, state=change.state,
                               outcome=refused.outcome.value, reason=refused.reason, review=refused.review_id)
-            return {**refused.to_dict(), "next": "there is nothing to observe; plan the work again"}
+            return {**refused.to_dict(), "next": "apply the change and record what it did, then judge it"}
         record = self.preflight().get_by_plan(plan_id)
         plan = ChangePlan.from_dict(record["plan_document"])
-        if plan.id != plan_id:
-            raise OpsError(f"the preflight record for {plan_id} carries a different plan")
+        # `plan.id` covers the arguments; `plan_hash` covers the objective, the post-checks and the
+        # rollback - which are exactly the criteria the judgement reasons over. Checking the id alone let
+        # a self-consistent document that keeps the same operations and changes those criteria pass, and
+        # the change would be judged by a rubric nobody reviewed.
+        if plan.id != plan_id or (record.get("plan_hash") and plan.plan_hash != record["plan_hash"]):
+            raise OpsError(f"the preflight record for {plan_id} carries a different plan: the stored review "
+                           "says nothing about it")
         result = judge(self.reviews, change_id=change_id, plan_id=plan_id, objective=plan.objective,
                        post_checks=tuple(plan.post_checks), rollback=plan.rollback,
                        verification=verification)

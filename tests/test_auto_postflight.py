@@ -228,3 +228,26 @@ def test_the_postflight_names_the_configured_model_so_its_identity_moves_with_it
         second, change_id="c-1", plan_id="pl-1", objective="o", post_checks=(),
         rollback="", verification=passing_report()).review_id, (
         "the same goal judged by two models is two reviews, not one cached verdict")
+
+
+def test_needs_evidence_stays_unclear_and_does_not_ask_for_a_rollback(tmp_path: Path) -> None:
+    """A verdict that is not `PASS` is not a failure, and the two ask for opposite things.
+
+    Guarding the contradiction with `is_pass` caught `NEEDS_EVIDENCE` too, so a reviewer asking for a
+    measurement produced "the goal was not met: roll back" - and the `UNCLEAR` entry in `_VERDICT_MAP`
+    became unreachable. Only a `PASS` that vetoes itself is special; the rest map normally.
+    """
+    reviewer = ScriptedReviewer(Verdict.NEEDS_EVIDENCE)
+    result = module.postflight(service_for(tmp_path, reviewer), change_id="c-1", plan_id="pl-1",
+                               objective="o", post_checks=(), rollback="", verification=passing_report())
+    assert result.outcome is Outcome.UNCLEAR, result.reason
+    assert "roll back" not in result.next_action()
+    assert "run the checks" in result.next_action()
+
+
+def test_a_plain_needs_changes_is_not_met_and_still_asks_for_a_rollback(tmp_path: Path) -> None:
+    result = module.postflight(service_for(tmp_path, ScriptedReviewer(Verdict.NEEDS_CHANGES)),
+                               change_id="c-1", plan_id="pl-1", objective="o", post_checks=(),
+                               rollback="", verification=passing_report())
+    assert result.outcome is Outcome.NOT_MET
+    assert "roll back" in result.next_action()

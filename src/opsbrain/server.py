@@ -60,11 +60,11 @@ def build_instructions(config: Any) -> str:
     return _COMMON + (
         f"Mutations need no human step, in this order. Call `autonomy` with {steps}, and between the "
         "second and the third run the capability's own apply tool (`tofu` or `ansible` action=apply "
-        "change_id=<id>) to spend the approval, then `autonomy` action=verify-plan with the change id to "
-        "measure what actually happened. The plan goes in `document` as JSON for review-plan, the change "
-        "id in `id` and the reviewed plan id in `plan` for decide, and the verify-plan report in "
-        "`document` for postflight. An APPROVE issues the approval the apply spends; a RETRY means review "
-        "again; BLOCKED_AUTONOMOUSLY means it stopped and says why."
+        "change_id=<id>) to spend the approval, then `autonomy` action=verify-plan with the **reviewed "
+        "plan id** in `id` - not the change id, which this action looks its plan up by. The plan goes in "
+        "`document` as JSON for review-plan, the change id in `id` and the reviewed plan id in `plan` for "
+        "decide, and the verify-plan report in `document` for postflight. An APPROVE issues the approval "
+        "the apply spends; a RETRY means review again; BLOCKED_AUTONOMOUSLY means it stopped and says why."
         + _TAIL
     )
 
