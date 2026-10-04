@@ -178,7 +178,7 @@ class ChangeStore:
     # `Sequence`, not `list`: inside this class body the bare name `list` is `ChangeStore.list`, so a
     # `list[str]` annotation here is not a type at all and mypy is right to say so.
     def record_decision_inputs(self, change_id: str, *, evidence_ids: Sequence[str], policy_version: str,
-                              plan_id: str, decision: str, arguments_hash: str = "",
+                              plan_id: str, decision: str, arguments_hash: str = "", profile: str = "",
                               decision_record: dict[str, Any] | None = None) -> Change:
         """Record what the decision engine decided against, so the gate can check it later.
 
@@ -195,6 +195,9 @@ class ChangeStore:
             change.details = {**change.details, "evidence_ids": list(evidence_ids),
                               "policy_version": policy_version, "plan_id": plan_id,
                               "decision": decision, "arguments_hash": arguments_hash,
+                              **({"profile": profile} if profile else {}),
+                              **({"decision_id": (decision_record or {}).get("id")}
+                                 if decision_record and decision_record.get("id") else {}),
                               **({"decision_record": decision_record} if decision_record else {})}
             self._save(change)
         return change

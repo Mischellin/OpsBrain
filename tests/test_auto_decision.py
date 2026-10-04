@@ -10,6 +10,7 @@ not a gate.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from typing import Any
 
@@ -681,7 +682,8 @@ PLAN_ARGS = {"plan_file": ".opsbrain/j-1234abcd.tfplan"}
 
 
 def _plan_for_change(target: str = "proxmox", bundle_id: str = "",
-                     capability: str = "tofu.apply", arguments: dict[str, Any] | None = None):
+                     capability: str = "tofu.apply", arguments: dict[str, Any] | None = None,
+                     profile: str = "general"):
     """A complete, reviewable plan naming one target.
 
     `changes` cannot be empty - a plan with no changes is not a plan - so the shape here is the real one
@@ -701,7 +703,7 @@ def _plan_for_change(target: str = "proxmox", bundle_id: str = "",
         versions={"systemd": "252"},
         post_checks=["systemctl show logrotate.service -p FragmentPath,DropInPaths"],
         preconditions=["web-1 is reachable"], rollback="systemctl revert logrotate",
-        created=1_700_000_000.0)
+        profile=profile, created=1_700_000_000.0)
 
 
 def test_a_decided_change_applies_without_any_human_step(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -1308,3 +1310,148 @@ def test_a_report_naming_this_plan_is_accepted_by_a_service_that_produced_it(ops
     assert brief["change"] == plan.id
     out = ops.auto.decide_change(change.id, plan.id, verification=brief)
     assert out["decision"]["decision"] == "APPROVE", out["decision"].get("detail", out)
+
+
+# ------------------------------------------------------- the profile's own requirements, and identity
+def test_a_profile_that_requires_evidence_refuses_a_plan_that_cites_none(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`allowed_*` and `allow_autonomous` were the only fields enforced.
+
+    A profile could demand evidence, preconditions, verification or a second review and still see an
+    APPROVE with none of them, because nothing read those four lists.
+    """
+    from opsbrain.auto.config import AutoConfig
+
+    ops.config = ops.config.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
+        decision={"mode": "autonomous"},
+        profiles=[_profile(require_evidence=["inventory"])])})
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    assert ops.auto.review_plan(plan)["outcome"] == "approvable"
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY"
+    assert "requires evidence" in out["decision"]["detail"]
+
+
+def test_an_approval_is_labelled_with_the_profile_the_plan_was_reviewed_under(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The default profile is the default for a plan that names none - not for one that names another.
+
+    Labelling a `secrets` review as `general` meant changes to the profile actually in force never made
+    the approval stale.
+    """
+    from opsbrain.auto.approval import ApprovalStore
+    from opsbrain.auto.config import AutoConfig, PolicyProfileConfig
+
+    ops.config = ops.config.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
+        decision={"mode": "autonomous", "default_profile": "general"},
+        profiles=[PolicyProfileConfig(name="general"),
+                  PolicyProfileConfig(name="secrets", allowed_targets=["proxmox"])])})
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id), profile="secrets")
+    ops.auto.review_plan(plan)
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "APPROVE", out["decision"].get("detail", out)
+    approval = ops.changes.get(change.id).engine_approval
+    assert ApprovalStore(ops.auto.root / "approvals").get(approval).binding.profile == "secrets"
+
+
+def test_a_preflight_record_carrying_another_plan_is_refused(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The outer record is selected by plan id, but a nested document that parses is not thereby it.
+
+    Capability, target, arguments and profile are all read out of the document, so a stored PASS for plan
+    A would otherwise authorise a change described only by plan B.
+    """
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    ops.auto.review_plan(plan)
+    stored = ops.auto.preflight().store.get(f"pf-{plan.plan_hash[:16]}")
+    stored["plan_document"] = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id)).to_dict()
+    ops.auto.preflight().store.put(f"pf-{plan.plan_hash[:16]}", stored)
+    with pytest.raises(OpsError, match="carries a different plan"):
+        ops.auto.decide_change(change.id, plan.id)
+
+
+def test_a_review_that_became_a_denial_stops_being_cited(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The preflight record is a copy; a copy outlives the record it was copied from."""
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    assert ops.auto.review_plan(plan)["outcome"] == "approvable"
+    review_id = ops.auto.preflight().get_by_plan(plan.id)["review"]
+    document = ops.auto.reviews.store.get(review_id)
+    document["verdict"] = "DENY"
+    ops.auto.reviews.store.put(review_id, document)
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY"
+    assert "cannot be resolved" in out["decision"]["detail"]
+
+
+def test_a_failed_review_reaches_the_engine_instead_of_being_refused(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """A runner failure is exactly what RETRY exists to answer.
+
+    Refusing it in the resolver meant the exposed workflow never returned RETRY for a reviewer failure
+    and the repair budget was never spent.
+    """
+    from opsbrain.auto.config import AutoConfig
+
+    ops.config = ops.config.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token=TOKEN, review={"runner": "codex", "max_retries": 0},
+        decision={"mode": "autonomous", "max_repair_cycles": 2})})
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    ops.auto.review_plan(plan)  # the plan is stored even though the reviewer did not answer
+    review_id = ops.auto.preflight().get_by_plan(plan.id)["review"]
+    document = ops.auto.reviews.store.get(review_id)
+    document["status"] = "TIMEOUT"
+    document["verdict"] = None
+    ops.auto.reviews.store.put(review_id, document)
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "RETRY", out["decision"].get("detail", out)
+
+
+def test_an_expired_approval_cannot_be_renewed_from_the_decision_that_granted_it(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`issue` replaces an expired record on purpose - so the original APPROVE must not be replayable.
+
+    Timestamps are outside the binding hash, so a re-review of an unchanged change lands on the same id;
+    without recording which decision issued it, the old APPROVE could mint a fresh lease with a new
+    `created`, renewing authority no re-review granted.
+    """
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    ops.auto.review_plan(plan)
+    out = ops.auto.decide_change(change.id, plan.id)
+    approval = out.get("approval", "")
+    assert approval
+
+    # Age the stored lease so the store would otherwise replace it.
+    path = ops.auto.root / "approvals" / f"{approval}.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["binding"]["created"] = round(now() - 10_000.0, 3)
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    # Through the engine, not the store: the store knows nothing about decisions, and the guard belongs
+    # where a decision is turned into an approval.
+    from opsbrain.changes import digest
+
+    arguments = digest({k: v for k, v in sorted(change.args.items())}) if change.args else ""
+    with pytest.raises(OpsError, match="already issued the approval"):
+        ops.auto.engine().issue(change.id, arguments, bound_for(change, created=now()),
+                                record=decide_for(change, by=ops.auto.engine()))

@@ -13,6 +13,7 @@ Outside it, budgets do not exist and redelivery double-charges. Inside it:
 from __future__ import annotations
 
 import contextlib
+import json
 import threading
 import time
 from collections.abc import Sequence
@@ -494,6 +495,13 @@ class AutoService:
         change = self.core.changes.get(change_id)
         record = self.preflight().get_by_plan(plan_id)
         plan = ChangePlan.from_dict(record["plan_document"])
+        # The outer record is selected by plan id, but a nested document that parses is not thereby the
+        # same plan - and capability, target, arguments and profile are all read out of it. A stored PASS
+        # for plan A would otherwise authorise a change described only by plan B.
+        if plan.id != plan_id or (record.get("plan_hash") and plan.plan_hash != record["plan_hash"]):
+            raise OpsError(
+                f"the preflight record for {plan_id} carries a different plan (id={plan.id!r}): the stored "
+                f"review says nothing about it")
         result = PreflightResult.from_record(record)
         # The review covers a concrete operation, not just a kind of edit. Comparing capability and target
         # alone left a reviewed `tofu.apply` for `proxmox` able to authorise a *different* saved plan
@@ -529,6 +537,33 @@ class AutoService:
         if profile is not None and not self.autonomous_for(change, profile):
             return self._decision_refused(change_id, plan_id, self._scope_reason(change, profile),
                                           review_id=result.review_id)
+        # Resolved, not copied. `_evaluate` only checks that the tuple is non-empty, so a review record
+        # that was deleted, corrupted or replaced after the preflight still produced a citation nobody
+        # could open - an approval whose stated justification cannot be audited.
+        # What the engine is told the review said. The preflight record is a *copy* made at review time,
+        # so the stored record - which may since have become a failure or a denial - is the current fact.
+        review_status = result.review_status.value
+        review_verdict = result.verdict.value if result.verdict else ""
+        review_ids: tuple[str, ...] = ()
+        if result.review_id:
+            resolved = self._review_state(result.review_id, plan_id)
+            if resolved is None:
+                return self._decision_refused(change_id, plan_id,
+                                              f"review {result.review_id} cannot be resolved for this plan, "
+                                              f"so nothing here has been judged", review_id="")
+            if resolved != "passing":
+                # A *failed* review is a legitimate outcome the engine has branches for - it is what RETRY
+                # exists to answer. Refusing it here meant the workflow never returned RETRY for a reviewer
+                # failure and the repair budget was never spent.
+                live = self.reviews.store.get(result.review_id)
+                review_status = str(live.get("status") or review_status)
+                review_verdict = str(live.get("verdict") or "")
+            review_ids = (result.review_id,)
+        unmet = self._profile_gaps(plan, change, review_ids=review_ids)
+        if unmet:
+            return self._decision_refused(change_id, plan_id,
+                                          f"profile {plan.profile!r} requires {unmet}, and this plan does "
+                                          f"not state them", review_id=result.review_id)
         access = self.core.require(change.capability, change.target)
         if verification is not None:
             report = VerificationReport.from_dict(verification)
@@ -572,8 +607,8 @@ class AutoService:
             preflight_approvable=result.approvable,
             evidence_reason=evidence_reason,
             evidence_ids=evidence_ids,
-            review_verdict=result.verdict.value if result.verdict else "",
-            review_status=result.review_status.value,
+            review_verdict=review_verdict,
+            review_status=review_status,
             policy_allows=access is not Access.DENY,
             target_in_scope=profile is None or self.autonomous_for(change, profile),
             destructive=bool(change.dangerous),
@@ -584,16 +619,6 @@ class AutoService:
             spend_usd=self.reviews.ledger.spend_usd,
             elapsed_s=now() - change.created,
         )
-        # Resolved, not copied. `_evaluate` only checks that the tuple is non-empty, so a review record
-        # that was deleted, corrupted or replaced after the preflight still produced a citation nobody
-        # could open - an approval whose stated justification cannot be audited.
-        review_ids: tuple[str, ...] = ()
-        if result.review_id:
-            if not self._review_still_stands(result.review_id, plan_id):
-                return self._decision_refused(change_id, plan_id,
-                                              f"review {result.review_id} cannot be resolved for this plan, "
-                                              f"so nothing here has been judged", review_id="")
-            review_ids = (result.review_id,)
         # The change record is the authority for what an approval covers, so it is what both the record
         # and the binding name. The plan's own `arguments_hash` travels in the record for audit; the two
         # vocabularies are different, and pretending they are one would let them silently disagree.
@@ -619,26 +644,77 @@ class AutoService:
         binding = binding_for(change, evidence_ids=result.evidence_ids,
                               policy_version=self.auto.decision.policy_version,
                               arguments_hash=arguments,
-                              profile=self.auto.decision.default_profile,
+                              profile=plan.profile or self.auto.decision.default_profile,
                               evidence_expires_in_s=evidence_remaining)
         approval = self.engine().issue(plan_id, arguments, binding, record=decision)
         self.core.changes.attach_approval(change_id, approval)
         return {**out, "approval": approval, "next": f"apply change {change_id}; no human step is required"}
 
-    def _review_still_stands(self, review_id: str, plan_id: str) -> bool:
-        """Whether the cited review is still a readable, passing verdict about this plan.
+    def _review_state(self, review_id: str, plan_id: str) -> str | None:
+        """`"passing"`, `"failed"`, or `None` when the record cannot be resolved for this plan.
 
-        The preflight record is a copy made at review time. Time passes, records get removed, and a copy
-        outlives its original - so the engine is told a `PASS` it cannot re-derive from anything.
+        A `PASS` that has since become a `DENY`, or that has picked up a BLOCKER, is not a passing review.
+        A record whose subject does not match this plan is not this plan's review. And a runner failure is
+        neither of those: it is a real fact, and the one the engine's retry branches exist for.
         """
         try:
             stored = self.reviews.store.get(review_id)
         except OpsError:
-            return False
-        if stored.get("status") != "OK" or not stored.get("verdict"):
-            return False
-        subject_ref = str(stored.get("subject_ref", ""))
-        return not subject_ref or subject_ref == plan_id
+            return None
+        if str(stored.get("subject_ref", "")) != plan_id:
+            return None
+        if stored.get("status") != "OK":
+            return "failed"
+        if stored.get("verdict") == "DENY":
+            return None
+        if stored.get("verdict") != "PASS":
+            return "failed"
+        findings = stored.get("findings") or ()
+        if any(str((finding or {}).get("severity", "")).upper() == "BLOCKER" for finding in findings):
+            return None
+        return "passing"
+
+    def _profile_gaps(self, plan: Any, change: Any, *,
+                      review_ids: Sequence[str] = ()) -> str:
+        """What this plan does not state that its profile requires, as one readable clause.
+
+        `allowed_*` and `allow_autonomous` were the only fields enforced, so a profile could demand
+        evidence, preconditions, verification or a second review and still see an APPROVE with none.
+        """
+        profile = self._profile_for(plan)
+        if profile is None:
+            return ""
+        missing: list[str] = []
+        for kind, required in (("evidence", profile.require_evidence),
+                               ("a precondition", profile.require_preconditions),
+                               ("a verification check", profile.require_verification)):
+            missing += [f"{kind} {item!r}" for item in required if not self._plan_states(plan, item)]
+        if profile.extra_reviews and len(review_ids) < profile.extra_reviews:
+            missing.append(f"{profile.extra_reviews} reviews (only {len(review_ids)} ran)")
+        if profile.irreversible and not any(step.irreversible_reason for step in plan.changes):
+            missing.append("an irreversible_reason on its steps")
+        return ", ".join(missing)
+
+    @staticmethod
+    def _plan_states(plan: Any, item: str) -> bool:
+        """Whether the plan says the thing a profile names, matched by word rather than by id.
+
+        A profile writes `host:reachable` and a plan writes `web-1 is reachable`; demanding an exact id
+        match would make every requirement unsatisfiable, and demanding nothing is what let them through.
+        The plan's own *statements* are searched, not its serialised form - `to_dict` carries field names
+        for values never filled in, so "inventory" would be satisfied by an empty `inventory_hash` key.
+        """
+        parts: list[str] = [plan.objective, plan.diagnosis, plan.rollback, *plan.preconditions,
+                            *plan.post_checks, *plan.alternatives_rejected, *plan.unverified_claims,
+                            *plan.unknowns]
+        for step in plan.changes:
+            parts += [step.how, step.undo, step.irreversible_reason, step.expectation, step.resource]
+        haystack = json.dumps(parts, ensure_ascii=False).casefold()
+        needle = item.casefold()
+        if needle in haystack:
+            return True
+        head = needle.split(":", 1)[0].strip()
+        return len(head) >= 3 and head in haystack
 
     def _profile_for(self, plan: Any) -> Any:
         """The policy profile the plan is filed under, or None when the operator defined none."""

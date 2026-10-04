@@ -212,8 +212,11 @@ class ApprovalEngine:
         # The engine's *current* configured version, not the one the binding carries. Supplying the
         # binding's own value makes the comparison equal by construction, so an approval issued under v1
         # stayed executable forever after the policy moved to v2.
+        # The profile in force is the one the plan was reviewed under, recorded at issuance - not the
+        # configured default, which is only the default for a plan that names no profile of its own.
+        in_force = str(change.details.get("profile") or self.config.decision.default_profile)
         reasons = stale_reasons(approval.binding, self._current_for(
-            change, self.config.decision.policy_version, self.config.decision.default_profile))
+            change, self.config.decision.policy_version, in_force))
         if reasons:
             raise OpsError(f"approval {approval.id} is STALE ({', '.join(reasons)})")
         return True
@@ -555,11 +558,25 @@ class ApprovalEngine:
                            f"references but the decision was made on {len(record.evidence_ids)}")
         if not binding.targets:
             raise OpsError("refusing to issue: the binding names no target, so it authorises nothing")
+        # A decision is spent once. `ApprovalStore.issue` deliberately replaces an *expired* record -
+        # timestamps are outside the binding hash, so a re-review of an unchanged change lands on the
+        # same id - and without this the original APPROVE could be replayed with a fresh `created` to mint
+        # a new lease, renewing authority that no re-review of review or evidence ever granted.
+        already = self.changes.get(binding.change_id).details.get("decision_id")
+        if already:
+            # A decision issues one approval, once. The same APPROVE must not be replayable: with a fresh
+            # `created` and the same identity it would mint a new lease over an expired one, renewing
+            # authority that no re-review of the review or the evidence ever granted. Re-review instead -
+            # that is what produces a decision with a new id.
+            raise OpsError(
+                f"decision {already} already issued the approval for {binding.change_id}; re-review the "
+                f"plan rather than re-issuing the same decision")
         approval_id = self.approvals.issue(binding).id
         self.changes.record_decision_inputs(
             binding.change_id, evidence_ids=list(binding.evidence_ids),
             policy_version=binding.policy_version, plan_id=plan_id, decision=record.decision.value,
-            arguments_hash=binding.arguments_hash, decision_record=record.to_dict())
+            arguments_hash=binding.arguments_hash, profile=binding.profile,
+            decision_record=record.to_dict())
         return approval_id
 
     # ----------------------------------------------------------------------------------------- audit
