@@ -221,15 +221,19 @@ class ChangeStore:
         with self._transition(change_id):
             change = self.get(change_id)
             engine_approved = False
-            if self.gate is not None and needs_approval:
+            # A destructive change needs a decision whatever the policy said, so the gate is consulted for
+            # it even when no approval is being demanded. Skipping the gate on `needs_approval=False` alone
+            # left `auto.decision.allow_destructive` ineffective for a policy-allow target: the operator
+            # entry point checked the engine approval, then consumed with `needs_approval=False`, and the
+            # destructive guard below demanded a human flag the engine had already covered.
+            if self.gate is not None and (needs_approval or change.dangerous):
                 # Before anything else: in autonomous mode this change must be carrying a decision the
                 # engine made. A human approval, or no approval at all, does not open this path.
                 #
-                # Only when an approval is actually being demanded. A policy-allow mutation has nobody to
-                # approve anything - the policy already allowed it - so requiring an engine decision there
-                # meant the change was created and then immediately refused for lacking a record that
-                # could not yet exist. The gate would have been consulted for a decision that was never
-                # on the table.
+                # Not consulted for an ordinary policy-allow mutation. The policy already allowed it, so
+                # there is nobody to approve anything, and demanding an engine decision there meant the
+                # change was created and then immediately refused for lacking a record that could not yet
+                # exist - the gate consulted about a decision that was never on the table.
                 engine_approved = self.gate(change)
             if change.capability != capability or change.target != target:
                 raise OpsError(f"change {change_id} is for {change.capability}:{change.target}")

@@ -1037,3 +1037,44 @@ def test_the_instructions_describe_the_path_the_deployment_actually_has(ops) -> 
     text = build_instructions(autonomous)
     assert "autonomy action=decide" in text, "the action that actually opens the gate is named"
     assert "opsbrain approve" not in text, "the path that is guaranteed to fail is not"
+
+
+def test_the_reviewer_is_shown_the_arguments_the_approval_is_bound_to() -> None:
+    """`how` is prose. The approval is bound to `arguments`, and the reviewer has to see the same thing.
+
+    A plan could describe a harmless operation in prose while its arguments named a different playbook or
+    a different saved plan: `decide_change` then matched the hidden values and authorised that operation.
+    """
+    from opsbrain.auto.plan import ChangePlan, ProposedChange
+
+    plan = ChangePlan.build(
+        objective="restart a service", diagnosis="the unit is masked",
+        changes=[ProposedChange(capability="tofu.apply", target="proxmox", how="apply the saved plan",
+                                undo="revert it", arguments={"plan_file": ".opsbrain/j-1234abcd.tfplan"})],
+        rollback="revert it", created=1_700_000_000.0)
+    rendered = plan.render_for_reviewer()
+    assert "j-1234abcd.tfplan" in rendered, "the reviewer sees the file that will actually be applied"
+    assert "arguments:" in rendered
+
+    bare = ChangePlan.build(
+        objective="read a service", diagnosis="looking",
+        changes=[ProposedChange(capability="k8s.get", target="default", how="list pods", undo="none")],
+        rollback="none", created=1_700_000_000.0)
+    assert "(none declared)" in bare.render_for_reviewer(), "and says plainly when there are none"
+
+
+def test_allow_destructive_reaches_a_policy_allow_target(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The engine's destructive opt-in was decided on and then discarded at the point of use.
+
+    `consume` skipped the gate because the policy allowed the capability, so the engine approval went
+    unread and the destructive guard asked for a human flag the decision had already covered.
+    """
+    _ops, engine = _autonomous_ops(ops, tmp_path, allow_destructive=True)
+    change = ops.changes.create("tofu.apply", "proxmox", "destroy a vm", "ph-1", dangerous=True,
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    record = decide_for(change, by=engine, destructive=True)
+    approval = issue_for(engine, change, bound_for(change), by=engine, record=record)
+    ops.changes.attach_approval(change.id, approval)
+    # The policy-allow path is the one that used to bypass the gate entirely.
+    assert ops.changes.consume(change.id, "tofu.apply", "proxmox", needs_approval=False).state == "applied"

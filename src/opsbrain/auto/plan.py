@@ -384,6 +384,11 @@ class ChangePlan:
                 f"  {index}. {change.capability}:{change.target}"
                 f"{'  [changes state]' if change.state_changing else '  [read-only]'}",
                 f"     how:       {change.how}",
+                # The concrete arguments, always. `how` is prose and can describe a harmless operation
+                # while the arguments name a different playbook or a different saved plan - and it is the
+                # arguments the approval is bound to. A reviewer who never saw them judged one thing and
+                # authorised another.
+                f"     arguments: {dict(change.arguments) or '(none declared)'}",
                 f"     reversible:{change.reversible.value}"
                 + (f" — {change.irreversible_reason}" if change.irreversible_reason else ""),
             ]
