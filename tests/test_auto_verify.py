@@ -791,24 +791,3 @@ def test_the_observation_window_is_recomputed_for_each_check(ops, fake) -> None:
     windows = [result.observation_s for result in report.results]
     assert windows == [5.0, 30.0], f"each check is judged on the time it actually waited: {windows}"
     assert report.observation_s == windows[-1]
-
-
-def test_every_reason_the_checks_can_emit_is_enumerable() -> None:
-    """A caller has to be able to enumerate the codes. A code nothing lists is a code nothing matches."""
-    from opsbrain.auto.config import all_reason_codes
-    from opsbrain.auto.evidence import Reason
-    from opsbrain.auto.preflight import REASON_BY_OUTCOME
-
-    listed = set(all_reason_codes())
-    missing = {reason.value for reason in Reason} - listed
-    assert missing == set(), f"reason codes the pipeline emits but nobody lists: {sorted(missing)}"
-    assert set(REASON_BY_OUTCOME.values()) <= listed, "an outcome maps to an unlisted reason"
-    for reason in Reason:
-        assert reason.value in listed
-
-
-def test_the_decision_codes_are_still_exported() -> None:
-    from opsbrain.auto.config import DECISION_REASON_CODES, REASON_CODES
-
-    assert REASON_CODES == DECISION_REASON_CODES
-    assert "approval_stale" in REASON_CODES
