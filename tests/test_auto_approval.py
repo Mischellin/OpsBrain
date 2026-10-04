@@ -340,3 +340,55 @@ def test_the_evidence_cap_can_only_shorten_an_approval(tmp_path: Path) -> None:
                              args={}, expired=False, expires=now() + 7200.0)
     binding = binding_for(change, expires_s=300.0, evidence_expires_in_s=900.0)
     assert binding.expires_s == pytest.approx(300.0, abs=5), "the shorter of the two stands"
+
+
+def test_revoking_a_spent_approval_erases_nothing(tmp_path: Path) -> None:
+    """A terminal record is not negotiable, and the record of what ran is not ours to erase."""
+    store = ApprovalStore(tmp_path)
+    approval = store.issue(a_binding())
+    store.consume(approval.id, current(), owner="worker-1", idempotency_key="job-42")
+    store.record_outcome(approval.id, {"state": "executed", "at": 1.0})
+    with pytest.raises(OpsError, match="already spent"):
+        store.revoke(approval.id, "too late")
+    kept = store.get(approval.id)
+    assert kept.state is LeaseState.CONSUMED
+    assert kept.outcome["state"] == "executed", "the proof of what ran survived"
+    replay = store.consume(approval.id, current(), owner="worker-2", idempotency_key="job-42")
+    assert replay.state is LeaseState.CONSUMED, "idempotent replay still answers with the earlier outcome"
+
+
+def test_revoking_twice_is_not_an_error(tmp_path: Path) -> None:
+    store = ApprovalStore(tmp_path)
+    approval = store.issue(a_binding())
+    assert store.revoke(approval.id, "first").state is LeaseState.REVOKED
+    assert store.revoke(approval.id, "second").state is LeaseState.REVOKED
+
+
+def test_an_expired_approval_does_not_block_issuing_a_fresh_one(tmp_path: Path) -> None:
+    """`created` and `expires_s` are outside the binding hash, so a re-review lands on the same id.
+
+    Returning the dead record forever left a change that is still open with no way to act on it: the only
+    way forward was to replan from scratch.
+    """
+    store = ApprovalStore(tmp_path)
+    stale = store.issue(a_binding())
+    # Age the stored record rather than issuing an already-dead one: that is the real situation, a record
+    # that was valid and then outlived its window while the change it covers stayed open.
+    path = tmp_path / f"{stale.id}.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["binding"]["created"] = round(now() - 10_000.0, 3)
+    path.write_text(json.dumps(document), encoding="utf-8")
+    assert store.get(stale.id).binding.expired is True
+    fresh = store.issue(a_binding())
+    assert fresh.id == stale.id, "the same decision keeps its identity"
+    assert fresh.binding.expired is False
+    assert store.get(stale.id).state is LeaseState.ISSUED, "the live record replaced the dead one"
+
+
+def test_a_spent_approval_is_never_replaced_by_a_re_issue(tmp_path: Path) -> None:
+    store = ApprovalStore(tmp_path)
+    approval = store.issue(a_binding())
+    store.consume(approval.id, current(), owner="worker-1", idempotency_key="job-42")
+    with pytest.raises(OpsError, match="already spent"):
+        store.issue(a_binding())
+    assert store.get(approval.id).lease_owner == "worker-1", "the spender is still on the record"

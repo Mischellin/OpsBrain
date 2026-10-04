@@ -199,7 +199,18 @@ class ApprovalStore:
                 existing = Approval.from_dict(json.loads(path.read_text(encoding="utf-8")))
                 if existing.binding.binding_hash != binding.binding_hash:
                     raise OpsError(f"approval id {approval.id} is held by a different binding")
-                return existing
+                if existing.state is LeaseState.ISSUED and not existing.binding.expired:
+                    return existing
+                # The stored record is spent, revoked or simply too old to use. `created` and `expires_s`
+                # are deliberately outside the binding hash - the same decision must keep the same id -
+                # so a re-review of an unchanged change lands here and would otherwise hand back the dead
+                # record forever, leaving no way to act on a change that is still open. Replacing it keeps
+                # the identity and gives the fresh review a live lease; a spent one is refused instead,
+                # because overwriting it would erase what ran.
+                if existing.state is LeaseState.CONSUMED:
+                    raise OpsError(f"approval {approval.id} was already spent; a spent approval is not "
+                                   f"replaced, and the change it authorised has already run")
+                approval = Approval(binding=binding)
             write_private(path, json.dumps(approval.to_dict(), ensure_ascii=False))
         return approval
 
@@ -266,11 +277,24 @@ class ApprovalStore:
             return spent
 
     def revoke(self, approval_id: str, why: str = "") -> Approval:
+        """Withdraw an approval that has not been spent.
+
+        Refuses once the lease is consumed. Overwriting a CONSUMED record with a REVOKED one used to
+        destroy `consumed_at` and the recorded outcome - the durable proof of what actually ran - and it
+        broke same-key idempotent replay, which then answered "revoked" instead of the earlier outcome.
+        A terminal record is not negotiable; there is nothing left to withdraw.
+        """
         with _locked(self.root / ".approvals.lock"):
             path = self._path(approval_id)
             if not path.is_file():
                 raise OpsError(f"no approval {approval_id}")
             approval = Approval.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            if approval.state is LeaseState.CONSUMED:
+                raise OpsError(f"approval {approval_id} was already spent by "
+                               f"{approval.lease_owner or 'someone else'}; a spent approval cannot be "
+                               f"revoked, and the record of what ran is not ours to erase")
+            if approval.state is LeaseState.REVOKED:
+                return approval
             revoked = Approval(binding=approval.binding, state=LeaseState.REVOKED, lease_owner=why or "revoked")
             write_private(path, json.dumps(revoked.to_dict(), ensure_ascii=False))
             return revoked
