@@ -20,7 +20,7 @@ from opsbrain.auto.decision import ApprovalEngine, Decision, DecisionRecord, Inp
 from opsbrain.auto.evidence import Reason as EvidenceReason
 from opsbrain.auto.preflight import Outcome
 from opsbrain.auto.verify import CheckResult, CheckStatus, VerificationReport
-from opsbrain.util import OpsError
+from opsbrain.util import OpsError, now
 
 
 def report(status: CheckStatus, *, reason: str = "", change_id: str = "pl-1") -> VerificationReport:
@@ -645,7 +645,7 @@ def test_an_engine_approved_destructive_change_applies_without_a_human_flag(ops,
 
 
 # ---------------------------------------------------------------------------- the end-to-end criterion
-def _bundle(ops: Any, tmp_path: Any, change_id: str = "") -> str:
+def _bundle(ops: Any, tmp_path: Any, change_id: str = "", *, observed_at: float | None = None) -> str:
     """A real evidence bundle, collected through the service.
 
     The engine refuses a decision that cites no evidence, and preflight calls an `ev-` reference nobody can
@@ -663,7 +663,8 @@ def _bundle(ops: Any, tmp_path: Any, change_id: str = "") -> str:
         [Observation(kind="log", target="web-1", capability="log.journal",
                      command_id="log.journal@web-1", collector="ssh:ops@10.0.0.42",
                      content="logrotate.timer: active (running)\n",
-                     provenance=Provenance.OBSERVED, observed_at=now())],
+                     provenance=Provenance.OBSERVED,
+                     observed_at=now() if observed_at is None else observed_at)],
         allowed=("log.journal",), targets=["web-1"], inventory_hash="inv-9f8e7d6c5b4a3928",
         change_id=change_id)
     return bundle["id"] if isinstance(bundle, dict) else bundle.id
@@ -1078,3 +1079,35 @@ def test_allow_destructive_reaches_a_policy_allow_target(ops, tmp_path) -> None:
     ops.changes.attach_approval(change.id, approval)
     # The policy-allow path is the one that used to bypass the gate entirely.
     assert ops.changes.consume(change.id, "tofu.apply", "proxmox", needs_approval=False).state == "applied"
+
+
+def test_the_approval_cap_comes_from_the_same_freshness_measurement_as_the_check(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The cap and the check must not measure freshness two different ways.
+
+    `check_evidence` measures from the oldest timestamp in the bundle against the limit stored *in that
+    bundle*. Deriving the cap from `bundle.created` and the currently configured window instead gave a
+    longer answer whenever an observation predated ingestion or the window was tightened after collection -
+    so the approval was issued with seconds of freshness left and stayed usable well after the evidence
+    went stale, because execution only re-reads the binding's expiry and the evidence ids.
+    """
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    assert ops.auto.review_plan(plan)["outcome"] == "approvable"
+
+    # An observation collected well before the bundle was ingested: the bundle's own `created` is now,
+    # but `check_evidence` measures freshness from the *oldest* entry, so the evidence is much closer to
+    # stale than the bundle's timestamp suggests.
+    stale_by = 800.0
+    old_bundle = _bundle(ops, tmp_path, change.id, observed_at=now() - stale_by)
+    old_plan = _plan_for_change(bundle_id=old_bundle)
+    assert ops.auto.review_plan(old_plan)["outcome"] == "approvable"
+
+    ids, reason, remaining = ops.auto._evidence_state((old_bundle,), change.id)
+    assert reason == "evidence_fresh", reason
+    window = float(ops.auto.auto.evidence.max_age_s)
+    # Measured the way `check_evidence` measures it - from the oldest entry, not from ingestion.
+    assert remaining <= window - stale_by + 5.0, (
+        f"the cap is {remaining:.0f}s, but the evidence has only {window - stale_by:.0f}s left")

@@ -618,11 +618,16 @@ class AutoService:
                 continue
             payloads, blocked = self.evidence.load_artifacts(bundle)
             checks = check_evidence(bundle, payloads, blocked=blocked, change_id=change_id or None)
-            # The earliest expiry is the one that matters: an approval outliving the *first* stale bundle
-            # is exactly the case worth refusing.
+            # Derived from the same two values `check_evidence` measures freshness with: the oldest
+            # timestamp in the bundle and the limit stored *in that bundle*. Using `bundle.created` and
+            # the currently configured window instead gave a longer answer whenever an observation
+            # predated ingestion, or whenever the window was tightened after collection - so the approval
+            # could be issued with seconds of freshness left and stay usable well after the evidence was
+            # stale, because execution only re-reads the binding's expiry and the evidence ids.
             with contextlib.suppress(TypeError, ValueError):
-                remaining = min(remaining, max(0.0, float(bundle.created) + self.auto.evidence.max_age_s
-                                              - time.time()))
+                oldest = min([float(bundle.created),
+                              *(float(entry.observed_at or entry.captured) for entry in bundle.entries)])
+                remaining = min(remaining, max(0.0, oldest + float(bundle.limits.max_age_s) - time.time()))
             found = reason_code(checks)
             if found != "evidence_fresh":
                 failing.append(bundle_id)
