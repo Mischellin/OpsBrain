@@ -83,7 +83,8 @@ def redact_text(text: str) -> str:
 #: `bypass`. Those are not credentials, and masking a boolean because its name contains a substring is
 #: worse than useless: it turns `verify_evidence` into a string the client cannot read.
 _PASSWORD_NAMES = (
-    "pass", "passwd", "password", "passphrase", "pwd", "pass_word", "passwd_?hash", "pass[-_]?word",
+    "pass", "passwd", "password", "passphrase", "passcode", "pass[-_]?code", "passkey", "pwd", "pass_word",
+    "passwd_?hash", "pass[-_]?word",
     "x[-_]?pass", "(?:user|admin|root|db|ftp|ssh|smtp|mail|api|app|service)_pass(?:word|wd)?",
 )
 _PASSWORD_NAME = re.compile(r"(?i)^(?:" + "|".join(_PASSWORD_NAMES) + r")$")
@@ -96,8 +97,9 @@ _SENSITIVE_NAME = re.compile(r"(?i)(?:^|[^a-z0-9])(?:" + _SENSITIVE_KEY + r")(?:
 #: `accesstoken` or `refreshtoken` carries the credential just as surely, and no separator will ever
 #: appear in it to be found. Restricted to words that cannot be the tail of an ordinary term -
 #: `tokenizer`, `keynote`, `secretary` and `authorized` do not end in any of these, which is the point.
-_SENSITIVE_SUFFIX = re.compile(r"(?:token|tokens|secret|secrets|passphrase|password|passwd|apikey|"
-                               r"privatekey|presharedkey|credential|credentials|dsn)$")
+_SENSITIVE_SUFFIX = re.compile(r"(?:token|secret|passphrase|password|passwd|passcode|pwd|credential)s?$|"
+                               r"(?:apikey|privatekey|presharedkey|accesskey|secretkey|authkey|signingkey|"
+                               r"encryptionkey|masterkey|passkey|passwordhash|passwdhash|pwdhash|dsn)s?$")
 
 #: Keys that *look* sensitive and are not - but only while the value is the kind of value they promise.
 #: `token` in a budget report is a count, not a credential, and masking it replaces a number with a string:

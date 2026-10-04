@@ -577,3 +577,24 @@ def test_telemetry_is_exempt_by_value_type_not_by_name() -> None:
     assert redact_obj({"is_pass": True, "passed": 3, "bypass": False}) == {
         "is_pass": True, "passed": 3, "bypass": False}
     assert redact_obj({"password_changed": "hunter2-opaque"})["password_changed"] != "hunter2-opaque"
+
+
+def test_unseparated_password_family_keys_are_still_credentials() -> None:
+    """Normalising adds boundaries only where a case change gave one, so `passcode` has none.
+
+    The first matcher was a substring search and masked these; narrowing it (so `is_pass` stops looking
+    like a password) must not have quietly stopped masking `passcode`, `dbpasscode` or `passwordhash`.
+    """
+    from opsbrain.redact import _is_sensitive_key, redact_obj
+
+    for key in ("passcode", "dbpasscode", "passwordhash", "passwdhash", "passwords", "passkey", "dbpasskey",
+                "secretkey", "accesskey", "authkey", "signingkey", "userpassword", "adminpasswd",
+                "pass_code", "PassCode", "dbPassCode", "dbpwd", "apikeys", "secretkeys"):
+        assert _is_sensitive_key(key), f"{key} names a credential"
+        assert redact_obj({key: "123456"})[key] != "123456", f"{key}: an opaque value is masked"
+
+    # ...while the targeted exemptions and the ordinary words that merely contain a fragment stay readable.
+    for key in ("compass", "passage", "passenger", "tokenizer", "keynote", "secretary", "authorized"):
+        assert not _is_sensitive_key(key), f"{key} is not a credential"
+    assert redact_obj({"is_pass": True, "passed": 3, "bypass": False}) == {
+        "is_pass": True, "passed": 3, "bypass": False}
