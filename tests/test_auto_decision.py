@@ -63,7 +63,7 @@ def decide(change_id: str = "", **overrides: Any) -> DecisionRecord:
                            review_ids=("rv-0000abcd",))
 
 
-def decide_for(change: Any, **overrides: Any) -> DecisionRecord:
+def decide_for(change: Any, by: ApprovalEngine | None = None, **overrides: Any) -> DecisionRecord:
     """A decision about one concrete change, carrying the same facts the binding will.
 
     `issue` now refuses a binding whose arguments, evidence or policy differ from the record's, so the
@@ -74,8 +74,8 @@ def decide_for(change: Any, **overrides: Any) -> DecisionRecord:
     arguments = digest({k: v for k, v in sorted(change.args.items())}) if change.args else ""
     # The report is about this change, or the engine correctly refuses a PASS from elsewhere.
     facts = {"verification": report(CheckStatus.PASS, change_id=change.id)}
-    return engine().decide(inputs(**{**facts, **overrides}), change.id, arguments, change_id=change.id,
-                           review_ids=("rv-0000abcd",))
+    return (by or engine()).decide(inputs(**{**facts, **overrides}), change.id, arguments,
+                                   change_id=change.id, review_ids=("rv-0000abcd",))
 
 
 # --------------------------------------------------------------------------- the positive path
@@ -562,3 +562,51 @@ def test_two_reviews_that_agree_still_approve() -> None:
     """The secondary check is not a veto on everything - a passing pair must still get through."""
     record = decide(secondary_review_status="OK", secondary_review_verdict="PASS")
     assert record.decision is Decision.APPROVE
+
+
+# ------------------------------------------------------------------ the paths that have to reach the gate
+def test_a_policy_allow_mutation_still_works_with_the_gate_installed(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Nothing to approve when nothing is being asked for approval.
+
+    `Core.gate` created the change and immediately consumed it with `needs_approval=False`. The engine gate
+    was consulted anyway, demanded a decision record that could not exist yet, and every one-step
+    policy-allow mutation raised instead of running.
+    """
+    from opsbrain.config import Access
+
+    _autonomous_ops(ops, tmp_path)
+    ops.require = lambda *_a, **_k: Access.ALLOW  # type: ignore[method-assign]
+    change = ops.gate("tofu.unlock", "proxmox", None, summary="unlock", content_hash="h1")
+    assert getattr(change, "state", None) == "applied"
+
+
+def test_an_engine_approved_apply_does_not_stop_to_ask_a_human(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The end-to-end criterion: a decided change applies without a human in the loop.
+
+    Issuance attaches an approval and leaves the change pending, which is the exact state the operator
+    entry point used to treat as "a human must approve this" - so the autonomous path always ended in a
+    prompt no matter what the engine had decided.
+    """
+    _ops, engine = _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    approval = engine.issue(change.id, change.hash, bound_for(change), record=decide_for(change, by=engine))
+    ops.changes.attach_approval(change.id, approval)
+    ops.exec.on(r"tofu apply", "@@OPSBRAIN-PLAN-MISMATCH " + "ab" * 32 + "@@\n", rc=78)
+    out = ops.tofu_apply(change.id)
+    assert out["plan_changed"] is True, "it got as far as the runner-side plan check"
+
+
+def test_an_engine_approved_destructive_change_applies_without_a_human_flag(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`auto.decision.allow_destructive` was decided on and then discarded at the point of use."""
+    _ops, engine = _autonomous_ops(ops, tmp_path, allow_destructive=True)
+    change = ops.changes.create("tofu.apply", "proxmox", "destroy", "ph-1", dangerous=True,
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    approval = engine.issue(change.id, change.hash, bound_for(change),
+                            record=decide_for(change, by=engine, destructive=True))
+    ops.changes.attach_approval(change.id, approval)
+    ops.exec.on(r"tofu apply", "@@OPSBRAIN-PLAN-MISMATCH " + "ab" * 32 + "@@\n", rc=78)
+    out = ops.tofu_apply(change.id)
+    assert out["plan_changed"] is True, "the destructive check was satisfied by the engine's approval"

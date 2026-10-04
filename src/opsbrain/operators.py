@@ -216,11 +216,24 @@ class Operators(Core):
             f"{binary} plan -input=false -no-color -lock-timeout=60s -detailed-exitcode > /dev/null 2>&1; "
             "echo \"@@OPSBRAIN-POSTPLAN $?@@\"; fi; exit $rc")
 
+    def engine_authorised(self, change: Any) -> bool:
+        """Whether the decision engine has already authorised this change.
+
+        The operator entry points used to answer "ask a human" the moment they saw a pending change, which
+        is exactly the state an engine-approved change is in: issuance attaches an approval and leaves the
+        change pending. So the autonomous path returned a human prompt every time and was unreachable in
+        practice, however correct the engine was. Returns False when the engine is not deciding, and lets
+        the gate raise when it is and the change is not authorised.
+        """
+        gate = getattr(self.changes, "gate", None)
+        return bool(gate is not None and gate(change))
+
     def tofu_apply(self, change_id: str, wait_s: int | None = None) -> dict[str, Any]:
         pending = self.changes.get(change_id)
         name, config = self._stack(pending.target)
         access = self.require("tofu.apply", name)
-        if pending.state == "pending" and (access is Access.CONFIRM or pending.dangerous):
+        if (pending.state == "pending" and (access is Access.CONFIRM or pending.dangerous)
+                and not self.engine_authorised(pending)):
             return self.approval_needed(pending)
         plan_file = str(pending.args.get("plan_file", ""))
         # Validated before the change is spent and before the path reaches a shell command.
@@ -359,7 +372,8 @@ class Operators(Core):
         access = self.require("ansible.apply", playbook)
         if config.require_limit_for_apply and not limit:
             raise OpsError("apply needs a limit (ansible.require_limit_for_apply): run the check with `limit`")
-        if pending.state == "pending" and access is Access.CONFIRM:
+        if (pending.state == "pending" and access is Access.CONFIRM
+                and not self.engine_authorised(pending)):
             return self.approval_needed(pending)
         change = self.changes.consume(change_id, "ansible.apply", playbook, needs_approval=access is Access.CONFIRM,
                                       content_hash=self._ansible_hash(playbook, limit, tags))

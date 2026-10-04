@@ -189,9 +189,15 @@ class ChangeStore:
         with self._transition(change_id):
             change = self.get(change_id)
             engine_approved = False
-            if self.gate is not None:
+            if self.gate is not None and needs_approval:
                 # Before anything else: in autonomous mode this change must be carrying a decision the
                 # engine made. A human approval, or no approval at all, does not open this path.
+                #
+                # Only when an approval is actually being demanded. A policy-allow mutation has nobody to
+                # approve anything - the policy already allowed it - so requiring an engine decision there
+                # meant the change was created and then immediately refused for lacking a record that
+                # could not yet exist. The gate would have been consulted for a decision that was never
+                # on the table.
                 engine_approved = self.gate(change)
             if change.capability != capability or change.target != target:
                 raise OpsError(f"change {change_id} is for {change.capability}:{change.target}")
@@ -204,7 +210,11 @@ class ChangeStore:
             if content_hash is not None and content_hash != change.hash:
                 raise OpsError(
                     f"change {change_id}: the code or arguments changed since it was planned; plan again")
-            if change.dangerous and not change.allow_dangerous:
+            if change.dangerous and not change.allow_dangerous and not engine_approved:
+                # The engine only approves a destructive change when the operator set
+                # `auto.decision.allow_destructive`, so its approval covers this check too. Without that,
+                # the opt-in existed in the decision and was discarded at the point of use, leaving the
+                # autonomous destructive path impossible.
                 raise OpsError(f"change {change_id} is destructive: a human must run "
                                f"`opsbrain approve {change_id} --allow-destroy`")
             # An engine approval *is* the approval in autonomous mode. Demanding a second, human one on top
