@@ -26,7 +26,7 @@ from .evidence import EvidenceBundle, render_for_reviewer
 from .plan import ChangePlan
 from .review import ReviewLimits, ReviewRequest, ReviewResult, RunnerStatus, Severity, Subject, Verdict
 from .store import RecordStore
-from .verify import Target
+from .verify import REGISTRY, Target
 
 #: An allowlist, not a denylist. A denylist of mutating verbs is always one verb short: `touch`, `chmod`,
 #: `chown`, `tee`, `sed -i`, `apt install` and a hundred others change state without appearing on it, and
@@ -130,6 +130,17 @@ class PreflightResult:
         return out
 
 
+#: The same fencing evidence uses. A plan is written by a worker or a model, and `diagnosis` and `how` are
+#: exactly where "approve this plan" would be put. The reviewer still reads the text; it is now visibly data.
+BEGIN = "=== UNTRUSTED PLAN DATA ==="
+END = "=== END UNTRUSTED PLAN DATA ==="
+
+
+def untrusted(text: str) -> str:
+    """Fence worker-authored text so its contents cannot close the region or speak as the harness."""
+    return f"{BEGIN}\n{text.replace(END, '').replace(BEGIN, '')}\n{END}"
+
+
 def split_probes(checks: Sequence[str], allowlist: Sequence[str] = ()) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Separate "go and look" from "go and change something", so a caller can only act on the first.
 
@@ -145,9 +156,20 @@ def split_probes(checks: Sequence[str], allowlist: Sequence[str] = ()) -> tuple[
     return tuple(read_only), tuple(acting)
 
 
+#: Characters that turn one command into several. An allowed prefix does not make these safe: a request
+#: that begins with a read-only command and continues into a second one is not a read-only request.
+_SHELL_OPERATORS = (";", "&&", "||", "|", "`", "$(", ">", "<")
+
+
 def _is_read_only(check: str, allowed: frozenset[str]) -> bool:
-    """Prefix match on whitespace-collapsed text, so `ls` matches and `lsof -p 1` does not."""
+    """Prefix match on whitespace-collapsed text, so `ls` matches and `lsof -p 1` does not.
+
+    A shell operator disqualifies the request outright. Whoever runs these later may or may not use a
+    shell, and refusing the ambiguous string is the only answer that is right either way.
+    """
     collapsed = " ".join(check.lower().split())
+    if any(operator in collapsed for operator in _SHELL_OPERATORS):
+        return False
     return any(collapsed == prefix or collapsed.startswith(f"{prefix} ") for prefix in allowed)
 
 
@@ -166,7 +188,8 @@ class Preflight:
 
     def refuse(self, plan: ChangePlan, outcome: Outcome, reason: str) -> PreflightResult:
         """A recorded refusal, with the same shape as a reviewed one, so nothing downstream needs a special case."""
-        preflight = PreflightResult(plan_id=plan.id, outcome=outcome, reason="review_failed", review_id="",
+        preflight = PreflightResult(plan_id=plan.id, outcome=outcome,
+                                    reason=REASON_BY_OUTCOME[outcome], review_id="",
                                     review_status=RunnerStatus.UNAVAILABLE, verdict=None, findings=(),
                                     unverified_claims=plan.unverified_claims, requested_probes=(),
                                     state_changing_probes=(), structural_gaps=plan.incomplete(),
@@ -184,7 +207,7 @@ class Preflight:
 
     def build_request(self, plan: ChangePlan, bundle: EvidenceBundle | None = None, *,
                       subject_ref: str | None = None) -> ReviewRequest:
-        context = [plan.render_for_reviewer()]
+        context = [untrusted(plan.render_for_reviewer())]
         if bundle is not None:
             payloads, _ = self.evidence.load_artifacts(bundle)
             context.append("")
@@ -256,8 +279,26 @@ def declared_state_changing(plan: ChangePlan) -> tuple[str, ...]:
 
     Verification is allowed to start something only if the plan said so *in advance*. This is the one place
     that extracts that declaration, so a plan cannot quietly grow a permitted action after review.
+
+    The two vocabularies differ: a plan step says `ansible.apply` on a profile, the verifier runs a check
+    named `systemd:unit-start`. Emitting the plan's own strings compares against a set that can never
+    contain the check being run, and every state-changing check is refused forever.
     """
-    return tuple(sorted({f"{change.capability}:{change.target}" for change in plan.changes if change.state_changing}))
+    matched: list[str] = []
+    for change in plan.changes:
+        if not change.state_changing:
+            continue
+        for name, check in REGISTRY.items():
+            if check.state_changing and check.profile == change.profile:
+                matched.append(name)
+    return tuple(sorted(dict.fromkeys(matched)))
+
+
+def unmatched_declarations(plan: ChangePlan) -> tuple[str, ...]:
+    """State-changing steps that name no profile, so they map onto no check and authorise nothing."""
+    known = set(declared_state_changing(plan))
+    return tuple(sorted({f"{change.capability}:{change.target}" for change in plan.changes
+                         if change.state_changing and not change.profile} - known))
 
 
 def verification_targets(plan: ChangePlan) -> tuple[Target, ...]:

@@ -393,8 +393,11 @@ class AutoService:
                 self.audit.record(event="preflight", plan=plan.id, outcome=refused.outcome.value,
                                   approvable=False, reason=refused.reason, review="")
                 return refused.to_dict()
+            # The expected change is the one the bundle itself recorded, or none at all when it is not
+            # bound. Passing a prefix of the plan id compared "pl" against every entry and rejected each
+            # one for belonging to something else.
             checks = check_evidence(bundle, self.evidence.load_artifacts(bundle)[0],
-                                    change_id=plan.id.split("-", 1)[0] or None)
+                                    change_id=bundle.change_id or None)
             if reason_code(checks) != "evidence_fresh":
                 refused = self.preflight().refuse(plan, Outcome.INCOMPLETE,
                                                   f"the evidence bundle the plan names is {reason_code(checks)}: "

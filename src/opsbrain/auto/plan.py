@@ -16,6 +16,7 @@ happens later, through a change id, and only after a decision nobody may forge f
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -26,6 +27,15 @@ from ..changes import digest
 from ..util import OpsError, now
 
 CONTRACT_VERSION = "1.0"
+
+
+def _floor_ms(moment: float) -> float:
+    """Whole milliseconds, always downwards.
+
+    `round()` maps 1 to 1 but 1.0004 to 1.0, so the same instant supplied as an int and as a float would
+    hash differently and a plan would appear altered by nothing at all.
+    """
+    return math.floor(moment * 1000) / 1000
 
 MAX_TEXT = 4_000
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./@-]{0,127}$")
@@ -63,6 +73,9 @@ class ProposedChange:
     undo: str = ""
     irreversible_reason: str = ""
     state_changing: bool = True
+    #: The verification profile this step acts on, e.g. `systemd`. It is what maps a plan's declaration
+    #: onto the verifier's own check names; a step that names none authorises nothing.
+    profile: str = ""
 
     def __post_init__(self) -> None:
         if not self.capability or not self.target:
@@ -76,13 +89,15 @@ class ProposedChange:
                 raise PlanError(
                     f"change {self.capability}:{self.target} is marked irreversible without a reason; "
                     "a reviewer cannot price a risk that has not been described")
-        elif not self.undo.strip():
+        elif not self.undo.strip() and self.state_changing:
             raise PlanError(
                 f"change {self.capability}:{self.target} claims to be reversible but names no undo")
+        # `state_changing=False` means the step observes rather than acts, so demanding an undo for it
+        # asks for a rollback of something that was never going to happen.
 
     def to_dict(self) -> dict[str, Any]:
         return {"capability": self.capability, "target": self.target, "how": self.how,
-                "reversible": self.reversible.value, "undo": self.undo,
+                "reversible": self.reversible.value, "undo": self.undo, "profile": self.profile,
                 "irreversible_reason": self.irreversible_reason, "state_changing": self.state_changing}
 
     @staticmethod
@@ -96,7 +111,8 @@ class ProposedChange:
             capability=str(data.get("capability", "")), target=str(data.get("target", "")),
             how=str(data.get("how", "")), reversible=Reversibility(reversible),
             undo=str(data.get("undo", "") or ""), irreversible_reason=str(data.get("irreversible_reason", "") or ""),
-            state_changing=bool(data.get("state_changing", True)))
+            state_changing=bool(data.get("state_changing", True)),
+            profile=str(data.get("profile", "") or ""))
 
 
 @dataclass(frozen=True)
@@ -149,7 +165,10 @@ class ChangePlan:
             raise PlanError("a plan needs a diagnosis: what is wrong, and how that was established")
         if not changes:
             raise PlanError("a plan with no changes is not a plan")
-        ordered = tuple(sorted(changes, key=lambda change: (change.target, change.capability, change.how)))
+        # The author's order is the execution order. Sorting by target made "stop the unit, replace its
+        # config, start it again" into an arbitrary permutation, and a plan that is applied in a different
+        # order than it was reviewed is a different plan.
+        ordered = tuple(changes)
         derived = _worst_reversibility(ordered)
         if reversibility is not None and reversibility is not derived:
             # Accepting a *safer* label than the changes support is how an irreversible edit gets filed
@@ -162,7 +181,7 @@ class ChangePlan:
             raise PlanError(f"a {resolved.value} plan must name its rollback")
         plan = ChangePlan(
             id="", objective=objective.strip(), diagnosis=diagnosis.strip(), changes=ordered,
-            created=round(now() if created is None else created, 3),
+            created=_floor_ms(now() if created is None else created),
             evidence_refs=tuple(sorted(set(evidence_refs))), evidence_bundle=evidence_bundle,
             inventory_hash=inventory_hash,
             # A plan that forgot to say where it acts must not end up judged against an empty scope.
