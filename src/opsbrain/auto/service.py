@@ -668,6 +668,8 @@ class AutoService:
                               profile=plan.profile or self.auto.decision.default_profile,
                               profile_version=(self._profile_for(plan).version
                                                if self._profile_for(plan) else "1"),
+                              profile_requirements=(self._profile_for(plan).requirements_digest()
+                                                    if self._profile_for(plan) else ""),
                               evidence_expires_in_s=evidence_remaining)
         approval = self.engine().issue(plan_id, arguments, binding, record=decision)
         self.core.changes.attach_approval(change_id, approval)

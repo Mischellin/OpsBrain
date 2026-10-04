@@ -464,7 +464,8 @@ def test_a_spent_approval_does_not_open_a_second_run(ops, tmp_path) -> None:  # 
                    "evidence_ids": ["ev-aaaaaaaabbbbbbbb"], "policy_version": "v1",
                    "profile": bound_for(change).profile,
                    "profile_version": bound_for(change).profile_version,
-                   "change_id": bound_for(change).change_id}
+                   "change_id": bound_for(change).change_id,
+                   "profile_requirements": bound_for(change).profile_requirements}
     engine.approvals.consume(approval, binding_now, owner="w", idempotency_key="k")
     ops.changes.attach_approval(change.id, approval)
     with pytest.raises(OpsError, match="consumed"):
@@ -1805,3 +1806,48 @@ def test_the_advertised_mcp_flow_can_actually_be_started(ops, tmp_path) -> None:
     assert out["decision"]["decision"] == "APPROVE", out["decision"].get("detail", out)
     assert AUTONOMOUS_FLOW == ("review-plan", "decide"), (
         "the steps the instructions name are the ones the action table carries")
+
+
+def test_a_profile_rewritten_without_a_version_bump_still_invalidates_its_approvals(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The version is a label the operator bumps; the requirements digest is the content behind it.
+
+    Tightening `secrets` without touching `version` changed the rules while keeping both the name and the
+    label, so "approved under `secrets` v1" stayed true and the approval remained spendable. This is the
+    last piece of OPS-AUTO-10: the history of a decision now says what it was decided under.
+    """
+    from opsbrain.auto.approval import ApprovalStore
+    from opsbrain.auto.config import AutoConfig, PolicyProfileConfig
+
+    def cfg(extra_reviews: int) -> Any:
+        return AutoConfig(
+            enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
+            decision={"mode": "autonomous", "default_profile": "secrets"},
+            profiles=[PolicyProfileConfig(name="secrets", version="1", extra_reviews=extra_reviews,
+                                          allowed_targets=["proxmox"], allow_autonomous=True)])
+
+    ops.config = ops.config.model_copy(update={"auto": cfg(1)})
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id), profile="secrets")
+    ops.auto.review_plan(plan)
+    approval = ops.auto.decide_change(change.id, plan.id)["approval"]
+    granted_under = ApprovalStore(ops.auto.root / "approvals").get(approval).binding.profile_requirements
+    assert granted_under, "the approval records what the profile stood for, not only its name"
+
+    # The operator tightens the rules and forgets to bump the version.
+    engine = ApprovalEngine(ops.config.model_copy(update={"auto": cfg(3)}).auto,
+                            ApprovalStore(ops.auto.root / "approvals"))
+    with pytest.raises(OpsError, match="profile_requirements_changed"):
+        engine.gate(ops.changes.get(change.id), spend=False)
+
+
+def test_two_profiles_with_one_name_and_different_rules_are_distinguishable() -> None:
+    from opsbrain.auto.config import PolicyProfileConfig
+
+    tight = PolicyProfileConfig(name="secrets", allowed_targets=["p"], extra_reviews=2)
+    loose = PolicyProfileConfig(name="secrets", allowed_targets=["p"])
+    assert tight.requirements_digest() != loose.requirements_digest()
+    assert tight.requirements_digest() == PolicyProfileConfig(
+        name="secrets", allowed_targets=["p"], extra_reviews=2).requirements_digest()

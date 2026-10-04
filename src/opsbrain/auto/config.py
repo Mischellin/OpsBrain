@@ -13,6 +13,7 @@ from typing import Any
 from pydantic import Field, field_validator, model_validator
 
 from ..models import Access, _Model
+from ..util import digest as _digest
 
 PROFILE_NAMES = ("general", "network", "firewall", "vpn", "reboot", "auth", "secrets", "storage",
                  "k8s-control-plane", "dns")
@@ -228,6 +229,26 @@ class PolicyProfileConfig(_Model):
     def min_reviews(self) -> int:
         """How many independent reviews this class is worth, whatever the profile asks for."""
         return _CLASSIFICATION_REVIEWS[self.classification]
+
+    def requirements_digest(self) -> str:
+        """A hash over what this profile actually requires - everything that governs a decision.
+
+        The name and the version are what an approval records; this is what they stand for. Without it,
+        "the change was approved under `secrets`" cannot be read back as "under *these* rules", and two
+        profiles sharing a name across a rewrite are indistinguishable.
+        """
+        return _digest({
+            "classification": self.classification,
+            "require_evidence": sorted(self.require_evidence),
+            "require_preconditions": sorted(self.require_preconditions),
+            "require_verification": sorted(self.require_verification),
+            "allowed_targets": sorted(self.allowed_targets),
+            "allowed_capabilities": sorted(self.allowed_capabilities),
+            "recovery_actions": sorted(self.recovery_actions),
+            "extra_reviews": self.extra_reviews,
+            "irreversible": self.irreversible,
+            "allow_autonomous": self.allow_autonomous,
+        })
 
 
 class VerifyConfig(_Model):

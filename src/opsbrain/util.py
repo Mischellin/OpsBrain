@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -114,3 +115,12 @@ def file_lock(path: Path) -> Iterator[None]:
             with contextlib.suppress(OSError):
                 fcntl.flock(handle, fcntl.LOCK_UN)
             os.close(handle)
+
+
+def digest(value: Any) -> str:
+    """A stable hash of any JSON-shaped value.
+
+    Lives here rather than in the change store because both `changes` and the `auto` package need it, and
+    having `auto` import `changes` for a hash would invert the layering.
+    """
+    return hashlib.sha256(compact(value).encode()).hexdigest()

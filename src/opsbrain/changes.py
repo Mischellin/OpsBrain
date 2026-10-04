@@ -8,7 +8,6 @@ approved by a human with `opsbrain approve <id>` on a terminal. A change is sing
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import json
 import re
 from collections.abc import Callable, Iterator, Sequence
@@ -16,7 +15,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .util import OpsError, compact, file_lock, new_id, now, write_private
+from .util import OpsError, file_lock, new_id, now, write_private
+from .util import digest as _digest
 
 _ID = re.compile(r"^c-[0-9a-f]{8}$")
 #: The id becomes a lock filename, so it is validated as one before it is used as one.
@@ -24,8 +24,9 @@ _CHANGE_ID = re.compile(r"^c-[0-9a-f]{8,64}$")
 PENDING, APPROVED, APPLIED, DISCARDED = "pending", "approved", "applied", "discarded"
 
 
-def digest(value: Any) -> str:
-    return hashlib.sha256(compact(value).encode()).hexdigest()
+#: Re-exported: callers throughout the codebase take it from here, and it now lives in `util` so the
+#: `auto` package does not have to import the change store for a hash.
+digest = _digest
 
 
 @dataclass
@@ -205,7 +206,7 @@ class ChangeStore:
     # `list[str]` annotation here is not a type at all and mypy is right to say so.
     def record_decision_inputs(self, change_id: str, *, evidence_ids: Sequence[str], policy_version: str,
                               plan_id: str, decision: str, arguments_hash: str = "", profile: str = "",
-                              profile_version: str = "",
+                              profile_version: str = "", profile_requirements: str = "",
                               decision_record: dict[str, Any] | None = None) -> Change:
         """Record what the decision engine decided against, so the gate can check it later.
 
@@ -224,6 +225,8 @@ class ChangeStore:
                               "decision": decision, "arguments_hash": arguments_hash,
                               **({"profile": profile} if profile else {}),
                               **({"profile_version": profile_version} if profile_version else {}),
+                              **({"profile_requirements": profile_requirements}
+                                 if profile_requirements else {}),
                               **({"decision_id": (decision_record or {}).get("id")}
                                  if decision_record and decision_record.get("id") else {}),
                               **({"decision_record": decision_record} if decision_record else {})}

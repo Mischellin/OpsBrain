@@ -222,9 +222,12 @@ class ApprovalEngine:
         # The version *currently configured*, not the one recorded at issuance - exactly as with the
         # policy version above. Comparing against the recorded one would make the check a tautology: the
         # binding and the record would always agree, and tightening a profile would change nothing.
-        in_force_version = self._profile_config(in_force).version
+        configured = self._profile_config(in_force)
+        in_force_version = configured.version
+        in_force_requirements = configured.requirements_digest()
         reasons = stale_reasons(approval.binding, self._current_for(
-            change, self.config.decision.policy_version, in_force, in_force_version))
+            change, self.config.decision.policy_version, in_force, in_force_version,
+            in_force_requirements))
         if reasons:
             raise OpsError(f"approval {approval.id} is STALE ({', '.join(reasons)})")
         # Spent, not just read. Reading left the approval `ISSUED` after a successful apply, so `revoke`
@@ -237,13 +240,14 @@ class ApprovalEngine:
             if approval.outcome.get("idempotency_key") == f"change:{change.id}":
                 return True
             self.approvals.consume(approval.id, self._current_for(
-                change, self.config.decision.policy_version, in_force, in_force_version),
+                change, self.config.decision.policy_version, in_force, in_force_version,
+                in_force_requirements),
                                    owner=f"engine:{change.id}", idempotency_key=f"change:{change.id}")
         return True
 
     @staticmethod
     def _current_for(change: Any, policy_version: str, profile: str,
-                     profile_version: str = "1") -> dict[str, Any]:
+                     profile_version: str = "1", profile_requirements: str = "") -> dict[str, Any]:
         """The change's own facts, as the approval must be checked against them.
 
         Derived from the record, never from the binding: comparing `binding.evidence_ids` with
@@ -271,6 +275,7 @@ class ApprovalEngine:
             # from `general` to a stricter profile would leave the approval spendable.
             "profile": profile,
             "profile_version": profile_version,
+            "profile_requirements": profile_requirements,
         }
 
     def _profile_config(self, name: str) -> Any:
@@ -278,7 +283,8 @@ class ApprovalEngine:
         for profile in self.config.profiles:
             if profile.name == name:
                 return profile
-        return type("Absent", (), {"version": "1", "name": name})()
+        return type("Absent", (), {"version": "1", "name": name,
+                                  "requirements_digest": staticmethod(lambda: "")})()
 
     def _budget_exhausted(self, inputs: Inputs) -> str:
         """Which of the operator's ceilings this workflow has already reached, if any.
