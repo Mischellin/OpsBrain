@@ -320,25 +320,28 @@ class Readers(Core):
         self._names(namespace, name)
         if selector and not _SELECTOR.fullmatch(selector):
             raise OpsError(f"invalid selector: {selector!r}")
-        if kind == "namespaces" and not namespace:
-            # The listing *is* the disclosure. A `k8s.read:prod: deny` has to mean prod is not named in
-            # the answer either, and this path never reached the per-namespace check because namespaces
-            # are not themselves namespaced - so the denied one came straight back in `items`.
+        if kind == "namespaces" and not namespace and not name:
+            # The listing *is* the disclosure, and this branch issues the cluster read itself, so the bare
+            # capability is checked *before* it - exactly as `_require_all_namespaces` does. Checking the
+            # per-namespace rules only afterwards meant a caller denied `k8s.read` outright had already
+            # caused `kubectl get namespaces` to run.
+            self.require("k8s.read")
             rows = parsers.k8s_rows(kind, self._kubectl_json("get", "namespaces"))
-            allowed, withheld = [], []
+            allowed, withheld = [], 0
             for row in rows:
-                name = str(row.get("name", ""))
-                if not name:
+                row_name = str(row.get("name", ""))
+                if not row_name:
                     continue
-                if self.may_read_namespace(name):
+                if self.may_read_namespace(row_name):
                     allowed.append(row)
                 else:
-                    withheld.append(name)
+                    withheld += 1
             out = {"kind": kind, "namespaces": [str(r.get("name", "")) for r in allowed],
                    **self.capped(allowed, 40)}
             if withheld:
-                out["withheld"] = sorted(withheld)
-                out["note"] = f"{len(withheld)} namespace(s) are not covered by policy and are not listed"
+                # A count, not the names. Naming them would put back exactly what the rule withholds.
+                out["withheld"] = withheld
+                out["note"] = f"{withheld} namespace(s) are not covered by policy and are not listed"
             return out
         cluster_wide = not namespace and kind not in ("nodes", "namespaces")
         names: list[str] = []
@@ -358,9 +361,16 @@ class Readers(Core):
             # server was still being loaded. The authorisation is unchanged: the point is that a namespace
             # created after the check cannot appear here, not how fast the reads happen.
             def read_scope(scope: str) -> list[Any]:
-                return parsers.k8s_rows(kind, self._kubectl_json(
-                    "get", K8S_KINDS[kind], *([name] if name else []), "-n", scope,
-                    *(["-l", selector] if selector else [])))
+                args = ["get", K8S_KINDS[kind], *([name] if name else []), "-n", scope]
+                if name:
+                    # `kubectl get <kind> <name>` exits non-zero with NotFound when that object is not in
+                    # this namespace, and a named object normally lives in exactly one. Without
+                    # `--ignore-not-found` the first namespace that does not have it aborted the whole
+                    # read, so a lookup that used to work with `-A` failed on ordinary input.
+                    args.append("--ignore-not-found")
+                if selector:
+                    args += ["-l", selector]
+                return parsers.k8s_rows(kind, self._kubectl_json(*args))
 
             if len(names) == 1:
                 rows = read_scope(names[0])

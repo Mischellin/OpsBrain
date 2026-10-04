@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from opsbrain.config import Access
+from opsbrain.executor import Result
 from opsbrain.util import OpsError
 
 
@@ -311,8 +312,10 @@ def test_a_denied_namespace_is_not_named_by_the_namespace_listing(ops) -> None: 
     named = [row["name"] for row in out["items"]]
     assert "prod" not in named, "a namespace the policy does not cover is not named"
     assert set(named) == {"default", "staging"}
-    assert out["withheld"] == ["prod"], "and the caller is told something was withheld, without being told what"
-    assert "prod" not in json.dumps({k: v for k, v in out.items() if k != "withheld"}) or out["withheld"] == ["prod"]
+    # A count, not the names: the whole point of the rule is that `prod` is not disclosed anywhere in the
+    # answer, and echoing it back under `withheld` undid that.
+    assert out["withheld"] == 1
+    assert "prod" not in json.dumps(out), "and the denied name appears nowhere in the response"
 
 
 def test_a_redaction_marker_survives_a_second_pass(ops) -> None:  # type: ignore[no-untyped-def]
@@ -332,3 +335,71 @@ def test_a_redaction_marker_survives_a_second_pass(ops) -> None:  # type: ignore
     as_text = json.dumps(once)
     assert redact_text(as_text) == as_text, "a second pass over redacted JSON changes nothing at all"
     assert json.loads(redact_text(as_text))["password"] == "[REDACTED:value]"
+
+
+def test_the_namespace_listing_is_gated_before_it_reads_the_cluster(ops) -> None:  # type: ignore[no-untyped-def]
+    """This branch issues `get namespaces` itself, so the bare capability is checked before it.
+
+    Checking the per-namespace rules only afterwards meant a caller denied `k8s.read` outright had already
+    caused the forbidden cluster read - the same mistake the per-namespace fix was made for.
+    """
+    from opsbrain.config import Access
+
+    ops.exec.rules.clear()
+    ops.exec.on(r"get namespaces", json.dumps({"items": []}) + "\n")
+    ops.require = _policy(ops, {"k8s.read": Access.DENY})
+    with pytest.raises(OpsError, match="k8s.read"):
+        ops.k8s_get(kind="namespaces")
+    assert not ops.exec.calls, "the cluster was read by a caller the policy denies"
+
+
+def test_a_named_namespace_lookup_is_not_turned_into_a_full_listing(ops) -> None:  # type: ignore[no-untyped-def]
+    """`kind="namespaces", name="prod"` is a single-object lookup and must stay one."""
+    from opsbrain.config import Access
+
+    ops.exec.rules.clear()
+    ops.exec.on(r"get namespaces prod", json.dumps(
+        {"items": [{"metadata": {"name": "prod"}}]}) + "\n")
+    ops.require = _policy(ops, {"k8s.read": Access.ALLOW})
+    out = ops.k8s_get(kind="namespaces", name="prod")
+    scripts = [script for _, script in ops.exec.calls if "get namespaces" in script]
+    assert scripts, "the lookup ran"
+    assert all("get namespaces prod" in script for script in scripts), "and it asked for the named object"
+    assert "namespaces" in out.get("items", [{}])[0] or out.get("kind") == "namespaces"
+
+
+def test_a_named_object_absent_from_a_namespace_does_not_abort_the_whole_read(ops) -> None:  # type: ignore[no-untyped-def]
+    """`kubectl get pods web -n x` exits NotFound unless told to ignore missing objects.
+
+    A named object normally lives in one namespace, so the first namespace without it used to fail the
+    entire read - turning a lookup that used to work with `-A` into one that failed on ordinary input.
+    """
+    from opsbrain.config import Access
+
+    ops.exec.rules.clear()
+    ops.exec.on(r"get namespaces", json.dumps({"items": [
+        {"metadata": {"name": "default"}}, {"metadata": {"name": "prod"}}]}) + "\n")
+    ops.exec.on(r"-n default", json.dumps({"items": [{"metadata": {"name": "web"}}]}) + "\n")
+    # Exactly what kubectl does: NotFound without the flag, an empty list with it.
+    ops.exec.on(r"-n prod", lambda script: (  # type: ignore[arg-type]
+        Result(1, 'Error from server (NotFound): pods "web" not found\n')
+        if "--ignore-not-found" not in script
+        else Result(0, json.dumps({"items": []}) + "\n")))
+    ops.require = _policy(ops, {"k8s.read": Access.ALLOW})
+    out = ops.k8s_get(kind="pods", name="web")
+    scripts = [script for _, script in ops.exec.calls if "get pods web" in script]
+    assert scripts and all("--ignore-not-found" in script for script in scripts), (
+        "a namespace that does not have the object must not end the read")
+    assert "web" in json.dumps(out["items"]), "and the namespace that has the object is still reported"
+    assert len(out["namespaces"]) == 2, "both authorised namespaces were read"
+
+
+def test_every_marker_kind_this_module_emits_survives_a_second_pass() -> None:
+    """`MARK` emits kinds with underscores - `private_key`, `github_token`, `ansible_vault`."""
+    from opsbrain.redact import redact_obj, redact_text
+
+    for kind in ("value", "private_key", "github_token", "ansible_vault"):
+        stored = f'{{"api_key": "[REDACTED:{kind}]"}}'
+        assert redact_text(stored) == stored, f"a {kind} marker was rewritten on the second pass"
+        json.loads(redact_text(stored))
+    assert redact_obj({"input_tokens": 7})["input_tokens"] == 7
