@@ -7,3 +7,5 @@ dist/
 .mypy_cache/
 *.egg-info/
 .env
+
+.DS_Store
