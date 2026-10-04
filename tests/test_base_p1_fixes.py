@@ -291,3 +291,44 @@ def test_a_wide_cluster_read_does_not_become_a_serial_queue(ops) -> None:  # typ
     from opsbrain.readers import _K8S_READ_PARALLELISM
 
     assert 1 < _K8S_READ_PARALLELISM < count, "the bound is what makes this not a queue"
+
+
+def test_a_denied_namespace_is_not_named_by_the_namespace_listing(ops) -> None:  # type: ignore[no-untyped-def]
+    """The listing *is* the disclosure, and namespaces are not themselves namespaced.
+
+    That path never reached the per-namespace check, so `k8s.read:prod: deny` produced a listing that
+    named prod - the enforcement the rest of this class exists for, bypassed through a supported call.
+    """
+    from opsbrain.config import Access
+
+    ops.exec.rules.clear()
+    ops.exec.on(r"get namespaces", json.dumps({"items": [
+        {"metadata": {"name": "default"}}, {"metadata": {"name": "prod"}},
+        {"metadata": {"name": "staging"}}]}) + "\n")
+    ops.require = _policy(ops, {"k8s.read": Access.ALLOW, "k8s.read:prod": Access.DENY})
+
+    out = ops.k8s_get(kind="namespaces")
+    named = [row["name"] for row in out["items"]]
+    assert "prod" not in named, "a namespace the policy does not cover is not named"
+    assert set(named) == {"default", "staging"}
+    assert out["withheld"] == ["prod"], "and the caller is told something was withheld, without being told what"
+    assert "prod" not in json.dumps({k: v for k, v in out.items() if k != "withheld"}) or out["withheld"] == ["prod"]
+
+
+def test_a_redaction_marker_survives_a_second_pass(ops) -> None:  # type: ignore[no-untyped-def]
+    """Stored text is redacted again on read, and the marker has to be recognised as done.
+
+    Bypassing only the save path left the same corruption on `artifact action=read` and `grep`: the quoted
+    marker came back as a bare unquoted token and the document stopped being JSON.
+    """
+    from opsbrain.redact import redact_obj, redact_text
+
+    once = redact_obj({"password": "hunter2", "rows": [1, 2, 3]})
+    assert once["password"] == "[REDACTED:value]"
+    twice = redact_obj(once)
+    assert twice["password"] == "[REDACTED:value]", "redacting redacted JSON is a no-op"
+    json.dumps(twice)  # and the document is still valid JSON
+
+    as_text = json.dumps(once)
+    assert redact_text(as_text) == as_text, "a second pass over redacted JSON changes nothing at all"
+    assert json.loads(redact_text(as_text))["password"] == "[REDACTED:value]"

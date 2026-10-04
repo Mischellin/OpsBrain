@@ -118,6 +118,14 @@ class Readers(Core):
         return out
 
     # ----------------------------------------------------------------------------------------- hosts
+    def may_read_namespace(self, name: str) -> bool:
+        """Whether the policy covers this namespace, without raising on one it does not."""
+        try:
+            self.require("k8s.read", name)
+        except OpsError:
+            return False
+        return True
+
     def _require_all_namespaces(self) -> list[str]:
         """The namespaces a cluster-wide read may cover, each authorised individually.
 
@@ -312,6 +320,26 @@ class Readers(Core):
         self._names(namespace, name)
         if selector and not _SELECTOR.fullmatch(selector):
             raise OpsError(f"invalid selector: {selector!r}")
+        if kind == "namespaces" and not namespace:
+            # The listing *is* the disclosure. A `k8s.read:prod: deny` has to mean prod is not named in
+            # the answer either, and this path never reached the per-namespace check because namespaces
+            # are not themselves namespaced - so the denied one came straight back in `items`.
+            rows = parsers.k8s_rows(kind, self._kubectl_json("get", "namespaces"))
+            allowed, withheld = [], []
+            for row in rows:
+                name = str(row.get("name", ""))
+                if not name:
+                    continue
+                if self.may_read_namespace(name):
+                    allowed.append(row)
+                else:
+                    withheld.append(name)
+            out = {"kind": kind, "namespaces": [str(r.get("name", "")) for r in allowed],
+                   **self.capped(allowed, 40)}
+            if withheld:
+                out["withheld"] = sorted(withheld)
+                out["note"] = f"{len(withheld)} namespace(s) are not covered by policy and are not listed"
+            return out
         cluster_wide = not namespace and kind not in ("nodes", "namespaces")
         names: list[str] = []
         if cluster_wide:

@@ -34,6 +34,8 @@ _KEY_VALUE = re.compile(
     r"(\"[^\"\n]{1,512}\"|'[^'\n]{1,512}'|[^\s,;\"']{1,512})")
 # WireGuard keys are 32 bytes base64: 43 characters + "="
 _WG_KEY = re.compile(r"(?i)\b(privatekey|presharedkey)\s{0,3}=\s{0,3}[A-Za-z0-9+/]{43}=")
+#: A value that is already a redaction marker, with or without the quotes the serialiser put round it.
+_ALREADY_REDACTED = re.compile(r'^(?:"\[REDACTED:[a-z]+\]"|\[REDACTED:[a-z]+\])$', re.IGNORECASE)
 _SAFE_VALUES = frozenset({"", "null", "none", "true", "false", "yes", "no", "(sensitive value)", "(sensitive)",
                           "<redacted>", "***", "\"\"", "''"})
 
@@ -58,7 +60,11 @@ def redact(text: str) -> tuple[str, int]:
     def key_value(match: re.Match[str]) -> str:
         nonlocal count
         value = match.group(2)
-        if value.strip().lower() in _SAFE_VALUES or value.startswith("[REDACTED:"):
+        if value.strip().lower() in _SAFE_VALUES or _ALREADY_REDACTED.match(value.strip()):
+            # A marker that is already a marker, quoted or not, is left exactly as it is. Re-running the
+            # redactor over stored text - an artifact read, a grep - used to rewrite
+            # `"password":"[REDACTED:value]"` into a bare unquoted token, so the same corruption kept
+            # happening downstream of the store even after the save path learned to skip it.
             return match.group(0)
         count += 1
         return match.group(1) + MARK.format(kind="value")
