@@ -13,7 +13,6 @@ Outside it, budgets do not exist and redelivery double-charges. Inside it:
 from __future__ import annotations
 
 import contextlib
-import json
 import threading
 import time
 from collections.abc import Sequence
@@ -383,7 +382,7 @@ class AutoService:
             self._preflight = Preflight(self.auto, self.reviews, self.root, self.evidence)
         return self._preflight
 
-    def review_plan(self, plan: ChangePlan, *, evidence: str = "") -> dict[str, Any]:
+    def review_plan(self, plan: ChangePlan, *, evidence: str = "", runs: int | None = None) -> dict[str, Any]:
         """Review a plan before anything changes, and answer with the outcome, not a boolean.
 
         `evidence` is a bundle id; when given, its redacted render travels with the plan so the reviewer
@@ -417,7 +416,11 @@ class AutoService:
                 self.audit.record(event="preflight", plan=plan.id, outcome=refused.outcome.value,
                                   approvable=False, reason=refused.reason, review="")
                 return refused.to_dict()
-        result: PreflightResult = self.preflight().run(plan, bundle)
+        # `runs` defaults to what the plan's own profile asks for. Making the caller pass it would let a
+        # profile demanding two reviews be satisfied by one, because the caller decides and the caller can
+        # be wrong - the same shape as a caller supplying the verdict itself.
+        wanted = max(1, runs) if runs is not None else self._required_runs(plan)
+        result: PreflightResult = self.preflight().run(plan, bundle, runs=wanted)
         self.audit.record(event="preflight", plan=plan.id, outcome=result.outcome.value,
                           approvable=result.approvable, reason=result.reason, review=result.review_id)
         return result.to_dict()
@@ -568,7 +571,7 @@ class AutoService:
                 live = self.reviews.store.get(result.review_id)
                 review_status = str(live.get("status") or review_status)
                 review_verdict = str(live.get("verdict") or "")
-            review_ids = (result.review_id,)
+            review_ids = tuple(result.review_ids) or (result.review_id,)
         unmet = self._profile_gaps(plan, change, review_ids=review_ids)
         if unmet:
             return self._decision_refused(change_id, plan_id,
@@ -702,6 +705,11 @@ class AutoService:
         self.core.changes.note_workflow_start(
             change_id, calls=self.reviews.ledger.calls, spend=self.reviews.ledger.spend_usd, at=now())
 
+    def _required_runs(self, plan: Any) -> int:
+        """How many independent reviews the plan's profile is worth."""
+        profile = self._profile_for(plan)
+        return 1 if profile is None else max(1, profile.extra_reviews, profile.min_reviews)
+
     def _profile_gaps(self, plan: Any, change: Any, *,
                       review_ids: Sequence[str] = ()) -> str:
         """What this plan does not state that its profile requires, as one readable clause.
@@ -713,10 +721,11 @@ class AutoService:
         if profile is None:
             return ""
         missing: list[str] = []
-        for kind, required in (("evidence", profile.require_evidence),
-                               ("a precondition", profile.require_preconditions),
-                               ("a verification check", profile.require_verification)):
-            missing += [f"{kind} {item!r}" for item in required if not self._plan_states(plan, item)]
+        for field, required in (("evidence", profile.require_evidence),
+                                ("precondition", profile.require_preconditions),
+                                ("verification", profile.require_verification)):
+            missing += [f"{field} {item!r}" for item in required
+                        if not self._plan_states(plan, field, item)]
         # The effective floor, which is the class's - the configured number can only be higher, because
         # the config layer refuses a profile that asks for less than its own classification is worth.
         needed = max(profile.extra_reviews, profile.min_reviews)
@@ -727,25 +736,26 @@ class AutoService:
         return ", ".join(missing)
 
     @staticmethod
-    def _plan_states(plan: Any, item: str) -> bool:
-        """Whether the plan says the thing a profile names, matched by word rather than by id.
+    def _plan_states(plan: Any, field: str, item: str) -> bool:
+        """Whether one structured field of the plan carries the thing a profile names.
 
-        A profile writes `host:reachable` and a plan writes `web-1 is reachable`; demanding an exact id
-        match would make every requirement unsatisfiable, and demanding nothing is what let them through.
-        The plan's own *statements* are searched, not its serialised form - `to_dict` carries field names
-        for values never filled in, so "inventory" would be satisfied by an empty `inventory_hash` key.
+        Field by field, never by searching the whole plan. A prose match meant `require_verification:
+        [systemd:unit-start]` was satisfied by the word "systemd" appearing in the diagnosis, with no step
+        declaring that check at all - a textual substitute for a structured requirement, which is the one
+        thing a profile is for.
         """
-        parts: list[str] = [plan.objective, plan.diagnosis, plan.rollback, *plan.preconditions,
-                            *plan.post_checks, *plan.alternatives_rejected, *plan.unverified_claims,
-                            *plan.unknowns]
-        for step in plan.changes:
-            parts += [step.how, step.undo, step.irreversible_reason, step.expectation, step.resource]
-        haystack = json.dumps(parts, ensure_ascii=False).casefold()
-        needle = item.casefold()
-        if needle in haystack:
-            return True
-        head = needle.split(":", 1)[0].strip()
-        return len(head) >= 3 and head in haystack
+        wanted = item.casefold().strip()
+        if field == "verification":
+            return any(step.declared_check.casefold() == wanted for step in plan.changes)
+        if field == "evidence":
+            named = {ref.casefold() for ref in plan.evidence_refs}
+            if plan.evidence_bundle:
+                named.add(plan.evidence_bundle.casefold())
+            return wanted in named
+        if field == "precondition":
+            return any(wanted in line.casefold() or line.casefold() in wanted
+                       for line in plan.preconditions)
+        return False
 
     def _profile_for(self, plan: Any) -> Any:
         """The policy profile the plan is filed under, or None when the operator defined none."""

@@ -1632,8 +1632,13 @@ def test_a_serious_class_must_state_whether_autonomy_is_allowed() -> None:
     assert explicit.allow_autonomous is False
 
 
-def test_a_plan_below_its_class_floor_is_refused_even_with_passing_reviews(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
-    """The floor is checked at decision time too, not only in the config."""
+def test_a_class_floor_is_met_by_actually_running_the_reviews(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The floor is a promise the system keeps, not a wall a caller hits.
+
+    `review_plan` asks the profile how many reviews its class is worth and runs that many, so a `medium`
+    profile gets its two sessions and the decision proceeds. The refusal remains for the case where the
+    runner cannot deliver them.
+    """
     from opsbrain.auto.config import AutoConfig, PolicyProfileConfig
 
     ops.config = ops.config.model_copy(update={"auto": AutoConfig(
@@ -1646,7 +1651,61 @@ def test_a_plan_below_its_class_floor_is_refused_even_with_passing_reviews(ops, 
                                 args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
                                 details={"plan_sha256": "ab" * 32})
     plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id), profile="secrets")
+    assert ops.auto._required_runs(plan) == 2, "the class says two, and the reviewer is asked for two"
     ops.auto.review_plan(plan)
+    assert len(ops.auto.preflight().get_by_plan(plan.id)["review_refs"]) == 2
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "APPROVE", out["decision"].get("detail", out)
+
+
+def test_a_floor_the_runner_cannot_meet_still_blocks(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """If the second session cannot be produced, the class floor is not quietly waived."""
+    from opsbrain.auto.config import AutoConfig, PolicyProfileConfig
+
+    ops.config = ops.config.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token=TOKEN, review={"runner": "codex", "max_retries": 0},
+        decision={"mode": "autonomous", "default_profile": "secrets"},
+        profiles=[PolicyProfileConfig(name="secrets", classification="high", extra_reviews=2,
+                                      allowed_targets=["proxmox"], allow_autonomous=True)])})
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id), profile="secrets")
+    ops.auto.review_plan(plan)
+    record = ops.auto.preflight().get_by_plan(plan.id)
+    # A second session that failed is not a second session.
+    record["review_refs"] = record["review_refs"][:1]
+    ops.auto.preflight().store.put(f"pf-{plan.plan_hash[:16]}", record)
     out = ops.auto.decide_change(change.id, plan.id)
     assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY"
-    assert "2 reviews (medium class, 1 ran)" in out["decision"]["detail"]
+    assert "2 reviews (high class, 1 ran)" in out["decision"]["detail"]
+
+
+def test_a_profile_requirement_is_matched_against_its_field_not_against_prose(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Saying "systemd" in the diagnosis is not declaring `systemd:unit-start`.
+
+    The requirements were matched by substring against the whole plan, which is a textual substitute for a
+    structured requirement - and structured requirements are the entire point of a profile.
+    """
+    from opsbrain.auto.config import AutoConfig, PolicyProfileConfig
+
+    ops.config = ops.config.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
+        decision={"mode": "autonomous", "default_profile": "secrets"},
+        profiles=[PolicyProfileConfig(name="secrets", allowed_targets=["proxmox"],
+                                      require_verification=["systemd:unit-start"])])})
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id), profile="secrets")
+    ops.auto.review_plan(plan)
+    from opsbrain.auto.plan import ChangePlan
+
+    stored = ChangePlan.from_dict(ops.auto.preflight().get_by_plan(plan.id)["plan_document"])
+    assert stored.profile == "secrets", "the profile survives into the record the decision reads"
+    assert ops.auto._profile_gaps(stored, change, review_ids=("rv-0000abcd",)), "and is what the gate uses"
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY"
+    assert "systemd:unit-start" in out["decision"]["detail"]

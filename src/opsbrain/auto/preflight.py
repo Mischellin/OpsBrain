@@ -16,7 +16,7 @@ Two failure modes get specific handling, because both are ways a bad plan slips 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
 
@@ -94,6 +94,10 @@ class PreflightResult:
     plan_hash: str
     created: float = 0.0
     note: str = ""
+    #: Every review that was run about this plan, not just the first. A profile can demand more than one
+    #: independent review, and the engine counts references - so the extra sessions have to be recorded
+    #: here or the requirement is unsatisfiable no matter what the runner does.
+    review_ids: tuple[str, ...] = ()
 
     @property
     def approvable(self) -> bool:
@@ -112,7 +116,7 @@ class PreflightResult:
             plan_id=str(record.get("plan", "")),
             outcome=Outcome(str(record.get("outcome", Outcome.INCOMPLETE.value))),
             reason=str(record.get("reason", "")),
-            review_id=str(record.get("review", "")),
+            review_id=str(record.get("review", "")), review_ids=tuple(record.get("review_refs", ())),
             review_status=RunnerStatus(str(record.get("review_status", RunnerStatus.OK.value))),
             verdict=Verdict(record["verdict"]) if record.get("verdict") else None,
             findings=tuple(record.get("findings", ())),
@@ -143,7 +147,7 @@ class PreflightResult:
             "state_changing_probes": list(self.state_changing_probes),
             "structural_gaps": list(self.structural_gaps),
             "declared_checks": list(self.declared_checks),
-            "evidence_ids": list(self.evidence_ids),
+            "evidence_ids": list(self.evidence_ids), "review_refs": list(self.review_ids),
             "arguments_hash": self.arguments_hash,
             "plan_hash": self.plan_hash,
             "created": round(self.created, 3),
@@ -274,7 +278,14 @@ class Preflight:
                              limits=self.limits())
 
     def run(self, plan: ChangePlan, bundle: EvidenceBundle | None = None, *,
-            subject_ref: str | None = None) -> PreflightResult:
+            subject_ref: str | None = None, runs: int = 1) -> PreflightResult:
+        """Review a plan, `runs` times over, and record every reference.
+
+        More than one is a different thing from asking twice: the request id is derived from the rubric
+        among other fields, so a second pass carries a different rubric version, lands on a different id,
+        and is not served from the first pass's cache. Asking twice with one rubric would return the
+        first answer and call it independent.
+        """
         request_bundle_id = bundle.id if bundle is not None else ""
         if self.reviews.is_stub():
             # The stub answers PASS to anything, so with the default configuration every plan would be
@@ -289,6 +300,16 @@ class Preflight:
                                f"({self.auto.review.context_chars} chars): a reviewer cannot judge a plan it "
                                "only saw part of")
         result: ReviewResult = self.reviews.review(request)
+        review_ids: list[str] = [result.review_id]
+        # Further passes carry their own rubric, which is what makes them independent rather than a
+        # redelivery. A runner failure in an extra pass is recorded and stops the count there - the first
+        # answer still stands, and the engine decides what a short count means.
+        for extra in range(1, max(1, runs)):
+            follow_up = self.reviews.review(replace(request, rubric_version=f"{request.rubric_version}+{extra}"))
+            if follow_up.status is not RunnerStatus.OK:
+                break
+            review_ids.append(follow_up.review_id)
+            result = follow_up
         read_only, acting = split_probes(result.next_checks, self.auto.evidence.read_only_probes)
         # A plan may cite evidence nobody can resolve. Those references are not evidence: without this the
         # reviewer receives bare id strings and a PASS still comes back approvable.
@@ -298,7 +319,7 @@ class Preflight:
         outcome = self._outcome(result, gaps)
         preflight = PreflightResult(
             plan_id=plan.id, outcome=outcome, reason=REASON_BY_OUTCOME[outcome], review_id=result.review_id,
-            review_status=result.status, verdict=result.verdict,
+            review_ids=tuple(review_ids), review_status=result.status, verdict=result.verdict,
             findings=tuple(finding.to_dict() for finding in result.findings),
             unverified_claims=tuple(dict.fromkeys(plan.unverified_claims + result.unverified_claims)),
             requested_probes=read_only,
