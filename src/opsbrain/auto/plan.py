@@ -76,6 +76,9 @@ class ProposedChange:
     #: The verification profile this step acts on, e.g. `systemd`. It is what maps a plan's declaration
     #: onto the verifier's own check names; a step that names none authorises nothing.
     profile: str = ""
+    #: The verification check this step authorises, by name (`systemd:unit-start`). A profile is a class of
+    #: checks; only this names one, so a step never sweeps in an action by matching vocabulary.
+    declared_check: str = ""
 
     def __post_init__(self) -> None:
         if not self.capability or not self.target:
@@ -112,7 +115,8 @@ class ProposedChange:
             how=str(data.get("how", "")), reversible=Reversibility(reversible),
             undo=str(data.get("undo", "") or ""), irreversible_reason=str(data.get("irreversible_reason", "") or ""),
             state_changing=bool(data.get("state_changing", True)),
-            profile=str(data.get("profile", "") or ""))
+            profile=str(data.get("profile", "") or ""),
+            declared_check=str(data.get("declared_check", "") or ""))
 
 
 @dataclass(frozen=True)

@@ -95,9 +95,15 @@ class ReviewService:
             self._tokens_out = ledger.output_tokens
             self._spend_usd = ledger.spend_usd
 
-    def _is_stub(self) -> bool:
-        """True only for the built-in stub. A test that injects its own fake is a test, and must keep working."""
-        return type(self.reviewer()) is FakeReviewer
+    def is_stub(self) -> bool:
+        """True only for the stub the *configuration* selected, not for one a caller injected.
+
+        Both are `FakeReviewer` instances, and the difference is not the class but where it came from: the
+        default runner is a stub nobody chose, while an injected reviewer - a test double or a real
+        integration - is something a caller picked on purpose, and a guard must not overrule that on the
+        basis of a config field the caller never touched.
+        """
+        return self._reviewer is None and self.reviews.runner == "fake"
 
     def _id_lock(self, review_id: str) -> threading.Lock:
         """One lock per review id, so parallel redelivery of the same request does not review it twice."""
@@ -167,7 +173,8 @@ class ReviewService:
                               auth=review.auth, timeout_s=review.timeout_s, max_parallel=review.max_parallel,
                               max_retries=review.max_retries, max_model_calls=review.max_model_calls,
                               budget_usd=review.budget_usd, snapshot_dir=review.snapshot_dir,
-                              scratch_home=review.scratch_home, sandbox=tuple(review.sandbox), live=review.live)
+                              scratch_home=review.scratch_home, sandbox=tuple(review.sandbox),
+                              api_key_env=review.api_key_env, live=review.live)
 
     def capabilities(self) -> dict[str, Any]:
         return probe_capabilities(self.settings())
@@ -179,7 +186,7 @@ class ReviewService:
             # The master switch, enforced here as well as at the facade. This method is public, and a
             # pipeline that is "off" but still answers review requests has a gate that is a convention.
             raise OpsError("auto.enabled is false: the review pipeline is off")
-        if self.reviews.runner == "fake" and self._is_stub():
+        if self.is_stub():
             # The stub answers PASS to anything, and it is the documented default. With `auto.enabled:
             # true` and nothing else configured, it would otherwise manufacture a permission.
             return ReviewResult.failure(request, RunnerStatus.UNAVAILABLE,

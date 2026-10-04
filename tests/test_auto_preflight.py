@@ -48,6 +48,15 @@ def evidence_tmp() -> str:
     return tempfile.mkdtemp(prefix="opsbrain-preflight-")
 
 
+def collector_for(tmp_path: Path) -> tuple[Any, Any]:
+    from opsbrain.auto.evidence import EvidenceCollector, EvidenceLimits, EvidenceStore
+
+    store = EvidenceStore(tmp_path / "auto")
+    return store, EvidenceCollector(store, EvidenceLimits(), allowed=("log.journal",),
+                                    change_id="c-1a2b3c4d")
+
+
+
 def good_plan(**overrides: Any) -> ChangePlan:
     base: dict[str, Any] = {
         "objective": "logrotate stops on web-1",
@@ -369,13 +378,20 @@ def test_a_plan_declares_its_state_changing_actions_in_the_verifiers_vocabulary(
     Emitting the plan's own strings compares against a set that can never contain the check being run, so
     every state-changing check would be refused forever. The declaration is the verifier's name.
     """
-    plan = good_plan(changes=[unit_change(profile="systemd"),
+    plan = good_plan(changes=[unit_change(profile="systemd", declared_check="systemd:unit-start"),
                               unit_change(target="web-2", state_changing=False, profile="systemd")])
     assert declared_state_changing(plan) == ("systemd:unit-start",), "verification may act only on this set"
 
 
+def test_a_profile_alone_authorises_nothing() -> None:
+    """Mapping a profile to all of its state-changing checks would let a step sweep in an action by
+    matching vocabulary, which is not the same as declaring it."""
+    plan = good_plan(changes=[unit_change(profile="systemd")])
+    assert declared_state_changing(plan) == ()
+    assert unmatched_declarations(plan) == ("ansible.apply:web-1",)
+
+
 def test_a_step_naming_no_profile_authorises_nothing() -> None:
-    """Fail-closed: a step the verifier cannot map onto a check must not widen what may run."""
     plan = good_plan(changes=[unit_change()])
     assert declared_state_changing(plan) == ()
     assert unmatched_declarations(plan) == ("ansible.apply:web-1",)
@@ -476,10 +492,22 @@ def test_the_stub_runner_cannot_authorise_a_plan(tmp_path: Path) -> None:
     from opsbrain.config import Config
 
     auto = AutoService(Config(repo=str(tmp_path), data_dir=str(tmp_path / "data"),
-                              auto=AutoConfig(enabled=True)), reviewer=FakeReviewer())
+                              auto=AutoConfig(enabled=True)))
     answer = auto.review_plan(good_plan())
     assert answer["approvable"] is False
-    assert "fake" in answer["note"]
+    assert "fake" in answer["note"], "the default runner is a stub nobody chose"
+
+
+def test_an_explicitly_injected_reviewer_is_not_overruled_by_the_default_runner(tmp_path: Path) -> None:
+    """The guard is about the stub the config selected, not about a reviewer a caller chose."""
+    from opsbrain.auto.service import AutoService
+    from opsbrain.config import Config
+
+    runner = FakeReviewer()
+    runner.default = response_document(Verdict.PASS)
+    auto = AutoService(Config(repo=str(tmp_path), data_dir=str(tmp_path / "data"),
+                              auto=AutoConfig(enabled=True)), reviewer=runner)
+    assert auto.review_plan(good_plan())["approvable"] is True
 
 
 def test_a_plan_that_does_not_fit_the_review_context_is_refused(tmp_path: Path) -> None:
@@ -687,3 +715,24 @@ def test_a_preflight_record_carries_the_plan_it_judged(tmp_path: Path) -> None:
     stored = engine.get(plan.plan_hash)
     assert stored["plan_document"]["id"] == plan.id
     assert stored["plan_document"]["plan_hash"] == plan.plan_hash
+
+
+def test_a_truncated_evidence_render_is_refused_not_sent(tmp_path: Path) -> None:
+    """A reviewer shown part of the evidence is shown a fiction, and could approve it."""
+    from opsbrain.auto.evidence import EvidenceError, render_for_reviewer
+
+    store, collector = collector_for(tmp_path)
+    from opsbrain.auto.evidence import Observation, Provenance
+    from opsbrain.util import now
+
+    probe = Observation(kind="log", target="ops", capability="log.journal", command_id="log.journal@ops",
+                        collector="ssh:ops@10.0.0.42", content="y" * 30_000,
+                        provenance=Provenance.OBSERVED, observed_at=now())
+    bundle = store.save(collector.collect(observations=[probe], objective="x", inventory_hash="inv",
+                                          created=now()))
+    payloads, _ = store.load_artifacts(bundle)
+    with pytest.raises(EvidenceError, match="would have hidden part of the evidence"):
+        render_for_reviewer(bundle, payloads, max_chars=20_000, max_entry_chars=30_000)
+    # A budget too small for the evidence is refused too, whichever limit binds first.
+    with pytest.raises(EvidenceError):
+        render_for_reviewer(bundle, payloads, max_chars=200)

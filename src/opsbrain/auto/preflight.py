@@ -220,7 +220,7 @@ class Preflight:
 
     def run(self, plan: ChangePlan, bundle: EvidenceBundle | None = None, *,
             subject_ref: str | None = None) -> PreflightResult:
-        if self.auto.review.runner == "fake":
+        if self.reviews.is_stub():
             # The stub answers PASS to anything, so with the default configuration every plan would be
             # approvable without anybody having looked at it. Autonomy is the one thing a stub must never
             # manufacture, so the outcome is a refusal and the reason says which runner produced nothing.
@@ -293,21 +293,22 @@ def declared_state_changing(plan: ChangePlan) -> tuple[str, ...]:
     named `systemd:unit-start`. Emitting the plan's own strings compares against a set that can never
     contain the check being run, and every state-changing check is refused forever.
     """
-    matched: list[str] = []
-    for change in plan.changes:
-        if not change.state_changing:
-            continue
-        for name, check in REGISTRY.items():
-            if check.state_changing and check.profile == change.profile:
-                matched.append(name)
-    return tuple(sorted(dict.fromkeys(matched)))
+    # Only what the plan *names*. Mapping a profile to all of its state-changing checks would let a plan
+    # that says `systemd: apply a config change` authorise `systemd:unit-start` as a side effect of the
+    # vocabulary matching, which is not the same thing as declaring it.
+    return tuple(sorted({change.declared_check for change in plan.changes
+                         if change.state_changing and change.declared_check}))
 
 
 def unmatched_declarations(plan: ChangePlan) -> tuple[str, ...]:
-    """State-changing steps that name no profile, so they map onto no check and authorise nothing."""
+    """State-changing steps that name no check, so they authorise nothing and are reported.
+
+    A profile on its own is a class of checks, not a declaration: `systemd` says what the step touches,
+    `systemd:unit-start` says what it is allowed to do. Only the second is an authorisation.
+    """
     known = set(declared_state_changing(plan))
     return tuple(sorted({f"{change.capability}:{change.target}" for change in plan.changes
-                         if change.state_changing and not change.profile} - known))
+                         if change.state_changing and change.declared_check not in known} - known))
 
 
 #: `ChangePlan.targets` is a set of host or workload names; which kind each one is comes from the step
@@ -321,7 +322,7 @@ def verification_targets(plan: ChangePlan) -> tuple[Target, ...]:
     logs" has not said what should be checked afterwards, and inventing the target would let verification
     pass against something nobody planned for.
     """
-    from .verify import REGISTRY, unit_target
+    from .verify import unit_target
 
     profiles = {REGISTRY[name].profile for name in REGISTRY if REGISTRY[name].state_changing}
     targets: list[Target] = []
@@ -335,7 +336,6 @@ def verification_targets(plan: ChangePlan) -> tuple[Target, ...]:
 
 def unverified_targets(plan: ChangePlan) -> tuple[str, ...]:
     """Steps whose profile names no verification check, so nothing will be checked about them."""
-    from .verify import REGISTRY
 
     profiles = {REGISTRY[name].profile for name in REGISTRY if REGISTRY[name].state_changing}
     return tuple(sorted({f"{change.capability}:{change.target}" for change in plan.changes

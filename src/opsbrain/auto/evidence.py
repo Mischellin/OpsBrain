@@ -671,16 +671,25 @@ def render_for_reviewer(bundle: EvidenceBundle, artifacts: Mapping[str, str] | N
     ])
     budget = max(0, max_chars - len(header) - len(footer))
     rendered: list[str] = []
+    degraded: list[str] = []
     spent = 0
     for entry in bundle.entries:
         block = _render_entry(entry, artifacts, max_entry_chars)
         if spent + len(block) > budget:
             block = _render_entry(entry, None, 0)
             if spent + len(block) > budget:
-                rendered.append(f"  [{entry.command_id} omitted: the context budget is full]")
+                # Dropped from the render. A reviewer sent this is judging a plan against a summary of its
+                # evidence and could approve it, so the caller is told rather than shown a fiction.
+                degraded.append(entry.command_id)
                 continue
+            degraded.append(f"{entry.command_id} (payload omitted: the context budget is full)")
         spent += len(block)
         rendered.append(block)
+    if degraded:
+        raise EvidenceError(
+            f"the context budget would have hidden part of the evidence ({', '.join(degraded[:4])}"
+            f"{', …' if len(degraded) > 4 else ''}): refusing to send a reviewer a bundle it cannot read. "
+            "Raise auto.review.context_chars, or collect less per pass.")
     return _assemble(header, "\n".join(rendered), footer, max_chars)
 
 
@@ -692,10 +701,18 @@ def _assemble(header: str, body: str, footer: str, max_chars: int) -> str:
         return text
     room = max(0, max_chars - len(header) - len(footer) - 48)
     if room == 0:
-        # Header and footer alone exceed the budget. Truncating to nothing and still emitting them hands the
-        # model more text than it was allowed, so the fixed part is cut too and says so.
-        return f"[context truncated at {max_chars} chars: the fixed framing alone exceeds the budget]\n"
-    return f"{header}{body[:room]}\n[context truncated at {max_chars} chars]{footer}\n"
+        # The framing alone exceeds the budget, so the reviewer would be sent a bundle with none of its
+        # evidence. Same fiction as dropping an entry, and refused the same way.
+        raise EvidenceError(
+            f"the context budget ({max_chars} chars) is smaller than the framing alone: a reviewer sent "
+            "that would see the caveats and none of the evidence. Raise auto.review.context_chars.")
+    if len(body) > room:
+        # The body is cut, so the render is no longer the evidence. A reviewer asked to judge a plan
+        # against this would be judging against a summary of its evidence, and could approve it.
+        raise EvidenceError(
+            f"the reviewer render is {len(body)} chars of evidence against a {room} char budget: refusing to "
+            "send a truncated bundle, because a reviewer shown part of the evidence is shown a fiction")
+    return f"{header}{body}\n{footer}\n"
 
 
 def _render_entry(entry: EvidenceEntry, artifacts: Mapping[str, str] | None, max_chars: int) -> str:
