@@ -21,7 +21,7 @@ Epic: [#3](https://github.com/Mischellin/OpsBrain/issues/3). База — [#2](h
 | 14 | OPS-AUTO-05 — STALE approval, optimistic locking, single-use lease | `auto/approval.py` | [#19](https://github.com/Mischellin/OpsBrain/pull/19) | 404 теста, 32 находки Codex закрыто |
 | — | три P1 из v1 (P1-фиксы базы) | `redact.py`, `readers.py`, `changes.py`, `operators.py` | [#20](https://github.com/Mischellin/OpsBrain/pull/20) | 426 тестов, 18 находок Codex закрыто |
 | 7 | OPS-AUTO-04 — ApprovalEngine | `auto/decision.py` | [#21](https://github.com/Mischellin/OpsBrain/pull/21) | 533 теста, 61 находка Codex закрыто |
-| 9 | OPS-AUTO-10 — policy profiles | `auto/profiles.py` | — | не начато |
+| 9 | OPS-AUTO-10 — версионированные policy profiles | `auto/config.py` (`PolicyProfileConfig`) | в работе над #21 | профиль получил `version`; из 11 полей не читались `classification` и `recovery_actions` |
 | 10 | OPS-AUTO-08 — Codex postflight | `auto/postflight.py` | — | не начато |
 | 11 | OPS-AUTO-06 — canary rollout | `auto/rollout.py` | — | не начато |
 | 12 | OPS-AUTO-09 — bounded recovery loop | `auto/recovery.py` | — | не начато |
