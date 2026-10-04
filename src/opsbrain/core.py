@@ -40,6 +40,9 @@ class Core:
         self.audit = AuditLog(data / "audit.jsonl")
         self.auto = AutoService(config, reviewer=reviewer)
         self.auto.core = self  # the Verifier needs a Core, and Core builds the AutoService
+        # The engine goes in front of the change store, so an operator cannot approve by hand and skip
+        # the machinery that exists to decide. Core owns both ends, so Core wires them.
+        self.auto.engine().install(self.changes)
         self.finalizers: dict[str, Finalizer] = {}
 
     # -- helpers -----------------------------------------------------------------------------------

@@ -20,7 +20,9 @@ from typing import TYPE_CHECKING, Any
 
 from ..audit import AuditLog
 from ..util import OpsError, new_id
+from .approval import ApprovalStore
 from .config import AutoConfig
+from .decision import ApprovalEngine
 from .evidence import EvidenceBundle, EvidenceCollector, EvidenceStore, Observation, check_evidence, passed, reason_code
 from .ledger import BudgetLedger
 from .plan import ChangePlan
@@ -312,6 +314,7 @@ class AutoService:
                                       max_artifact_bytes=self.auto.evidence.max_bundle_bytes)
         self._collector = collector
         self._preflight: Preflight | None = None
+        self._engine: ApprovalEngine | None = None
         self._verifier: Verifier | None = None
         #: Bound by `Core` right after construction. The Verifier needs a Core, and Core builds this
         #: service, so the link is made explicitly by the owner rather than passed in and defaulted.
@@ -367,6 +370,11 @@ class AutoService:
         return self.evidence.list(limit)
 
     # -- preflight --------------------------------------------------------------------------------
+    def engine(self) -> ApprovalEngine:
+        if self._engine is None:
+            self._engine = ApprovalEngine(self.auto, ApprovalStore(self.root / "approvals"))
+        return self._engine
+
     def preflight(self) -> Preflight:
         if self._preflight is None:
             self._preflight = Preflight(self.auto, self.reviews, self.root, self.evidence)

@@ -11,7 +11,8 @@ import contextlib
 import hashlib
 import json
 import re
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,9 @@ class Change:
     args: dict[str, Any] = field(default_factory=dict)
     details: dict[str, Any] = field(default_factory=dict)
     decided_at: float | None = None
+    #: The engine-issued approval this change executes under. Set by the engine, never by an operator, and
+    #: required in autonomous mode: without it the gate has no record of a decision having been made.
+    engine_approval: str = ""
 
     @property
     def expired(self) -> bool:
@@ -56,6 +60,14 @@ class Change:
 
 
 class ChangeStore:
+    #: Installed by the approval engine. `changes.py` deliberately does not import `auto`, so the
+    #: dependency runs one way: the engine installs a check, the store calls it, and the store keeps
+    #: working unchanged when nothing is installed.
+    #: Returns True when the engine itself authorised this change, which satisfies the human-approval
+    #: requirement for it. A gate that raises instead refuses; a gate that returns False only leaves the
+    #: question of approval where it was.
+    gate: Callable[[Change], bool] | None = None
+
     def __init__(self, root: Path, ttl_s: int):
         self.root, self.ttl_s = root, ttl_s
 
@@ -108,6 +120,24 @@ class ChangeStore:
             self._save(change)
         return change
 
+    def update_hash(self, change_id: str, new_hash: str) -> Change:
+        """Rewrite the recorded fingerprint. Used only to model "the plan changed after it was approved"."""
+        change = self.get(change_id)
+        change.hash = new_hash
+        self._save(change)
+        return change
+
+    def attach_approval(self, change_id: str, approval_id: str) -> Change:
+        """Record the engine-issued approval this change will be executed under.
+
+        Persisted rather than set in memory, because `consume` re-reads the change: an approval attached
+        to an object that is never written down is an approval the gate will not see.
+        """
+        change = self.get(change_id)
+        change.engine_approval = approval_id
+        self._save(change)
+        return change
+
     def discard(self, change_id: str) -> Change:
         # The whole read-check-write is inside the lock. Taking it only around the read - as an earlier fix
         # did - serialises nothing at all: the check and the write still straddle the unlock.
@@ -129,6 +159,11 @@ class ChangeStore:
         """
         with self._transition(change_id):
             change = self.get(change_id)
+            engine_approved = False
+            if self.gate is not None:
+                # Before anything else: in autonomous mode this change must be carrying a decision the
+                # engine made. A human approval, or no approval at all, does not open this path.
+                engine_approved = self.gate(change)
             if change.capability != capability or change.target != target:
                 raise OpsError(f"change {change_id} is for {change.capability}:{change.target}")
             if change.expired:
@@ -143,7 +178,9 @@ class ChangeStore:
             if change.dangerous and not change.allow_dangerous:
                 raise OpsError(f"change {change_id} is destructive: a human must run "
                                f"`opsbrain approve {change_id} --allow-destroy`")
-            if needs_approval and change.state != APPROVED:
+            # An engine approval *is* the approval in autonomous mode. Demanding a second, human one on top
+            # would make the autonomous path unreachable, which is not the same as making it safe.
+            if needs_approval and change.state != APPROVED and not engine_approved:
                 raise OpsError(f"change {change_id} is not approved: a human must run `opsbrain approve "
                                f"{change_id}`")
             change.state, change.decided_at = APPLIED, now()

@@ -19,6 +19,7 @@ from opsbrain.auto.decision import ApprovalEngine, Decision, DecisionRecord, Inp
 from opsbrain.auto.evidence import Reason as EvidenceReason
 from opsbrain.auto.preflight import Outcome
 from opsbrain.auto.verify import CheckResult, CheckStatus, VerificationReport
+from opsbrain.util import OpsError
 
 
 def report(status: CheckStatus, *, reason: str = "") -> VerificationReport:
@@ -264,3 +265,88 @@ def test_the_engine_has_no_way_to_be_persuaded() -> None:
         assert absent not in fields, f"Inputs accepts {absent!r}, which is a channel for prose"
     assert not hasattr(ApprovalEngine, "review"), "the engine must not run a review to decide"
     assert not hasattr(ApprovalEngine, "complete"), "the engine must not call a model to decide"
+
+
+# ===================================================================== the gate: the executor may not skip the engine
+def _autonomous_ops(ops: Any, tmp_path: Any, **decision: Any) -> tuple[Any, ApprovalEngine]:
+    """An `OpsBrain` whose pipeline is on and autonomous, so the gate is actually installed."""
+    from opsbrain.auto.approval import ApprovalStore
+    from opsbrain.auto.decision import ApprovalEngine
+
+    auto = type(ops.config.auto)(enabled=True, autonomy_token=TOKEN,
+                                 decision={"mode": "autonomous", **decision})
+    # `Config` is frozen too, so the pipeline is switched on by building a new one rather than by
+    # assigning into it - which is also what an operator does when they edit the YAML.
+    ops.config = ops.config.model_copy(update={"auto": auto})
+    # One engine for both the gate and the issuing side: two ApprovalStores would each be looking at a
+    # different directory, and the gate would refuse an approval it cannot see.
+    engine = ApprovalEngine(auto, ApprovalStore(tmp_path / "approvals"))
+    engine.install(ops.changes)
+    return ops, engine
+
+
+def test_a_hand_approval_does_not_open_the_autonomous_path(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The criterion this whole arrangement exists for: `opsbrain approve` must not bypass the engine.
+
+    Without the gate, an operator approves by hand, the store says APPROVED, and the machinery built to
+    decide is simply not consulted - the autonomous path is advisory while the human path is real.
+    """
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1")
+    ops.changes.approve(change.id, allow_dangerous=True)
+    with pytest.raises(OpsError, match="no engine approval"):
+        ops.changes.consume(change.id, "tofu.apply", "proxmox", needs_approval=True)
+
+
+def test_an_engine_approval_opens_it(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from opsbrain.auto.approval import ApprovalBinding
+
+    ops, engine = _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1")
+    binding = ApprovalBinding(change_id=change.id, subject="tofu.apply:proxmox", plan_hash=change.hash,
+                              arguments_hash="ah-1", targets=("proxmox",), evidence_ids=("ev-aaaaaaaabbbbbbbb",),
+                              policy_version="v1")
+    approval = engine.issue(change.id, change.hash, binding, record=decide())
+    ops.changes.attach_approval(change.id, approval)
+    assert ops.changes.consume(change.id, "tofu.apply", "proxmox", needs_approval=True).state == "applied"
+
+
+def test_an_approval_issued_for_another_change_is_refused(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from opsbrain.auto.approval import ApprovalBinding
+
+    ops, engine = _autonomous_ops(ops, tmp_path)
+    mine = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1")
+    theirs = ops.changes.create("tofu.apply", "prod", "y", "ph-2")
+    binding = ApprovalBinding(change_id=theirs.id, subject="tofu.apply:prod", plan_hash=theirs.hash,
+                              arguments_hash="ah-1", targets=("prod",), evidence_ids=("ev-aaaaaaaabbbbbbbb",),
+                              policy_version="v1")
+    ops.changes.attach_approval(mine.id, engine.issue(mine.id, mine.hash, binding, record=decide()))
+    with pytest.raises(OpsError, match="was issued for"):
+        ops.changes.consume(mine.id, "tofu.apply", "proxmox", needs_approval=True)
+
+
+def test_a_stale_approval_no_longer_opens_the_gate(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The plan moved after the decision: the approval exists and the gate still refuses."""
+    from opsbrain.auto.approval import ApprovalBinding
+
+    ops, engine = _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1")
+    binding = ApprovalBinding(change_id=change.id, subject="tofu.apply:proxmox", plan_hash="ph-original",
+                              arguments_hash="ah-1", targets=("proxmox",), evidence_ids=("ev-aaaaaaaabbbbbbbb",),
+                              policy_version="v1")
+    ops.changes.attach_approval(change.id, engine.issue(change.id, change.hash, binding,
+                                                                  record=decide()))
+    ops.changes.update_hash(change.id, "ph-swapped")  # the plan was replaced after the decision
+    with pytest.raises(OpsError, match="STALE"):
+        ops.changes.consume(change.id, "tofu.apply", "proxmox", needs_approval=True)
+
+
+def test_manual_mode_leaves_the_human_path_working(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The gate must not make the two-gate manual workflow impossible - that is the operator's escape hatch."""
+    from opsbrain.auto.approval import ApprovalStore
+    from opsbrain.auto.decision import ApprovalEngine
+
+    ApprovalEngine(ops.config.auto, ApprovalStore(tmp_path / "approvals")).install(ops.changes)
+    change = ops.changes.create("tofu.apply", "proxmox", "x", "ph-1")
+    ops.changes.approve(change.id, allow_dangerous=True)
+    assert ops.changes.consume(change.id, "tofu.apply", "proxmox", needs_approval=True).state == "applied"

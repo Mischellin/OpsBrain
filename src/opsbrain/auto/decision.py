@@ -27,7 +27,7 @@ from enum import StrEnum
 from typing import Any
 
 from ..util import OpsError, new_id, now
-from .approval import ApprovalBinding, ApprovalStore, StaleReason
+from .approval import ApprovalBinding, ApprovalStore, StaleReason, stale_reasons
 from .config import AutoConfig
 from .evidence import Reason as EvidenceReason
 from .preflight import Outcome
@@ -150,6 +150,40 @@ class ApprovalEngine:
     def __init__(self, config: AutoConfig, approvals: ApprovalStore | None = None):
         self.config = config
         self.approvals = approvals
+
+    def install(self, changes: Any) -> None:
+        """Put this engine in front of the change store, so the executor cannot skip it.
+
+        Without this the human path is enough: an operator runs `opsbrain approve`, the store says
+        APPROVED, and the autonomous machinery that was built to decide is simply not consulted. The gate
+        makes the engine's decision a precondition of executing, not advice next to it.
+        """
+        changes.gate = self.gate
+
+    def gate(self, change: Any) -> bool:
+        """Refuse a change the engine has not authorised, when the engine is the one deciding.
+
+        Returns True when the engine's own approval covers this change, which is what lets an autonomous
+        execution skip the human step. False means "the engine is not deciding", not "approved".
+        """
+        if not self.autonomous():
+            return False  # manual mode: the human path is the path, and it stands alone
+        if not change.engine_approval:
+            raise OpsError(
+                f"change {change.id} carries no engine approval, and auto.decision.mode is `autonomous`: "
+                "run the approval engine instead of approving by hand")
+        if self.approvals is None:
+            raise OpsError("auto.decision.mode is `autonomous` but no approval store is configured")
+        approval = self.approvals.get(change.engine_approval)
+        if approval.binding.change_id != change.id:
+            raise OpsError(f"approval {approval.id} was issued for {approval.binding.change_id}, "
+                           f"not for {change.id}")
+        reasons = stale_reasons(approval.binding, {
+            "plan_hash": change.hash, "subject": f"{change.capability}:{change.target}",
+            "targets": [change.target], "policy_version": approval.binding.policy_version})
+        if reasons:
+            raise OpsError(f"approval {approval.id} is STALE ({', '.join(reasons)})")
+        return True
 
     def autonomous(self) -> bool:
         return self.config.decision.autonomous
@@ -285,7 +319,11 @@ class ApprovalEngine:
     # ------------------------------------------------------------------------------------- issuance
     def issue(self, plan_id: str, arguments_hash: str, binding: ApprovalBinding, *,
               record: DecisionRecord) -> str:
-        """Publish the approval the executor will spend. Only an APPROVE reaches this."""
+        """Publish the approval the executor will spend, and attach it to the change it authorises.
+
+        Only an APPROVE reaches this, and the id is written back onto the change so `gate` can see that
+        the decision was made - by this engine, for this change, against these inputs.
+        """
         if not record.approvable:
             raise OpsError(f"refusing to issue an approval for {record.decision.value}: {record.detail}")
         if self.approvals is None:
