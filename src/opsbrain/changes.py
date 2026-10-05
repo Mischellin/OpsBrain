@@ -8,15 +8,15 @@ approved by a human with `opsbrain approve <id>` on a terminal. A change is sing
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import json
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .util import OpsError, compact, file_lock, new_id, now, write_private
+from .util import OpsError, file_lock, new_id, now, write_private
+from .util import digest as _digest
 
 _ID = re.compile(r"^c-[0-9a-f]{8}$")
 #: The id becomes a lock filename, so it is validated as one before it is used as one.
@@ -24,8 +24,9 @@ _CHANGE_ID = re.compile(r"^c-[0-9a-f]{8,64}$")
 PENDING, APPROVED, APPLIED, DISCARDED = "pending", "approved", "applied", "discarded"
 
 
-def digest(value: Any) -> str:
-    return hashlib.sha256(compact(value).encode()).hexdigest()
+#: Re-exported: callers throughout the codebase take it from here, and it now lives in `util` so the
+#: `auto` package does not have to import the change store for a hash.
+digest = _digest
 
 
 @dataclass
@@ -43,6 +44,9 @@ class Change:
     args: dict[str, Any] = field(default_factory=dict)
     details: dict[str, Any] = field(default_factory=dict)
     decided_at: float | None = None
+    #: The engine-issued approval this change executes under. Set by the engine, never by an operator, and
+    #: required in autonomous mode: without it the gate has no record of a decision having been made.
+    engine_approval: str = ""
 
     @property
     def expired(self) -> bool:
@@ -56,6 +60,19 @@ class Change:
 
 
 class ChangeStore:
+    #: Installed by the approval engine. `changes.py` deliberately does not import `auto`, so the
+    #: dependency runs one way: the engine installs a check, the store calls it, and the store keeps
+    #: working unchanged when nothing is installed.
+    #: Returns True when the engine itself authorised this change, which satisfies the human-approval
+    #: requirement for it. A gate that raises instead refuses; a gate that returns False only leaves the
+    #: question of approval where it was.
+    gate: Callable[[Change], bool] | None = None
+    on_executed: Callable[[Change, str, dict[str, Any]], None] | None = None
+    #: The approval the engine spent, handed to the operator path so the *job* records the outcome.
+    #: `consume` runs before `start_job`, so claiming "executed" there would assert a mutation that may
+    #: never have been dispatched - and a lease recorded as executed is no longer reclaimable.
+    spent_approval: str = ""
+
     def __init__(self, root: Path, ttl_s: int):
         self.root, self.ttl_s = root, ttl_s
 
@@ -108,6 +125,149 @@ class ChangeStore:
             self._save(change)
         return change
 
+    def update_hash(self, change_id: str, new_hash: str) -> Change:
+        """Rewrite the recorded fingerprint. Used only to model "the plan changed after it was approved"."""
+        change = self.get(change_id)
+        change.hash = new_hash
+        self._save(change)
+        return change
+
+    def update_args(self, change_id: str, new_args: dict[str, Any]) -> Change:
+        """Rewrite the recorded arguments. Used only to model "the arguments moved after the decision".
+
+        Same purpose as `update_hash`, for the other half of the binding: an approval names both, and a
+        change whose arguments move after a decision is as stale as one whose plan moves.
+        """
+        change = self.get(change_id)
+        change.args = dict(new_args)
+        self._save(change)
+        return change
+
+    def note_workflow_start(self, change_id: str, *, calls: int, spend: float, at: float) -> Change:
+        """Record what the shared ledger had already spent when this decision first ran.
+
+        `BudgetLedger` is cumulative by design - usage has to survive a restart - so a decision that needs
+        its *own* spend has to subtract a baseline rather than read a lifetime total.
+        """
+        with self._transition(change_id):
+            change = self.get(change_id)
+            change.details = {**change.details, "baseline_calls": calls, "baseline_spend": spend,
+                              "workflow_started": at}
+            self._save(change)
+        return change
+
+    def record_execution(self, change_id: str, outcome: dict[str, Any]) -> None:
+        """Record what the spent lease actually did, from the job that did it."""
+        with self._transition(change_id):
+            change = self.get(change_id)
+            spent = self.spent_approval or change.engine_approval
+            if spent and self.on_executed is not None:
+                with contextlib.suppress(Exception):  # a lost outcome must not undo the mutation
+                    self.on_executed(change, spent, outcome)
+
+    def note_repair_cycle(self, change_id: str) -> Change:
+        """Count one repair cycle durably.
+
+        The engine bounds how many times it will answer RETRY for the same change. That bound is only
+        real if the count survives the process: held in memory, it starts at zero on every call and a
+        change whose reviewer keeps timing out is retried forever.
+        """
+        with self._transition(change_id):
+            change = self.get(change_id)
+            change.details = {**change.details,
+                              "repair_cycles": int(change.details.get("repair_cycles", 0) or 0) + 1}
+            self._save(change)
+        return change
+
+    def attach_approval(self, change_id: str, approval_id: str) -> Change:
+        """Record the engine-issued approval this change will be executed under.
+
+        Persisted rather than set in memory, because `consume` re-reads the change: an approval attached
+        to an object that is never written down is an approval the gate will not see.
+
+        Under the same transition lock as `approve`, `discard` and `consume`, with the whole read-modify-
+        write inside it. Without it a redelivered issuance could read `pending`, wait for a `consume` to
+        write `applied`, and then write its own stale copy back - putting `pending` and an approval on a
+        change that had already run, which is a second run waiting to happen. Attaching to a change that
+        is no longer open is refused rather than resurrecting it.
+        """
+        with self._transition(change_id):
+            change = self.get(change_id)
+            if change.state not in (PENDING, APPROVED):
+                raise OpsError(f"change {change_id} is already {change.state}; an approval attached to it "
+                               f"would authorise a second run")
+            if change.expired:
+                raise OpsError(f"change {change_id} has expired; plan again")
+            change.engine_approval = approval_id
+            self._save(change)
+        return change
+
+    # `Sequence`, not `list`: inside this class body the bare name `list` is `ChangeStore.list`, so a
+    # `list[str]` annotation here is not a type at all and mypy is right to say so.
+    def record_decision_inputs(self, change_id: str, *, evidence_ids: Sequence[str], policy_version: str,
+                              plan_id: str, decision: str, arguments_hash: str = "", profile: str = "",
+                              decision_record: dict[str, Any] | None = None) -> Change:
+        """Record what the decision engine decided against, so the gate can check it later.
+
+        Without this the gate had two options, both bad: trust the binding's own evidence list (which
+        proves nothing) or skip the comparison. The recorded values are what `stale_reasons` later
+        compares the binding to, so a change edited after the decision reads as stale.
+
+        `decision_record` is the whole record - reason, review references, verification status, attempts,
+        id. Persisting it is what makes the approval traceable after a restart: without it, the only
+        surviving artefact is a binding, and nobody can say afterwards *why* the execution was allowed.
+        """
+        with self._transition(change_id):
+            change = self._record_decision_locked(change_id, evidence_ids=evidence_ids,
+                                                  policy_version=policy_version, plan_id=plan_id,
+                                                  decision=decision, arguments_hash=arguments_hash,
+                                                  profile=profile,
+                                                  decision_record=decision_record)
+            self._save(change)
+        return change
+
+    def record_and_attach(self, change_id: str, approval_id: str, *, evidence_ids: Sequence[str],
+                          policy_version: str, plan_id: str, decision: str, arguments_hash: str = "",
+                          profile: str = "",
+                          decision_record: dict[str, Any] | None = None) -> Change:
+        """Record what was decided *and* attach the approval, inside one transition.
+
+        Two locks with a publish in between is a window. `decide_change` checks that the change is open,
+        the engine publishes the approval, and only then are the decision's inputs written; a `discard`
+        landing in that window left an issued approval with no change left to spend it on, and the change
+        carrying a `decision_id` that corresponded to nothing spendable - so a retry was refused as a
+        replay, for ever, over work that had simply been cancelled.
+
+        So the open-state check, the record and the attachment happen together, and the approval is
+        published only once they have. A change that is no longer open is refused here, and nothing is
+        written at all.
+        """
+        with self._transition(change_id):
+            change = self.get(change_id)
+            if change.state not in (PENDING, APPROVED):
+                raise OpsError(f"change {change_id} is {change.state}; a decision about work that has "
+                               "already run, or was discarded, authorises nothing, and none was recorded")
+            change = self._record_decision_locked(change_id, evidence_ids=evidence_ids,
+                                                  policy_version=policy_version, plan_id=plan_id,
+                                                  decision=decision, arguments_hash=arguments_hash,
+                                                  profile=profile,
+                                                  decision_record=decision_record)
+            change.engine_approval = approval_id
+            self._save(change)
+        return change
+
+    def _record_decision_locked(self, change_id: str, **fields: Any) -> Change:
+        """Write the decision's inputs onto a change. The caller holds the transition lock."""
+        change = self.get(change_id)
+        record = fields.get("decision_record")
+        change.details = {**change.details, "evidence_ids": list(fields["evidence_ids"]),
+                          "policy_version": fields["policy_version"], "plan_id": fields["plan_id"],
+                          "decision": fields["decision"], "arguments_hash": fields["arguments_hash"],
+                          **({"profile": fields["profile"]} if fields.get("profile") else {}),
+                          **({"decision_id": record["id"]} if record and record.get("id") else {}),
+                          **({"decision_record": record} if record else {})}
+        return change
+
     def discard(self, change_id: str) -> Change:
         # The whole read-check-write is inside the lock. Taking it only around the read - as an earlier fix
         # did - serialises nothing at all: the check and the write still straddle the unlock.
@@ -129,6 +289,21 @@ class ChangeStore:
         """
         with self._transition(change_id):
             change = self.get(change_id)
+            engine_approved = False
+            # A destructive change needs a decision whatever the policy said, so the gate is consulted for
+            # it even when no approval is being demanded. Skipping the gate on `needs_approval=False` alone
+            # left `auto.decision.allow_destructive` ineffective for a policy-allow target: the operator
+            # entry point checked the engine approval, then consumed with `needs_approval=False`, and the
+            # destructive guard below demanded a human flag the engine had already covered.
+            if self.gate is not None and (needs_approval or change.dangerous):
+                # Before anything else: in autonomous mode this change must be carrying a decision the
+                # engine made. A human approval, or no approval at all, does not open this path.
+                #
+                # Not consulted for an ordinary policy-allow mutation. The policy already allowed it, so
+                # there is nobody to approve anything, and demanding an engine decision there meant the
+                # change was created and then immediately refused for lacking a record that could not yet
+                # exist - the gate consulted about a decision that was never on the table.
+                engine_approved = self.gate(change)
             if change.capability != capability or change.target != target:
                 raise OpsError(f"change {change_id} is for {change.capability}:{change.target}")
             if change.expired:
@@ -140,14 +315,22 @@ class ChangeStore:
             if content_hash is not None and content_hash != change.hash:
                 raise OpsError(
                     f"change {change_id}: the code or arguments changed since it was planned; plan again")
-            if change.dangerous and not change.allow_dangerous:
+            if change.dangerous and not change.allow_dangerous and not engine_approved:
+                # The engine only approves a destructive change when the operator set
+                # `auto.decision.allow_destructive`, so its approval covers this check too. Without that,
+                # the opt-in existed in the decision and was discarded at the point of use, leaving the
+                # autonomous destructive path impossible.
                 raise OpsError(f"change {change_id} is destructive: a human must run "
                                f"`opsbrain approve {change_id} --allow-destroy`")
-            if needs_approval and change.state != APPROVED:
+            # An engine approval *is* the approval in autonomous mode. Demanding a second, human one on top
+            # would make the autonomous path unreachable, which is not the same as making it safe.
+            if needs_approval and change.state != APPROVED and not engine_approved:
                 raise OpsError(f"change {change_id} is not approved: a human must run `opsbrain approve "
                                f"{change_id}`")
             change.state, change.decided_at = APPLIED, now()
             self._save(change)
+            # Handed over, not recorded: the mutation has not been dispatched yet.
+            self.spent_approval = change.engine_approval if engine_approved else ""
             return change
 
     @contextlib.contextmanager

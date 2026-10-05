@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import io
 import json
@@ -216,11 +217,26 @@ class Operators(Core):
             f"{binary} plan -input=false -no-color -lock-timeout=60s -detailed-exitcode > /dev/null 2>&1; "
             "echo \"@@OPSBRAIN-POSTPLAN $?@@\"; fi; exit $rc")
 
+    def engine_authorised(self, change: Any) -> bool:
+        """Whether the decision engine has already authorised this change.
+
+        The operator entry points used to answer "ask a human" the moment they saw a pending change, which
+        is exactly the state an engine-approved change is in: issuance attaches an approval and leaves the
+        change pending. So the autonomous path returned a human prompt every time and was unreachable in
+        practice, however correct the engine was. Returns False when the engine is not deciding, and lets
+        the gate raise when it is and the change is not authorised.
+        """
+        # A check, not a claim. `tofu_apply` asks first and consumes afterwards, and the claim happens
+        # inside `ChangeStore.consume` - if this spent the lease, the second call would find it consumed.
+        gate = getattr(self.changes, "gate", None)
+        return bool(gate is not None and gate(change, spend=False))
+
     def tofu_apply(self, change_id: str, wait_s: int | None = None) -> dict[str, Any]:
         pending = self.changes.get(change_id)
         name, config = self._stack(pending.target)
         access = self.require("tofu.apply", name)
-        if pending.state == "pending" and (access is Access.CONFIRM or pending.dangerous):
+        if (pending.state == "pending" and (access is Access.CONFIRM or pending.dangerous)
+                and not self.engine_authorised(pending)):
             return self.approval_needed(pending)
         plan_file = str(pending.args.get("plan_file", ""))
         # Validated before the change is spent and before the path reaches a shell command.
@@ -242,6 +258,7 @@ class Operators(Core):
 
     def _done_tofu_apply(self, job: Job, rc: int, text: str) -> dict[str, Any]:
         meta = self.artifacts.save("tofu-apply", job.title, text)
+        self._settle_lease(job, rc)
         out: dict[str, Any] = {"stack": job.meta["stack"], "change": job.meta["change"], "artifact": meta.id,
                                "ok": rc == 0, **parsers.tofu_text(text)}
         if rc == PLAN_MISMATCH_RC and (mismatch := PLANMISMATCH.search(text)):
@@ -359,7 +376,8 @@ class Operators(Core):
         access = self.require("ansible.apply", playbook)
         if config.require_limit_for_apply and not limit:
             raise OpsError("apply needs a limit (ansible.require_limit_for_apply): run the check with `limit`")
-        if pending.state == "pending" and access is Access.CONFIRM:
+        if (pending.state == "pending" and access is Access.CONFIRM
+                and not self.engine_authorised(pending)):
             return self.approval_needed(pending)
         change = self.changes.consume(change_id, "ansible.apply", playbook, needs_approval=access is Access.CONFIRM,
                                       content_hash=self._ansible_hash(playbook, limit, tags))
@@ -368,8 +386,29 @@ class Operators(Core):
                              env=self._ansible_env(), meta={"playbook": playbook, "limit": limit, "change": change.id})
         return self.wait(job, wait_s)
 
+    def _settle_lease(self, job: Job, rc: int) -> None:
+        """Release or complete the engine's lease, now that the job has actually finished.
+
+        The lease is spent when the gate opens - so a revocation cannot land between the check and the
+        mutation - but the outcome belongs here, where the command's fate is known. Recording it at
+        consume time would claim a mutation that had not been dispatched.
+        """
+        change_id = str(job.meta.get("change") or "")
+        if not change_id:
+            return
+        with contextlib.suppress(Exception):
+            self.changes.record_execution(change_id, {"state": "executed" if rc == 0 else "failed",
+                                                     "rc": rc})
+
     def _done_ansible(self, job: Job, rc: int, text: str) -> dict[str, Any]:
         meta = self.artifacts.save(job.kind, job.title, text)
+        if job.kind == "ansible.apply":
+            # The lease is spent when the gate opens, and settled here, where the job's fate is known.
+            # `_settle_lease` was reached from the OpenTofu finaliser only, so every autonomous Ansible
+            # approval stayed `CONSUMED` with `executed=False` for ever: the audit claimed the approval was
+            # never used, and the lease became reclaimable after its TTL - a second apply of a change
+            # whose work had already landed.
+            self._settle_lease(job, rc)
         summary = parsers.ansible_run(text, max_items=self.max_items)
         out: dict[str, Any] = {"playbook": job.meta["playbook"], "limit": job.meta.get("limit"),
                                "artifact": meta.id, **summary}
@@ -379,7 +418,14 @@ class Operators(Core):
             limit, tags = job.meta.get("limit"), job.meta.get("tags")
             line = f"ansible-playbook {job.meta['playbook']} --limit {limit or 'ALL'}: {summary['changed']} change(s)"
             change = self.changes.create("ansible.apply", job.meta["playbook"], line, job.meta["hash"],
-                                         args={"limit": limit, "tags": tags},
+                                         # The playbook is in `args` because that is the shape a plan's
+                                         # `ProposedChange.arguments` documents an Ansible operation in, and
+                                         # `decide_change` compares the two dictionaries exactly. Without it
+                                         # the comparison never matched for a change a real `ansible_check`
+                                         # produced, so an autonomous Ansible apply could never reach an
+                                         # approval - and the only test that applied one had been building
+                                         # its change by hand in the plan's shape rather than this one's.
+                                         args={"playbook": job.meta["playbook"], "limit": limit, "tags": tags},
                                          details={"changed_tasks": summary["changed_tasks"]})
             out["change"] = change.id
             out["next"] = f"ansible action=apply change_id={change.id} (after a human approves it)"

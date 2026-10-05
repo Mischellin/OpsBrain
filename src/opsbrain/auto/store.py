@@ -59,6 +59,18 @@ class RecordStore:
     def has(self, record_id: str) -> bool:
         return valid_id(record_id, self.prefixes) and self._path(record_id).is_file()
 
+    def discard(self, record_id: str) -> bool:
+        """Remove a record so a later attempt at the same id starts from nothing.
+
+        Used where a stored record is *not* the answer but the record of an attempt that did not produce
+        one - a failed review, say. Keeping it would make every later call answer with the same failure.
+        Returns whether anything was there to remove.
+        """
+        if not self.has(record_id):
+            return False
+        self._path(record_id).unlink()
+        return True
+
     def list(self, limit: int = 50) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for path in self.root.glob("*.json"):

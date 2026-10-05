@@ -133,3 +133,34 @@ for a clipped one, silently skipping whatever the wider window would have added.
 Two requests for the same id cannot both reach the reviewer: an in-process lock per id covers one server,
 and an atomic claim file covers a second process. The loser is told to re-issue rather than being charged
 for a duplicate.
+
+## Emergency stop
+
+One switch blocks **every** autonomous decision:
+
+```yaml
+auto:
+  decision:
+    mode: autonomous
+    emergency_stop: true
+```
+
+In the engine it is checked before any of the review, evidence, plan or verification work, so a stop
+applies to work already mid-loop and not merely to work about to start, whatever the inputs look like. It
+is *not* the very first check: an unrecognised `mode`, a mode that differs from the configured one, and a
+policy `deny` are settled before it, because those are answers in their own right - a forbidden change is
+`DENY` whether or not the emergency stop is set. The reasons it emits are `emergency_stop` and
+`autonomy_off`; both are terminal, and neither ever turns into a retry.
+
+The neighbouring switches are deliberately narrower:
+
+- `autonomy_token` — presence is required for autonomous mode at all. It is read from the operator's
+  configuration and never from a model's output, so a model cannot grant itself the ability to decide.
+- `allow_destructive` — off by default. Without it, a change that destroys or replaces resources stays with
+  a person, whatever the rest of the decision says.
+- `mode: manual` — the operator's escape hatch. The engine is installed in front of the change store
+  regardless, but in manual mode it does not decide, and the human path works exactly as it always did.
+
+Turning the whole subsystem off is `auto.enabled: false`. Every other setting is inert in that case,
+including the emergency stop, which then has nothing to stop.
+

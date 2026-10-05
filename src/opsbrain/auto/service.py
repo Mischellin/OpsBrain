@@ -12,15 +12,19 @@ Outside it, budgets do not exist and redelivery double-charges. Inside it:
 
 from __future__ import annotations
 
+import contextlib
 import threading
+import time
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..audit import AuditLog
-from ..util import OpsError, new_id
+from ..util import OpsError, new_id, now
+from .approval import ApprovalStore, binding_for
 from .config import AutoConfig
+from .decision import ApprovalEngine, Reason
 from .evidence import EvidenceBundle, EvidenceCollector, EvidenceStore, Observation, check_evidence, passed, reason_code
 from .ledger import BudgetLedger
 from .plan import ChangePlan
@@ -222,12 +226,12 @@ class ReviewService:
             cached = self.store.get(request.review_id)
             if cached.get("status") == RunnerStatus.OK.value:
                 return self._rebuild_cached(request, cached)
-            return ReviewResult(review_id=request.review_id, subject=request.subject,
-                                subject_ref=request.subject_ref, status=RunnerStatus(cached["status"]),
-                                verdict=None, contract_version=cached.get("contract_version", CONTRACT_VERSION),
-                                rubric_version=cached.get("rubric_version", request.rubric_version),
-                                model=cached.get("model", request.model),
-                                note=cached.get("note", "cached: the review never produced a verdict"))
+            # A runner failure is not an answer, so it is not a cached answer either. Returning it forever
+            # meant the engine's `RETRY` / "retry the review" could not re-run the reviewer: the very next
+            # call handed back the same TIMEOUT or QUOTA_EXHAUSTED until the repair budget ran out and the
+            # change blocked. The spend is already charged and stays charged - what is retried is the
+            # review, not the billing.
+            self.store.discard(request.review_id)
         # `before_attempt` is the only reservation point: it fires once per invocation, so the first
         # attempt is charged exactly once and a retry has to pass the budget check too.
         result = run_review(self.reviewer(), request, retries=self.reviews.max_retries,
@@ -312,6 +316,7 @@ class AutoService:
                                       max_artifact_bytes=self.auto.evidence.max_bundle_bytes)
         self._collector = collector
         self._preflight: Preflight | None = None
+        self._engine: ApprovalEngine | None = None
         self._verifier: Verifier | None = None
         #: Bound by `Core` right after construction. The Verifier needs a Core, and Core builds this
         #: service, so the link is made explicitly by the owner rather than passed in and defaulted.
@@ -367,12 +372,17 @@ class AutoService:
         return self.evidence.list(limit)
 
     # -- preflight --------------------------------------------------------------------------------
+    def engine(self) -> ApprovalEngine:
+        if self._engine is None:
+            self._engine = ApprovalEngine(self.auto, ApprovalStore(self.root / "approvals"))
+        return self._engine
+
     def preflight(self) -> Preflight:
         if self._preflight is None:
             self._preflight = Preflight(self.auto, self.reviews, self.root, self.evidence)
         return self._preflight
 
-    def review_plan(self, plan: ChangePlan, *, evidence: str = "") -> dict[str, Any]:
+    def review_plan(self, plan: ChangePlan, *, evidence: str = "", runs: int | None = None) -> dict[str, Any]:
         """Review a plan before anything changes, and answer with the outcome, not a boolean.
 
         `evidence` is a bundle id; when given, its redacted render travels with the plan so the reviewer
@@ -406,7 +416,11 @@ class AutoService:
                 self.audit.record(event="preflight", plan=plan.id, outcome=refused.outcome.value,
                                   approvable=False, reason=refused.reason, review="")
                 return refused.to_dict()
-        result: PreflightResult = self.preflight().run(plan, bundle)
+        # `runs` defaults to what the plan's own profile asks for. Making the caller pass it would let a
+        # profile demanding two reviews be satisfied by one, because the caller decides and the caller can
+        # be wrong - the same shape as a caller supplying the verdict itself.
+        wanted = max(1, runs) if runs is not None else 1
+        result: PreflightResult = self.preflight().run(plan, bundle, runs=wanted)
         self.audit.record(event="preflight", plan=plan.id, outcome=result.outcome.value,
                           approvable=result.approvable, reason=result.reason, review=result.review_id)
         return result.to_dict()
@@ -454,6 +468,378 @@ class AutoService:
         self.audit.record(event="verified", change=change_id, status=report.status.value,
                           checks=len(report.results), observation_s=round(report.observation_s, 3))
         return report.brief()
+
+    def decide_change(self, change_id: str, plan_id: str, *,
+                      verification: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Ask the engine about one pending change, and issue the approval if it says yes.
+
+        This is the step that makes the autonomous path reachable at all. Everything before it - the
+        review, the preflight, the evidence - produces facts; without something that gathers them and asks
+        the deterministic engine, the gate in front of the executor has nothing to accept and every
+        operation goes to a human.
+
+        Both ids are named explicitly. The change store and the preflight store key different things and
+        do not link them, so guessing which plan a change belongs to would mean deciding about a document
+        nobody named.
+
+        Every `Inputs` field is gathered from stored state, not from the caller. A caller-supplied
+        `policy_allows` or `review_verdict` would be the caller deciding on the engine's behalf, which is
+        the one thing the engine exists to prevent. What the caller may add is the verification report,
+        because the checks can only be run after something has been applied.
+        """
+        # Imported here, not at module scope: `config` imports this package, so a top-level import of
+        # `Access` closes a cycle.
+        from ..config import Access
+        from .decision import Decision, Inputs
+
+        self.guard_enabled()
+        if self.core is None:
+            raise OpsError("deciding needs a Core; build OpsBrain, not AutoService alone")
+        change = self.core.changes.get(change_id)
+        if change.state not in ("pending", "approved"):
+            return self._decision_refused(change_id, plan_id,
+                                          f"the change is {change.state}; a decision about work that has "
+                                          f"already run, or was discarded, authorises nothing",
+                                          review_id="")
+        if change.expired:
+            return self._decision_refused(change_id, plan_id, "the change has expired; plan again",
+                                          review_id="")
+        self._mark_workflow_start(change_id)
+        change = self.core.changes.get(change_id)
+        record = self.preflight().get_by_plan(plan_id)
+        plan = ChangePlan.from_dict(record["plan_document"])
+        # The outer record is selected by plan id, but a nested document that parses is not thereby the
+        # same plan - and capability, target, arguments and profile are all read out of it. A stored PASS
+        # for plan A would otherwise authorise a change described only by plan B.
+        if plan.id != plan_id or (record.get("plan_hash") and plan.plan_hash != record["plan_hash"]):
+            raise OpsError(
+                f"the preflight record for {plan_id} carries a different plan (id={plan.id!r}): the stored "
+                f"review says nothing about it")
+        result = PreflightResult.from_record(record)
+        # The review covers a concrete operation, not just a kind of edit. Comparing capability and target
+        # alone left a reviewed `tofu.apply` for `proxmox` able to authorise a *different* saved plan
+        # against the same stack, because the file it will run is named in the change's arguments and the
+        # plan never mentioned it. A step now declares the arguments it runs, and all three must match.
+        wanted = f"{change.capability}:{change.target}"
+        candidates = [step for step in plan.changes
+                      if f"{step.capability}:{step.target}" == wanted]
+        if plan.changes and not candidates:
+            proposed = sorted({f"{step.capability}:{step.target}" for step in plan.changes})
+            return self._decision_refused(change_id, plan_id,
+                                          f"the plan proposes {', '.join(proposed)} and not {wanted}",
+                                          review_id=result.review_id)
+        if candidates and not any(dict(step.arguments) == dict(change.args) for step in candidates):
+            seen = "; ".join(f"{wanted} {dict(step.arguments)}" for step in candidates)
+            return self._decision_refused(change_id, plan_id,
+                                          f"the plan proposes {seen}, and the change runs "
+                                          f"{wanted} {dict(change.args)}",
+                                          review_id=result.review_id)
+        if plan.targets and change.target not in plan.targets:
+            return self._decision_refused(change_id, plan_id,
+                                          f"the plan names {', '.join(plan.targets)} and not "
+                                          f"{change.target!r}", review_id=result.review_id)
+        profile = self._profile_for(plan)
+        if profile is None and self.auto.profiles:
+            return self._decision_refused(change_id, plan_id,
+                                          f"the plan is filed under profile {plan.profile!r}, which the "
+                                          f"configuration does not define", review_id=result.review_id)
+        # The profile is what says this class of work may touch this target with this operation at all.
+        # `target_in_scope=bool(change.target)` said only that a string was present, so every scope the
+        # operator had written - `allow_autonomous`, `allowed_targets`, `allowed_capabilities` - was
+        # configured, validated, shown in the overview, and never consulted.
+        if profile is not None and not self.autonomous_for(change, profile):
+            return self._decision_refused(change_id, plan_id, self._scope_reason(change, profile),
+                                          review_id=result.review_id)
+        # Resolved, not copied. `_evaluate` only checks that the tuple is non-empty, so a review record
+        # that was deleted, corrupted or replaced after the preflight still produced a citation nobody
+        # could open - an approval whose stated justification cannot be audited.
+        # What the engine is told the review said. The preflight record is a *copy* made at review time,
+        # so the stored record - which may since have become a failure or a denial - is the current fact.
+        review_status = result.review_status.value
+        review_verdict = result.verdict.value if result.verdict else ""
+        review_ids: tuple[str, ...] = ()
+        if result.review_id:
+            resolved = self._review_state(result.review_id, plan_id)
+            if resolved is None:
+                return self._decision_refused(change_id, plan_id,
+                                              f"review {result.review_id} cannot be resolved for this plan, "
+                                              f"so nothing here has been judged", review_id="")
+            if resolved != "passing":
+                # A *failed* review is a legitimate outcome the engine has branches for - it is what RETRY
+                # exists to answer. Refusing it here meant the workflow never returned RETRY for a reviewer
+                # failure and the repair budget was never spent.
+                live = self.reviews.store.get(result.review_id)
+                review_status = str(live.get("status") or review_status)
+                review_verdict = str(live.get("verdict") or "")
+            review_ids = tuple(result.review_ids) or (result.review_id,)
+        # How many reviews actually passed, counted from the stored records rather than from how many ids
+        # the preflight happened to keep. The engine's `reviews_passed` is the number it compares with the
+        # required one, and nothing set it: every call reported 0, and a `max(1, ...)` fallback hid the gap
+        # by answering "one" whatever really ran. A configuration asking for two reviews was therefore
+        # unsatisfiable and blocked every decision, and the answer was the fallback's rather than the
+        # reviews'.
+        reviews_passed = sum(1 for rid in review_ids if self._review_state(rid, plan_id) == "passing")
+        # The engine is what decides what two independent answers mean - agreement, or a block - and it
+        # can only do that when told both. `result` is the *last* pass, so the earlier one was stored,
+        # counted against the profile, and then never compared against anything.
+        secondary_verdict, secondary_status = "", ""
+        if len(review_ids) > 1:
+            try:
+                other = self.reviews.store.get(review_ids[0])
+                secondary_status = str(other.get("status") or "")
+                secondary_verdict = str(other.get("verdict") or "")
+            except OpsError:
+                secondary_status, secondary_verdict = "", ""
+        # `Core.require` *raises* on a denial, so asking it left `policy_allows` permanently true and
+        # the engine's documented DENY/policy_forbids outcome unreachable for a real denied change -
+        # callers saw an unstructured tool error instead. The decision is taken here and the policy
+        # answered as data, so the engine gets to record why it refused.
+        access = self._access_for(change)
+        if verification is not None:
+            report = VerificationReport.from_dict(verification)
+            # The report's identity is checked, not overwritten. It belongs to the change, while the
+            # decision is about the plan, and forcing the id to the change here made every document
+            # disagree with the plan it was gathered for. Forcing it would also let a PASS for one change
+            # be read as proof about another.
+            # `verify_plan` reports against the plan id, because that is what a caller names; the
+            # executor's change is `c-*`. Both are the same object, so a report naming this plan is
+            # accepted - while a report naming a *different* plan or a different change is still refused.
+            expected = {change_id, plan_id}
+            if report.change_id and report.change_id not in expected:
+                return self._decision_refused(change_id, plan_id,
+                                              f"the verification report is for {report.change_id}, which is "
+                                              f"neither this change ({change_id}) nor this plan ({plan_id})",
+                                              review_id=result.review_id)
+        else:
+            report = None
+        # Evidence is re-read and re-checked here rather than trusted from the preflight record. That record
+        # was written when the bundle was fresh; the decision happens later, and by then the bundle may have
+        # aged past `evidence.max_age_s`, gone missing, or been tampered with. Treating a non-empty id tuple
+        # as `evidence_fresh` made all three reach APPROVE.
+        # What was reviewed is what the plan declared. `review_plan(plan, evidence=B)` lets a caller
+        # supply a different bundle, and the preflight then records B - so the approval would be bound to
+        # evidence the immutable reviewed plan never named. Both the declared bundle and the declared
+        # references have to be what the review actually saw.
+        declared = set(plan.evidence_refs) | ({plan.evidence_bundle} if plan.evidence_bundle else set())
+        reviewed = set(result.evidence_ids)
+        if declared and not reviewed.issubset(declared):
+            return self._decision_refused(change_id, plan_id,
+                                          f"the review saw {', '.join(sorted(reviewed))} but the plan "
+                                          f"declares {', '.join(sorted(declared))}; an approval cannot rest "
+                                          f"on evidence the reviewed plan did not name",
+                                          review_id=result.review_id)
+        evidence_ids, evidence_reason, evidence_remaining = self._evidence_state(
+            result.evidence_ids, change_id)
+        inputs = Inputs(
+            mode=self.auto.decision.mode,
+            preflight_outcome=result.outcome,
+            preflight_reason=result.reason,
+            preflight_approvable=result.approvable,
+            evidence_reason=evidence_reason,
+            evidence_ids=evidence_ids,
+            review_verdict=review_verdict,
+            review_status=review_status,
+            secondary_review_verdict=secondary_verdict,
+            secondary_review_status=secondary_status,
+            reviews_passed=reviews_passed,
+            policy_allows=access is not Access.DENY,
+            target_in_scope=profile is None or self.autonomous_for(change, profile),
+            destructive=bool(change.dangerous),
+            verification=report,
+            attempts=self._repair_count(change),
+            policy_version=self.auto.decision.policy_version,
+            # Counted from this workflow's own baseline, not from the service's lifetime totals. The
+            # ledger is cumulative, so an unrelated earlier review against a stricter ceiling reported a
+            # *new* workflow as exhausted before it had spent anything, and elapsed time measured from
+            # change creation charged it for waiting.
+            calls_used=self.reviews.ledger.calls - int(change.details.get("baseline_calls", 0)),
+            spend_usd=self.reviews.ledger.spend_usd - float(change.details.get("baseline_spend", 0.0)),
+            elapsed_s=now() - float(change.details.get("workflow_started") or change.created),
+        )
+        # The change record is the authority for what an approval covers, so it is what both the record
+        # and the binding name. The plan's own `arguments_hash` travels in the record for audit; the two
+        # vocabularies are different, and pretending they are one would let them silently disagree.
+        from ..changes import digest as _digest
+
+        arguments = _digest({key: value for key, value in sorted(change.args.items())}) if change.args else ""
+        decision = self.engine().decide(inputs, plan_id, arguments, change_id=change_id,
+                                        review_ids=review_ids)
+        self.audit.record(event="decision", change=change_id, decision=decision.decision.value,
+                          reason=decision.reason.value, plan=plan_id, review=result.review_id)
+        out: dict[str, Any] = {"decision": decision.brief()}
+        if decision.decision is Decision.RETRY:
+            # Counted only after the decision, under the same lock as every other transition, so a crash
+            # between deciding and counting cannot buy a free cycle - and so the count is durable. The
+            # *returned* change is used for the reply: the object loaded before the increment reports one
+            # less than the record now holds, so every answer was a cycle behind the durable counter.
+            counted = self.core.changes.note_repair_cycle(change_id)
+            out["decision"] = {**decision.brief(), "attempts": self._repair_count(counted),
+                               "repair_cycles_remaining": max(
+                                   0, self.auto.decision.max_repair_cycles - self._repair_count(counted))}
+        if not decision.approvable:
+            return out
+        binding = binding_for(change, evidence_ids=result.evidence_ids,
+                              policy_version=self.auto.decision.policy_version,
+                              arguments_hash=arguments,
+                              profile=plan.profile or self.auto.decision.default_profile,
+                              evidence_expires_in_s=evidence_remaining)
+        # The engine records the decision and attaches the approval under the change's own transition, so
+        # there is no second, unsynchronised write here to lose a race against a `discard`.
+        approval = self.engine().issue(plan_id, arguments, binding, record=decision)
+        return {**out, "approval": approval, "next": f"apply change {change_id}; no human step is required"}
+
+    def _review_state(self, review_id: str, plan_id: str) -> str | None:
+        """`"passing"`, `"failed"`, or `None` when the record cannot be resolved for this plan.
+
+        A `PASS` that has since become a `DENY`, or that has picked up a BLOCKER, is not a passing review.
+        A record whose subject does not match this plan is not this plan's review. And a runner failure is
+        neither of those: it is a real fact, and the one the engine's retry branches exist for.
+        """
+        try:
+            stored = self.reviews.store.get(review_id)
+        except OpsError:
+            return None
+        if str(stored.get("subject_ref", "")) != plan_id:
+            return None
+        if stored.get("status") != "OK":
+            return "failed"
+        if stored.get("verdict") == "DENY":
+            return None
+        if stored.get("verdict") != "PASS":
+            return "failed"
+        findings = stored.get("findings") or ()
+        if any(str((finding or {}).get("severity", "")).upper() == "BLOCKER" for finding in findings):
+            return None
+        return "passing"
+
+    def _mark_workflow_start(self, change_id: str) -> None:
+        """Stamp the first attempt: what the ledger had already spent, and when this loop began.
+
+        Both are baselines, not totals. Without them a change that waited an hour before its first retry
+        was charged that hour, and any earlier review of anything counted against this decision's ceiling.
+        """
+        change = self.core.changes.get(change_id)
+        if change.details.get("workflow_started"):
+            return
+        self.core.changes.note_workflow_start(
+            change_id, calls=self.reviews.ledger.calls, spend=self.reviews.ledger.spend_usd, at=now())
+
+    def _access_for(self, change: Any) -> Any:
+        """The policy's answer, as a value. `Core.require` raises, which is right for a tool call and
+        wrong here: the engine has a structured way to say "policy forbids this", and it is unreachable
+        if the denial has already become an exception.
+        """
+        from ..policy import decide as policy_decide
+
+        return policy_decide(self.core.config.policy, change.capability, change.target)
+
+    def _profile_for(self, plan: Any) -> Any:
+        """The policy profile the plan is filed under, or None when the operator defined none."""
+        for profile in self.auto.profiles:
+            if profile.name == plan.profile:
+                return profile
+        return None
+
+    def autonomous_for(self, change: Any, profile: Any) -> bool:
+        """Whether this profile covers this operation, on this target, for autonomous execution.
+
+        An empty `allowed_*` list means the operator did not restrict it - the scope this profile states,
+        and no more. The alternative reading, that an empty list covers nothing, was tried here and takes
+        the rest of the configuration with it: a profile that names targets but no capabilities - the
+        ordinary way to scope one stack - blocks every change before the target is ever consulted, and
+        the operator is told it covers a capability it never thought about. `docs/autonomy.md` stated
+        that stricter reading and was wrong; the two lists are independent scopes, and leaving one out
+        means "not scoped on this axis", not "nothing is allowed".
+        """
+        if not profile.allow_autonomous:
+            return False
+        if profile.allowed_capabilities and change.capability not in profile.allowed_capabilities:
+            return False
+        return not (profile.allowed_targets and change.target not in profile.allowed_targets)
+
+    def _scope_reason(self, change: Any, profile: Any) -> str:
+        """Which of the three limits refused it, so the operator knows which one to change.
+
+        An empty list is named as "anything" rather than left blank, because a refusal that says only
+        which target was excluded reads, to an operator who has just emptied the list, like a scope they
+        did not intend.
+        """
+        if not profile.allow_autonomous:
+            return f"profile {profile.name!r} does not allow autonomous execution"
+        if profile.allowed_capabilities and change.capability not in profile.allowed_capabilities:
+            return (f"profile {profile.name!r} does not cover {change.capability}; it covers "
+                    f"{', '.join(sorted(profile.allowed_capabilities))}")
+        return (f"profile {profile.name!r} does not cover the target {change.target!r}; it covers "
+                f"{', '.join(sorted(profile.allowed_targets))}")
+
+    def _evidence_state(self, evidence_ids: Sequence[str],
+                        change_id: str = "") -> tuple[tuple[str, ...], str, float]:
+        """Re-read and re-check every bundle a decision rests on, and answer with what is true now.
+
+        A preflight record remembers which evidence travelled with the review; it does not remember
+        whether that evidence is still usable. A bundle can pass its freshness window, go missing, or be
+        replaced, and all three left the id tuple intact - so a decision taken later would still have
+        reported `evidence_fresh` off a reference that no longer resolved to anything.
+
+        The bundles are also checked against `change_id`. Without it `check_evidence` falls back to the
+        bundle's own id as the expected identity, so a bundle consistently bound to some other change
+        passes every check and the approval records it as evidence for this one.
+
+        Returns the references, the reason, and how much longer the *earliest* bundle stays fresh - the
+        last of which caps the approval, so it cannot outlive its own evidence.
+        """
+        ids = tuple(evidence_ids)
+        if not ids:
+            return (), "evidence_missing", 0.0
+        # The references are returned even when they fail. Dropping them would send the engine down its
+        # "no evidence at all" branch, whose message names no bundle - and the operator's next step is to
+        # look at that bundle.
+        failing: list[str] = []
+        code = "evidence_fresh"
+        remaining = float("inf")
+        for bundle_id in ids:
+            try:
+                bundle = self.evidence.get(bundle_id)
+            except OpsError:
+                failing.append(bundle_id)
+                code = code if code != "evidence_fresh" else "evidence_missing"
+                continue
+            payloads, blocked = self.evidence.load_artifacts(bundle)
+            checks = check_evidence(bundle, payloads, blocked=blocked, change_id=change_id or None)
+            # Derived from the same two values `check_evidence` measures freshness with: the oldest
+            # timestamp in the bundle and the limit stored *in that bundle*. Using `bundle.created` and
+            # the currently configured window instead gave a longer answer whenever an observation
+            # predated ingestion, or whenever the window was tightened after collection - so the approval
+            # could be issued with seconds of freshness left and stay usable well after the evidence was
+            # stale, because execution only re-reads the binding's expiry and the evidence ids.
+            with contextlib.suppress(TypeError, ValueError):
+                oldest = min([float(bundle.created),
+                              *(float(entry.observed_at or entry.captured) for entry in bundle.entries)])
+                remaining = min(remaining, max(0.0, oldest + float(bundle.limits.max_age_s) - time.time()))
+            found = reason_code(checks)
+            if found != "evidence_fresh":
+                failing.append(bundle_id)
+                code = found if code == "evidence_fresh" else code
+        if not failing:
+            return ids, "evidence_fresh", remaining
+        return ids, f"{code} (unusable: {', '.join(failing)})", remaining
+
+    def _repair_count(self, change: Any) -> int:
+        """How many repair cycles this change has already had, from the record rather than from memory.
+
+        Left at its default, `attempts` was always 0, so every review timeout and every `NEEDS_EVIDENCE`
+        satisfied `attempts < max_repair_cycles` and returned RETRY indefinitely. The bound was enforced
+        only in tests that passed the field by hand.
+        """
+        return int(change.details.get("repair_cycles", 0) or 0)
+
+    def _decision_refused(self, change_id: str, plan_id: str, detail: str, *,
+                          review_id: str = "") -> dict[str, Any]:
+        """A refusal recorded as a decision, so the audit trail has the same shape either way."""
+        self.audit.record(event="decision", change=change_id, decision="BLOCKED_AUTONOMOUSLY",
+                          reason="plan_changed", plan=plan_id, review=review_id)
+        return {"decision": {"decision": "BLOCKED_AUTONOMOUSLY", "reason": Reason.PLAN_CHANGED.value,
+                            "detail": detail}}
 
     def verify_overview(self) -> dict[str, Any]:
         if self.core is None:

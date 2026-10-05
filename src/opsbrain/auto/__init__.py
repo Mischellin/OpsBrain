@@ -16,6 +16,7 @@ from .approval import (  # noqa: F401
     execute_once,
     verify,
 )
+from .decision import ApprovalEngine, Decision, DecisionRecord, Inputs  # noqa: F401
 from .evidence import (  # noqa: F401
     Check,
     EvidenceBundle,
@@ -48,6 +49,10 @@ from .service import AutoService  # noqa: F401
 
 __all__ = [
     "CONTRACT_VERSION",
+    "ApprovalEngine",
+    "Decision",
+    "DecisionRecord",
+    "Inputs",
     "Approval",
     "ApprovalBinding",
     "ApprovalStore",

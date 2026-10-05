@@ -40,6 +40,15 @@ class Core:
         self.audit = AuditLog(data / "audit.jsonl")
         self.auto = AutoService(config, reviewer=reviewer)
         self.auto.core = self  # the Verifier needs a Core, and Core builds the AutoService
+        # The engine goes in front of the change store, so an operator cannot approve by hand and skip
+        # the machinery that exists to decide. Core owns both ends, so Core wires them.
+        self.auto.engine().install(self.changes)
+        # The engine spends the lease when the gate opens; only here do we know the mutation ran, so the
+        # outcome is recorded from the change store rather than from the gate that cannot yet know.
+        approvals = self.auto.engine().approvals
+        if approvals is not None:
+            self.changes.on_executed = lambda change, approval_id, outcome: approvals.record_outcome(
+                approval_id, {**outcome, "at": round(time.monotonic(), 3)})
         self.finalizers: dict[str, Finalizer] = {}
 
     # -- helpers -----------------------------------------------------------------------------------
