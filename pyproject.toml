@@ -43,3 +43,12 @@ files = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The four suites the issue asks to be runnable separately. Markers rather than directories, because the
+# property a test has is what it *proves*, not which file it lives in: a security regression that is
+# also an end-to-end test is both, and a directory layout would force it to be one or the other.
+markers = [
+    "unit: a single module's own rules, no pipeline",
+    "integration: modules wired together, still without a mutation",
+    "security: an attempt to get through a gate that must not open",
+    "e2e: the whole chain, from evidence to a verified rollout",
+]

@@ -123,3 +123,25 @@ def http() -> FakeHttp:
 @pytest.fixture
 def ops(config: Config, fake: FakeExecutor, http: FakeHttp) -> OpsBrain:
     return OpsBrain(config, executor=fake, http=http, sleep=lambda _: None)  # type: ignore[arg-type]
+
+
+#: Which suite a test belongs to, by the file it lives in. Applied at collection rather than written on
+#: every test, because a property a test has is what it *proves* - a security regression is also an
+#: end-to-end test, and a decorator on 600 functions would make the two fight over one function.
+#:
+#: `security` and `e2e` are marked in the files themselves, because those are assertions about the test
+#: as much as about the code. Everything else is classified here: the pipeline modules, which wire
+#: several together without mutating anything, are integration; the rest are unit.
+_PIPELINE = {
+    "test_auto_decision.py", "test_auto_approval.py", "test_auto_preflight.py", "test_auto_evidence.py",
+    "test_auto_verify.py", "test_auto_postflight.py", "test_auto_rollout.py", "test_auto_recovery.py",
+    "test_policy_changes.py",
+}
+
+
+def pytest_collection_modifyitems(items: list[Any]) -> None:
+    for item in items:
+        path = Path(str(item.fspath)).name
+        if item.get_closest_marker("security") or item.get_closest_marker("e2e"):
+            continue  # already claimed by the file that wrote it
+        item.add_marker(pytest.mark.integration if path in _PIPELINE else pytest.mark.unit)

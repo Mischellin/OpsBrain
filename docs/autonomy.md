@@ -229,3 +229,19 @@ plan's cache would not be judging anything.
 The judgement and the state it was made against are both written to the audit. `confirmed` recorded
 against a change still sitting in `pending` is a statement about the audit trail, not about the world,
 and the two are written side by side so they can be read against each other.
+
+## What is actually verified, and on what
+
+Honest accounting, because the difference matters more than the list of features:
+
+| | status |
+|---|---|
+| The review, decision, evidence and verification pipeline | covered by the offline suite: `pytest` runs it end to end with the deterministic `fake` runner, no token, no network |
+| Ruff and `mypy --strict` | green on every PR |
+| Live review against the real `codex` runner | **not run in CI and not run here.** `OPSBRAIN_LIVE_REVIEW` is opt-in and needs a real token |
+| Live OpenTofu / Ansible / kubectl against real infrastructure | **not run.** No live check was performed in this work, and none is claimed |
+| The stub guard | a plan judged by the default `fake` runner comes back `REVIEW_FAILED`, so no verdict can be manufactured offline |
+
+So the "no human `yes`" path is demonstrated in tests and by construction, not against a live cluster. The
+first thing to do before trusting it on real infrastructure is a live review smoke test with a real runner,
+and then one deliberately-refused change to confirm the refusals are refusals and not slow approvals.
