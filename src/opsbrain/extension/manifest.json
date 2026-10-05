@@ -1,0 +1,18 @@
+{
+  "manifest_version": "0.3",
+  "name": "opsbrain",
+  "display_name": "OpsBrain",
+  "version": "0.0.0",
+  "description": "Token-cheap infrastructure operations: OpenTofu, Ansible, Kubernetes / Argo CD, hosts, router, monitoring - compact answers, raw output kept on disk, mutations only after a human approves them in a terminal.",
+  "long_description": "A minimal launcher for the OpsBrain MCP server installed on this computer (`opsbrain serve`). The extension contains no logic and no credentials: OpsBrain uses the ssh-agent, kubeconfig and config file (~/.opsbrain/config.yaml) that already exist here. Approvals are given with `opsbrain approve <id>` in a terminal, never from Claude.",
+  "author": {"name": "OpsBrain"},
+  "license": "UNLICENSED",
+  "keywords": ["opsbrain", "infrastructure", "devops", "opentofu", "ansible", "kubernetes"],
+  "server": {
+    "type": "node",
+    "entry_point": "server/index.js",
+    "mcp_config": {"command": "node", "args": ["${__dirname}/server/index.js"], "env": {}}
+  },
+  "tools_generated": true,
+  "compatibility": {"platforms": ["darwin", "linux"], "runtimes": {"node": ">=18.0.0"}}
+}

@@ -1,0 +1,704 @@
+"""Read side: knowledge (docs), hosts, Kubernetes, network (MikroTik) and observability.
+
+The few mutations that live here (service restart, Argo refresh / sync, rollout restart) go through
+`Core.gate`, like every other mutation.
+"""
+
+from __future__ import annotations
+
+import difflib
+import json
+import re
+import shlex
+import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any
+
+from . import parsers
+from .changes import Change, digest
+from .core import Core
+from .redact import redact_text
+from .util import OpsError, clip, compress_log, hoist_common
+
+_FORBIDDEN_DOC = re.compile(r"(?i)(vault|secret|\.env|\.vault_pass|\.key$|\.pem$|id_(rsa|ed25519)|rclone\.conf|"
+                            r"discovery/out|\.tfstate|\.tfvars)")
+_K8S_NAME = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")
+_K8S_LOG_TARGET = re.compile(r"^((deployment|deploy|statefulset|sts|daemonset|ds|job|pod)/)?[a-z0-9]([a-z0-9.-]{0,251}"
+                             r"[a-z0-9])?$")
+_SELECTOR = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./=!, ()-]{0,199}$")
+_SINCE = re.compile(r"^[0-9]{1,4} ?(s|sec|m|min|h|hour|hours|d|day|days)( ago)?$|^[0-9T:. -]{8,25}$|"
+                    r"^(today|yesterday)$")
+_UNIT = re.compile(r"^[A-Za-z0-9@_.:-]{1,120}$")
+#: How many per-namespace reads run at once. Enough that a hundred namespaces is not a hundred
+#: sequential round trips, bounded so a wide cluster cannot fan out into a fork bomb.
+_K8S_READ_PARALLELISM = 8
+
+K8S_KINDS = {
+    "pods": "pods", "deployments": "deployments", "statefulsets": "statefulsets", "daemonsets": "daemonsets",
+    "services": "services", "ingresses": "ingresses", "jobs": "jobs", "cronjobs": "cronjobs", "nodes": "nodes",
+    "pvc": "persistentvolumeclaims", "namespaces": "namespaces", "configmaps": "configmaps",
+    "hpa": "horizontalpodautoscalers", "applications": "applications.argoproj.io",
+    "clusters": "clusters.postgresql.cnpg.io",
+}  # `secrets` is deliberately absent: OpsBrain never reads Kubernetes Secrets
+
+STATUS_SCRIPT = (
+    "echo uptime_s=$(cut -d. -f1 /proc/uptime); echo load1=$(cut -d' ' -f1 /proc/loadavg); echo cpus=$(nproc); "
+    "awk '/MemTotal/{t=$2}/MemAvailable/{a=$2}END{if(t)printf \"mem_used_pct=%d\\n\",(t-a)*100/t}' /proc/meminfo; "
+    "echo disks=$(df -P -x tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null | "
+    "awk 'NR>1{gsub(\"%\",\"\",$5);printf \"%s:%s,\",$6,$5}'); "
+    "echo failed_units=$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{printf \"%s,\",$1}'); "
+    "if [ -f /var/run/reboot-required ]; then echo reboot_required=1; fi")
+
+
+class Readers(Core):
+    # ------------------------------------------------------------------------------------------ docs
+    def _doc_files(self) -> list[Path]:
+        files: dict[Path, None] = {}
+        for pattern in self.config.docs.globs:
+            for path in sorted(self.repo.glob(pattern)):
+                relative = path.relative_to(self.repo).as_posix()
+                if path.is_file() and not _FORBIDDEN_DOC.search(relative) and path.stat().st_size < 2_000_000:
+                    files[path] = None
+        return list(files)
+
+    def _doc_path(self, relative: str) -> Path:
+        path = (self.repo / relative).resolve()
+        if not path.is_relative_to(self.repo) or _FORBIDDEN_DOC.search(path.relative_to(self.repo).as_posix()):
+            raise OpsError(f"not readable: {relative!r}")
+        if path not in self._doc_files():
+            raise OpsError(f"not a knowledge file (see docs.globs): {relative!r}")
+        return path
+
+    def docs_search(self, query: str, limit: int = 8) -> dict[str, Any]:
+        self.require("docs.read")
+        terms = [term.lower() for term in re.findall(r"[\w./-]{2,}", query)][:8]
+        if not terms:
+            raise OpsError("empty query")
+        hits: list[tuple[int, str, int, str]] = []
+        for path in self._doc_files():
+            try:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            heading = ""
+            for number, line in enumerate(lines, 1):
+                if line.startswith("#"):
+                    heading = line.lstrip("# ").strip()
+                lowered = line.lower()
+                score = sum(1 for term in terms if term in lowered)
+                if score and score * 2 >= len(terms):
+                    bonus = sum(1 for term in terms if term in heading.lower())
+                    hits.append((score * 2 + bonus, path.relative_to(self.repo).as_posix(), number, line.strip()))
+        hits.sort(key=lambda hit: (-hit[0], hit[1], hit[2]))
+        rows = [{"path": path, "line": number, "text": clip(redact_text(text), 220)}
+                for _, path, number, text in hits[:max(1, min(limit, 30))]]
+        return {"hits": len(hits), "items": rows, "next": "docs action=read path=<path> start=<line>"}
+
+    def docs_read(self, path: str, start: int = 1, lines: int = 60) -> dict[str, Any]:
+        self.require("docs.read")
+        content = self._doc_path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+        start, lines = max(1, start), max(1, min(lines, 200))
+        body = redact_text("\n".join(content[start - 1:start - 1 + lines]))
+        return {"path": path, "total_lines": len(content), "start": start, "text": body}
+
+    def docs_status(self) -> dict[str, Any]:
+        """The current state in a few hundred tokens: last entry of the memory log + headings of the status file."""
+        self.require("docs.read")
+        out: dict[str, Any] = {}
+        if self.config.docs.memory_file:
+            text = self._doc_path(self.config.docs.memory_file).read_text(encoding="utf-8", errors="replace")
+            entries = re.split(r"(?m)^(?=## )", text)
+            out["last_entry"] = clip(redact_text(entries[-1].strip()), 2500)
+        if self.config.docs.status_file:
+            text = self._doc_path(self.config.docs.status_file).read_text(encoding="utf-8", errors="replace")
+            out["status_sections"] = [f"{number}: {line.lstrip('# ').strip()}"
+                                      for number, line in enumerate(text.splitlines(), 1) if line.startswith("##")][:40]
+            out["status_file"] = self.config.docs.status_file
+        return out
+
+    # ----------------------------------------------------------------------------------------- hosts
+    def may_read_namespace(self, name: str) -> bool:
+        """Whether the policy covers this namespace, without raising on one it does not."""
+        try:
+            self.require("k8s.read", name)
+        except OpsError:
+            return False
+        return True
+
+    def _require_all_namespaces(self) -> list[str]:
+        """The namespaces a cluster-wide read may cover, each authorised individually.
+
+        Returns the authorised list rather than only asserting, because the caller must then read *those*
+        namespaces by name. Authorising a list and afterwards issuing one `-A` read is not the same thing:
+        a namespace created in between is absent from the loop and its objects still come back. Reading the
+        authorised namespaces explicitly is what makes the per-namespace rule mean something at the moment
+        the objects are actually fetched.
+        """
+        # The bare capability is checked *before* the cluster is read. Checking it afterwards meant a
+        # caller the policy denies had already caused `kubectl get namespaces` to run.
+        self.require("k8s.read")
+        listing = parsers.k8s_rows("namespaces", self._kubectl_json("get", "namespaces"))
+        names = [str(row.get("name", "")) for row in listing if str(row.get("name", ""))]
+        if not names:
+            raise OpsError("cannot read the namespace list, so an all-namespace read is not authorised")
+        withheld = 0
+        for name in names:
+            if not self.may_read_namespace(name):
+                withheld += 1
+        if withheld:
+            # A count, never the names. `require` raises a message naming the target it refused, and that
+            # message travels back to the caller - disclosing exactly the namespace the rule withholds, by
+            # the back door the listing branch was built to close.
+            raise OpsError(f"an all-namespace read is not authorised: {withheld} namespace(s) are not "
+                           f"covered by policy. Read them by name, or extend the policy.")
+        return names
+
+    def _authorised_namespaces(self) -> tuple[list[str], int]:
+        """The namespaces the policy covers, and how many it does not.
+
+        The graceful sibling of `_require_all_namespaces`: an overview or an event feed is still useful over
+        the namespaces that *are* readable, so the rest are counted rather than failing the whole call. The
+        caller reads the returned namespaces by name; it must never fall back to an `-A` read.
+        """
+        self.require("k8s.read")
+        listing = parsers.k8s_rows("namespaces", self._kubectl_json("get", "namespaces"))
+        names = [str(row.get("name", "")) for row in listing if str(row.get("name", ""))]
+        if not names:
+            raise OpsError("cannot read the namespace list, so a cluster-wide read is not authorised")
+        allowed = [name for name in names if self.may_read_namespace(name)]
+        if not allowed:
+            raise OpsError("no namespace is covered by policy, so a cluster-wide read is not authorised")
+        return allowed, len(names) - len(allowed)
+
+    @staticmethod
+    def _map_namespaces(read: Callable[[str], Any], names: list[str]) -> list[Any]:
+        """Run one read per namespace - concurrently and bounded, so a wide cluster cannot stall a call."""
+        if len(names) == 1:
+            return [read(names[0])]
+        workers = min(_K8S_READ_PARALLELISM, len(names))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="opsbrain-k8s") as pool:
+            return list(pool.map(read, names))
+
+    def _authorise_hosts(self, names: list[str]) -> None:
+        """Check `hosts.read` for *every* selected host, not once for the batch.
+
+        A rule like `hosts.read:pve: deny` is keyed on the host, and a batch action that asks only about
+        the bare capability never lets it participate: the denial was configured, and the host was read
+        anyway. Authorising each name before any command goes out is what makes the targeted rule mean
+        something, for explicit lists and for tag-selected batches alike.
+        """
+        for name in names:
+            self.require("hosts.read", name)
+
+    def _select_hosts(self, hosts: list[str] | None, tag: str | None, *, kind: str = "linux") -> list[str]:
+        if hosts:
+            for name in hosts:
+                self.exec.host(name)
+            return hosts
+        names = [name for name, host in self.config.hosts.items()
+                 if host.kind == kind and (tag is None or tag in host.tags)]
+        if not names:
+            raise OpsError("no hosts selected")
+        return names
+
+    def _parallel(self, names: list[str], script: str, timeout: float = 40) -> dict[str, Any]:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda name: self.exec.run_ssh(name, script, timeout=timeout), names))
+        return dict(zip(names, results, strict=True))
+
+    def hosts_list(self) -> dict[str, Any]:
+        """The inventory. Gated like every other host read: it carries addresses, jump chains and tags.
+
+        Asking only about the bare capability never lets a targeted rule like `hosts.read:pve: deny`
+        participate, so every host is authorised by name and a denied one is left out. The answer says how
+        many were withheld, never which.
+        """
+        self.require("hosts.read")
+        shown: list[dict[str, Any]] = []
+        withheld = 0
+        for name, host in self.config.hosts.items():
+            try:
+                self.require("hosts.read", name)
+            except OpsError:
+                withheld += 1
+                continue
+            shown.append({"name": name, "addr": host.address, **({"jump": host.jump} if host.jump else {}),
+                          **({"tags": host.tags} if host.tags else {}),
+                          **({"services": host.services} if host.services else {})})
+        out: dict[str, Any] = {"hosts": shown}
+        if withheld:
+            out["withheld"] = withheld
+        return out
+
+    def hosts_ping(self, hosts: list[str] | None = None, tag: str | None = None) -> dict[str, Any]:
+        names = self._select_hosts(hosts, tag)
+        self._authorise_hosts(names)
+        results = self._parallel(names, "true", timeout=25)
+        down = {name: clip(result.out.strip().splitlines()[-1] if result.out.strip() else "timeout", 160)
+                for name, result in results.items() if not result.ok}
+        return {"up": len(names) - len(down), "total": len(names), "down": down}
+
+    def hosts_status(self, hosts: list[str] | None = None, tag: str | None = None) -> dict[str, Any]:
+        names = self._select_hosts(hosts, tag)
+        self._authorise_hosts(names)
+        results = self._parallel(names, STATUS_SCRIPT)
+        ignore = frozenset(self.config.ignore_failed_units)
+        rows: dict[str, Any] = {}
+        for name, result in results.items():
+            if result.ok:
+                rows[name] = parsers.host_status(result.out, ignore)
+            else:
+                reason = result.out.strip().splitlines()[-1] if result.out.strip() else "timeout"
+                rows[name] = {"warn": [f"unreachable: {clip(reason, 120)}"]}
+        attention = {name: row for name, row in rows.items() if row.get("warn")}
+        # healthy hosts cost one word each; details only where something is off (or when asked for few hosts)
+        if len(names) > 3:
+            return {"total": len(names), "healthy": [name for name in names if name not in attention],
+                    "attention": attention}
+        return {"total": len(names), "hosts": rows}
+
+    def _unit(self, host_name: str, service: str, *, configured_only: bool) -> str:
+        host = self.exec.host(host_name)
+        if not _UNIT.fullmatch(service):
+            raise OpsError(f"invalid unit name: {service!r}")
+        if configured_only and service not in host.services:
+            raise OpsError(f"{service!r} is not listed in hosts.{host_name}.services")
+        return service
+
+    def hosts_services(self, host: str, service: str | None = None) -> dict[str, Any]:
+        self.require("hosts.read", host)
+        units = [self._unit(host, service, configured_only=False)] if service else self.exec.host(host).services
+        if not units:
+            raise OpsError(f"no services configured for {host}")
+        script = "; ".join(f"echo {shlex.quote(unit)}=$(systemctl is-active {shlex.quote(unit)} 2>&1)"
+                           for unit in units)
+        result = self.exec.run_ssh(host, script, timeout=30)
+        if not result.ok and "=" not in result.out:
+            raise OpsError(f"{host}: {clip(result.out.strip(), 200)}")
+        states = dict(line.split("=", 1) for line in result.out.splitlines() if "=" in line)
+        return {"host": host, "services": states, "not_active": [u for u, s in states.items() if s != "active"]}
+
+    def hosts_logs(self, host: str, service: str, lines: int = 200, since: str | None = None,
+                   grep: str | None = None) -> dict[str, Any]:
+        self.require("hosts.read", host)
+        unit = self._unit(host, service, configured_only=False)
+        command = f"journalctl -u {shlex.quote(unit)} -n {max(10, min(lines, 5000))} --no-pager -o short-iso"
+        if since:
+            if not _SINCE.fullmatch(since):
+                raise OpsError(f"invalid since: {since!r} (e.g. '30 min ago', '2026-01-31 10:00')")
+            command += f" --since {shlex.quote(since)}"
+        if self.exec.host(host).sudo:
+            command = "sudo -n " + command
+        result = self.exec.run_ssh(host, command, timeout=60)
+        if not result.ok:
+            raise OpsError(f"{host}: {clip(result.out.strip(), 200)}")
+        meta = self.artifacts.save("journal", f"{host} {unit}", result.out)
+        selected = redact_text(result.out).splitlines()
+        if grep:
+            try:
+                regex = re.compile(grep[:200], re.IGNORECASE)
+            except re.error as exc:
+                raise OpsError(f"invalid grep: {exc}") from exc
+            selected = [line for line in selected if regex.search(line)]
+        return {"host": host, "unit": unit, "artifact": meta.id, **compress_log(selected)}
+
+    def hosts_restart(self, host: str, service: str, change_id: str | None = None) -> dict[str, Any]:
+        unit = self._unit(host, service, configured_only=True)
+        gate = self.gate("hosts.restart", host, change_id, summary=f"systemctl restart {unit} on {host}",
+                         content_hash=digest(["hosts.restart", host, unit]), args={"service": unit})
+        if not isinstance(gate, Change):
+            return gate
+        sudo = "sudo -n " if self.exec.host(host).sudo else ""
+        result = self.exec.run_ssh(host, f"{sudo}systemctl restart {shlex.quote(unit)}; sleep 2; "
+                                         f"systemctl is-active {shlex.quote(unit)}", timeout=90)
+        state = result.out.strip().splitlines()[-1] if result.out.strip() else "unknown"
+        return {"host": host, "unit": unit, "state": state, "ok": state == "active", "change": gate.id}
+
+    # ------------------------------------------------------------------------------------------- k8s
+    def _kubectl(self, *args: str, timeout: float = 60) -> str:
+        k8s = self.config.k8s
+        if k8s is None:
+            raise OpsError("k8s is not configured")
+        argv = [k8s.kubectl, "--request-timeout=30s"]
+        if k8s.kubeconfig:
+            argv += ["--kubeconfig", str(Path(k8s.kubeconfig).expanduser())]
+        if k8s.context:
+            argv += ["--context", k8s.context]
+        result = self.exec.run_local([*argv, *args], timeout=timeout)
+        if not result.ok:
+            raise OpsError(f"kubectl: {clip(redact_text(result.out.strip()), 300)}")
+        return result.out
+
+    def _kubectl_json(self, *args: str, allow_empty: bool = False) -> dict[str, Any]:
+        text = self._kubectl(*args, "-o", "json")
+        if allow_empty and not text.strip():
+            # `kubectl get <kind> <name> --ignore-not-found` succeeds and prints nothing at all when the
+            # object is absent. That is an empty answer, not a malformed one.
+            return {}
+        try:
+            document: dict[str, Any] = json.loads(text[text.index("{"):])
+        except ValueError as exc:
+            raise OpsError("kubectl returned no JSON") from exc
+        return document
+
+    @staticmethod
+    def _names(namespace: str | None = None, name: str | None = None) -> None:
+        for label, value in (("namespace", namespace), ("name", name)):
+            if value is not None and not _K8S_NAME.fullmatch(value):
+                raise OpsError(f"invalid {label}: {value!r}")
+
+    def k8s_overview(self) -> dict[str, Any]:
+        self.require("k8s.read")
+        nodes = parsers.k8s_nodes(self._kubectl_json("get", "nodes"))
+        # Pods are read per authorised namespace, never with `-A`: the bare capability only proves that
+        # `k8s.read:` is allowed, so a `k8s.read:prod: deny` rule never took part and `prod` came back.
+        allowed, withheld = self._authorised_namespaces()
+        documents = self._map_namespaces(lambda scope: self._kubectl_json("get", "pods", "-n", scope), allowed)
+        total, problems = parsers.k8s_pods_problems(
+            {"items": [item for document in documents for item in document.get("items", [])]},
+            self.config.k8s.restart_threshold if self.config.k8s else 5)
+        out: dict[str, Any] = {"nodes": {"total": len(nodes), "not_ready": [n for n in nodes if not n["ready"]
+                                                                            or len(n) > 2]},
+                               "pods": {"total": total, "problems": self.capped(problems)}}
+        if withheld:
+            out["pods"]["withheld"] = f"{withheld} namespace(s) are not covered by policy and are not counted"
+        try:
+            argo = self.config.k8s.argocd_namespace if self.config.k8s else "argocd"
+            if not self.may_read_namespace(argo):
+                raise OpsError("argocd namespace is not covered by policy")
+            apps, bad = parsers.argo_apps(self._kubectl_json("get", K8S_KINDS["applications"], "-n", argo))
+            out["argo"] = {"apps": apps, "not_ok": bad[:self.max_items]}
+        except OpsError:
+            out["argo"] = "unavailable"
+        return out
+
+    def k8s_get(self, kind: str, namespace: str | None = None, name: str | None = None,
+                selector: str | None = None) -> dict[str, Any]:
+        if kind not in K8S_KINDS:
+            raise OpsError(f"kind must be one of {sorted(K8S_KINDS)}")
+        self._names(namespace, name)
+        if selector and not _SELECTOR.fullmatch(selector):
+            raise OpsError(f"invalid selector: {selector!r}")
+        if kind == "namespaces" and not name:
+            # The listing *is* the disclosure, and this branch issues the cluster read itself, so the bare
+            # capability is checked *before* it - exactly as `_require_all_namespaces` does. Checking the
+            # per-namespace rules only afterwards meant a caller denied `k8s.read` outright had already
+            # caused `kubectl get namespaces` to run.
+            self.require("k8s.read")
+            # The selector was validated but never passed on, so this branch answered with every
+            # authorised namespace rather than the ones asked for.
+            args = ["get", "namespaces"]
+            if selector:
+                args += ["-l", selector]
+            rows = parsers.k8s_rows(kind, self._kubectl_json(*args))
+            allowed, withheld = [], 0
+            for row in rows:
+                row_name = str(row.get("name", ""))
+                if not row_name:
+                    continue
+                if namespace and row_name != namespace:
+                    # Namespaces are cluster-scoped, so `-n` would not narrow the read: kubectl lists them
+                    # all. Narrowing happens here, after the policy check below has had its say.
+                    continue
+                if self.may_read_namespace(row_name):
+                    allowed.append(row)
+                else:
+                    withheld += 1
+            # Capped, like every other listing this module returns, so a wide cluster cannot page an
+            # unbounded answer out of a single call.
+            out = {"kind": kind, "namespaces": [str(r.get("name", "")) for r in allowed[:40]],
+                   **self.capped(allowed, 40)}
+            if withheld:
+                # A count, not the names. Naming them would put back exactly what the rule withholds.
+                out["withheld"] = withheld
+                out["note"] = f"{withheld} namespace(s) are not covered by policy and are not listed"
+            return out
+        cluster_wide = not namespace and kind not in ("nodes", "namespaces")
+        names: list[str] = []
+        if cluster_wide:
+            # `-A` returns objects from namespaces the policy may well deny. Checking the empty target
+            # only proves that `k8s.read:` is allowed, so a per-namespace deny never participated. Either
+            # the operator has allowed every namespace explicitly, or this read does not happen - and even
+            # then each authorised namespace is read *by name*, so a namespace created after the check
+            # cannot smuggle its objects into the answer.
+            names = self._require_all_namespaces()
+        else:
+            # A namespace *is* its own scope: `kind=namespaces, name=prod` must be judged against
+            # `k8s.read:prod`, not against the bare capability, or a denied namespace is one lookup away.
+            self.require("k8s.read", name if kind == "namespaces" and name else (namespace or ""))
+        if names:
+            # Authorised per namespace, so the reads are per namespace too - but concurrently and with a
+            # bound. Serially, a cluster with a hundred namespaces turned one request into a hundred
+            # subprocesses that each wait on the API, and an ordinary MCP call could time out while the
+            # server was still being loaded. The authorisation is unchanged: the point is that a namespace
+            # created after the check cannot appear here, not how fast the reads happen.
+            def read_scope(scope: str) -> list[Any]:
+                args = ["get", K8S_KINDS[kind], *([name] if name else []), "-n", scope]
+                if name:
+                    # `kubectl get <kind> <name>` exits non-zero with NotFound when that object is not in
+                    # this namespace, and a named object normally lives in exactly one. Without
+                    # `--ignore-not-found` the first namespace that does not have it aborted the whole
+                    # read, so a lookup that used to work with `-A` failed on ordinary input.
+                    args.append("--ignore-not-found")
+                if selector:
+                    args += ["-l", selector]
+                return parsers.k8s_rows(kind, self._kubectl_json(*args, allow_empty=bool(name)))
+
+            rows = [row for chunk in self._map_namespaces(read_scope, names) for row in chunk]
+            return {"kind": kind, "namespaces": list(names), **self.capped(rows, 40)}
+        args = ["get", K8S_KINDS[kind], *([name] if name else [])]
+        args += ["-n", namespace] if namespace else ([] if kind in ("nodes", "namespaces") else ["-A"])
+        if selector:
+            args += ["-l", selector]
+        return {"kind": kind, **self.capped(parsers.k8s_rows(kind, self._kubectl_json(*args)), 40)}
+
+    def k8s_describe(self, kind: str, name: str, namespace: str | None = None) -> dict[str, Any]:
+        if kind not in K8S_KINDS:
+            raise OpsError(f"kind must be one of {sorted(K8S_KINDS)}")
+        self.require("k8s.read", name if kind == "namespaces" else (namespace or ""))
+        self._names(namespace, name)
+        text = self._kubectl("describe", K8S_KINDS[kind], name, *(["-n", namespace] if namespace else []))
+        meta = self.artifacts.save("describe", f"{kind}/{name}", text)
+        clean = redact_text(text)
+        _, _, events = clean.partition("\nEvents:")
+        interesting = [line for line in clean.splitlines()
+                       if re.match(r"^\s*(Status|Reason|Message|State|Last State|Exit Code|Ready|Restart Count|"
+                                   r"Image|Node|Conditions|Type|Replicas)\b", line)]
+        return {"artifact": meta.id, "facts": [clip(line.strip(), 160) for line in interesting[:25]],
+                "events": [clip(line.strip(), 220) for line in events.strip().splitlines()[-8:]]}
+
+    def k8s_logs(self, name: str, namespace: str, lines: int = 200, container: str | None = None,
+                 previous: bool = False, grep: str | None = None) -> dict[str, Any]:
+        self.require("k8s.read", namespace)
+        if not _K8S_LOG_TARGET.fullmatch(name):
+            raise OpsError(f"invalid target: {name!r} (pod name or deployment/<name>)")
+        self._names(namespace, container)
+        args = ["logs", name, "-n", namespace, f"--tail={max(10, min(lines, 5000))}"]
+        args += ["-c", container] if container else ["--all-containers=true"]
+        if previous:
+            args.append("--previous")
+        text = self._kubectl(*args)
+        meta = self.artifacts.save("k8s-logs", f"{namespace}/{name}", text)
+        selected = redact_text(text).splitlines()
+        if grep:
+            try:
+                regex = re.compile(grep[:200], re.IGNORECASE)
+            except re.error as exc:
+                raise OpsError(f"invalid grep: {exc}") from exc
+            selected = [line for line in selected if regex.search(line)]
+        return {"artifact": meta.id, **compress_log(selected)}
+
+    def k8s_events(self, namespace: str | None = None) -> dict[str, Any]:
+        self.require("k8s.read", namespace or "")
+        self._names(namespace)
+        if namespace:
+            return {"warnings": parsers.k8s_events(self._kubectl_json("get", "events", "-n", namespace),
+                                                   max_items=self.max_items)}
+        # No namespace named means every namespace, and `get events -A` would carry event details from the
+        # ones the policy denies. Read the authorised ones by name instead.
+        allowed, withheld = self._authorised_namespaces()
+        documents = self._map_namespaces(lambda scope: self._kubectl_json("get", "events", "-n", scope), allowed)
+        merged = {"items": [item for document in documents for item in document.get("items", [])]}
+        out: dict[str, Any] = {"warnings": parsers.k8s_events(merged, max_items=self.max_items)}
+        if withheld:
+            out["withheld"] = f"{withheld} namespace(s) are not covered by policy and are not included"
+        return out
+
+    def k8s_refresh(self, app: str, change_id: str | None = None) -> dict[str, Any]:
+        return self._argo(app, change_id, "k8s.refresh", "hard refresh of Argo CD application", [
+            "annotate", K8S_KINDS["applications"], app, "argocd.argoproj.io/refresh=hard", "--overwrite"])
+
+    def k8s_sync(self, app: str, change_id: str | None = None) -> dict[str, Any]:
+        patch = json.dumps({"operation": {"initiatedBy": {"username": "opsbrain"},
+                                          "sync": {"syncStrategy": {"hook": {}}}}})
+        return self._argo(app, change_id, "k8s.sync", "sync of Argo CD application", [
+            "patch", K8S_KINDS["applications"], app, "--type", "merge", "-p", patch])
+
+    def _argo(self, app: str, change_id: str | None, capability: str, what: str, args: list[str]) -> dict[str, Any]:
+        self._names(name=app)
+        gate = self.gate(capability, app, change_id, summary=f"{what} {app}", content_hash=digest([capability, app]))
+        if not isinstance(gate, Change):
+            return gate
+        namespace = self.config.k8s.argocd_namespace if self.config.k8s else "argocd"
+        self._kubectl(*args, "-n", namespace)
+        rows = parsers.k8s_rows("applications", self._kubectl_json("get", K8S_KINDS["applications"], app, "-n",
+                                                                   namespace))
+        return {"app": app, "done": capability, "now": rows[0] if rows else None, "change": gate.id}
+
+    def k8s_restart(self, kind: str, name: str, namespace: str, change_id: str | None = None) -> dict[str, Any]:
+        if kind not in ("deployments", "statefulsets", "daemonsets"):
+            raise OpsError("kind must be deployments | statefulsets | daemonsets")
+        self._names(namespace, name)
+        target = f"{namespace}/{name}"
+        gate = self.gate("k8s.restart", namespace, change_id, summary=f"rollout restart {kind}/{name} in {namespace}",
+                         content_hash=digest(["k8s.restart", kind, target]))
+        if not isinstance(gate, Change):
+            return gate
+        self._kubectl("rollout", "restart", f"{kind}/{name}", "-n", namespace)
+        try:
+            self._kubectl("rollout", "status", f"{kind}/{name}", "-n", namespace, "--timeout=150s", timeout=170)
+            rolled = True
+        except OpsError:
+            rolled = False
+        rows = parsers.k8s_rows(kind, self._kubectl_json("get", kind, name, "-n", namespace))
+        return {"target": target, "rolled_out": rolled, "now": rows[0] if rows else None, "change": gate.id}
+
+    # --------------------------------------------------------------------------------------- network
+    def _router(self) -> str:
+        if self.config.network is None:
+            raise OpsError("network is not configured")
+        return self.config.network.router
+
+    def _live_export(self) -> list[str]:
+        result = self.exec.run_ssh(self._router(), "/export hide-sensitive", timeout=90)
+        if not result.ok or not result.out.strip():
+            raise OpsError(f"cannot read the router export: {clip(result.out.strip(), 200) or 'empty'}")
+        return parsers.mikrotik_normalise(redact_text(result.out))
+
+    def network_export(self) -> dict[str, Any]:
+        self.require("network.read")
+        lines = self._live_export()
+        meta = self.artifacts.save("mikrotik-export", "live /export hide-sensitive", "\n".join(lines))
+        sections: dict[str, int] = {}
+        current = ""
+        for line in lines:
+            if line.startswith("/"):
+                current = line.strip()
+                sections.setdefault(current, 0)
+            elif current and line.strip():
+                sections[current] += 1
+        return {"artifact": meta.id, "lines": len(lines), "sections": sections}
+
+    def network_drift(self) -> dict[str, Any]:
+        self.require("network.read")
+        network = self.config.network
+        if network is None or not network.tracked_export:
+            raise OpsError("network.tracked_export is not configured")
+        tracked_path = (self.repo / network.tracked_export).resolve()
+        if not tracked_path.is_relative_to(self.repo) or not tracked_path.is_file():
+            raise OpsError(f"tracked export not found: {network.tracked_export}")
+        tracked = parsers.mikrotik_normalise(tracked_path.read_text(encoding="utf-8", errors="replace"))
+        live = self._live_export()
+        # autojunk off: on a long export the heuristic drops "popular" lines and reports unchanged ones as changed
+        matcher = difflib.SequenceMatcher(None, tracked, live, autojunk=False)
+        diff = [sign + line for tag, a1, a2, b1, b2 in matcher.get_opcodes() if tag != "equal"
+                for sign, block in (("-", tracked[a1:a2]), ("+", live[b1:b2])) for line in block]
+        if not diff:
+            return {"drift": False}
+        meta = self.artifacts.save("mikrotik-diff", "tracked vs live", "\n".join(diff))
+        return {"drift": True, "artifact": meta.id, "changed_lines": len(diff),
+                "diff": [clip(line, 200) for line in diff[:30]],
+                "note": "'-' only in the tracked file, '+' only on the router. OpsBrain never changes the router."}
+
+    def network_print(self, path: str) -> dict[str, Any]:
+        self.require("network.read")
+        network = self.config.network
+        if network is None or path not in network.print_paths:
+            raise OpsError(f"path must be one of {network.print_paths if network else []}")
+        result = self.exec.run_ssh(self._router(), f"{path} print without-paging", timeout=60)
+        if not result.ok:
+            raise OpsError(f"router: {clip(result.out.strip(), 200)}")
+        meta = self.artifacts.save("mikrotik-print", path, result.out)
+        lines = [line for line in redact_text(result.out).replace("\r", "").splitlines() if line.strip()]
+        return {"artifact": meta.id, "lines": len(lines), "text": [clip(line, 200) for line in lines[:40]]}
+
+    # --------------------------------------------------------------------------------------- observe
+    def _prometheus(self) -> str:
+        url = self.config.observe.prometheus_url
+        if not url:
+            raise OpsError("observe.prometheus_url is not configured")
+        return url.rstrip("/")
+
+    def observe_alerts(self) -> dict[str, Any]:
+        self.require("observe.read")
+        data = self.http.get_json(f"{self._prometheus()}/api/v1/alerts")
+        grouped: dict[str, dict[str, Any]] = {}
+        for alert in data.get("data", {}).get("alerts", []):
+            labels = alert.get("labels", {})
+            name = labels.get("alertname", "?")
+            row = grouped.setdefault(f"{name}/{alert.get('state')}", {
+                "alert": name, "state": alert.get("state"), "severity": labels.get("severity"), "n": 0, "on": [],
+                "summary": clip(alert.get("annotations", {}).get("summary", ""), 160)})
+            row["n"] += 1
+            where = labels.get("instance") or labels.get("pod") or labels.get("job") or ""
+            if where and len(row["on"]) < 6:
+                row["on"].append(where)
+        rows = sorted(grouped.values(), key=lambda row: (row["state"] != "firing", row["alert"]))
+        return {"firing": sum(row["n"] for row in rows if row["state"] == "firing"), **self.capped(rows)}
+
+    def observe_targets(self) -> dict[str, Any]:
+        self.require("observe.read")
+        data = self.http.get_json(f"{self._prometheus()}/api/v1/targets", {"state": "active"})
+        targets = data.get("data", {}).get("activeTargets", [])
+        down = [{"job": target.get("labels", {}).get("job"), "instance": target.get("labels", {}).get("instance"),
+                 "error": clip(target.get("lastError", ""), 160)} for target in targets if target.get("health") != "up"]
+        return {"total": len(targets), "down": down[:self.max_items]}
+
+    def observe_query(self, expr: str, minutes: int = 0) -> dict[str, Any]:
+        """Instant query, or with `minutes` a range reduced to min / avg / max / last per series."""
+        self.require("observe.read")
+        if not expr or len(expr) > 2000:
+            raise OpsError("expr is required (max 2000 characters)")
+        base = self._prometheus()
+        if minutes <= 0:
+            data = self.http.get_json(f"{base}/api/v1/query", {"query": expr})
+        else:
+            end = time.time()
+            minutes = min(minutes, 7 * 24 * 60)
+            data = self.http.get_json(f"{base}/api/v1/query_range", {
+                "query": expr, "start": end - minutes * 60, "end": end, "step": max(15, minutes * 60 // 120)})
+        if data.get("status") != "success":
+            raise OpsError(f"prometheus: {clip(str(data.get('error', data)), 300)}")
+        result = data["data"].get("result", [])
+        if not isinstance(result, list):  # scalar / string
+            return {"value": result}
+        labels = [{key: value for key, value in series.get("metric", {}).items() if key != "__name__"}
+                  for series in result]
+        common, labels = hoist_common(labels)
+        rows: list[dict[str, Any]] = []
+        for series, own in zip(result, labels, strict=True):
+            if "value" in series:
+                rows.append({**own, "v": _number(series["value"][1])})
+            else:
+                values = [number for _, raw in series.get("values", []) if (number := _number(raw)) is not None]
+                if values:
+                    rows.append({**own, "min": min(values), "avg": round(sum(values) / len(values), 4),
+                                 "max": max(values), "last": values[-1]})
+        return {"series": len(rows), **({"common": common} if common else {}), **self.capped(rows, 30)}
+
+    def observe_logs(self, query: str, minutes: int = 60, limit: int = 300) -> dict[str, Any]:
+        self.require("observe.read")
+        url = self.config.observe.loki_url
+        if not url:
+            raise OpsError("observe.loki_url is not configured")
+        if not query or len(query) > 2000:
+            raise OpsError("query (LogQL) is required")
+        end = time.time()
+        data = self.http.get_json(f"{url.rstrip('/')}/loki/api/v1/query_range", {
+            "query": query, "limit": max(10, min(limit, 5000)), "direction": "backward",
+            "start": int((end - min(minutes, 7 * 24 * 60) * 60) * 1e9), "end": int(end * 1e9)})
+        entries = sorted((entry for stream in data.get("data", {}).get("result", [])
+                          for entry in stream.get("values", [])), key=lambda entry: entry[0])
+        lines = [entry[1] for entry in entries]
+        meta = self.artifacts.save("loki", query, "\n".join(lines))
+        return {"artifact": meta.id, **compress_log(redact_text("\n".join(lines)).splitlines())}
+
+    def observe_http(self, name: str | None = None) -> dict[str, Any]:
+        self.require("observe.read")
+        checks = self.config.observe.http_checks
+        if name is not None and name not in checks:
+            raise OpsError(f"name must be one of {sorted(checks)}")
+        selected = {name: checks[name]} if name else checks
+        results = {key: self.http.check(url) for key, url in selected.items()}
+        return {"checks": {key: {"code": code, "ms": ms} for key, (code, ms) in results.items()},
+                "failing": [key for key, (code, _) in results.items() if not 200 <= code < 400]}
+
+
+def _number(raw: Any) -> float | None:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return None if value != value else round(value, 4)  # NaN -> None
