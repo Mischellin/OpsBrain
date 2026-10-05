@@ -48,3 +48,36 @@ def test_expired_change(tmp_path) -> None:  # type: ignore[no-untyped-def]
     with pytest.raises(OpsError, match="expired"):
         store.approve(change.id)
     assert store.list() == []
+
+
+def test_approve_and_discard_share_the_transition_lock(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """A discarded change must not be re-approved, and a spent one must not be re-approved either.
+
+    `consume` took a lock while `approve` and `discard` did not, so a racing `approve` could read PENDING,
+    wait for `consume` to write APPLIED, and write APPROVED back over it - handing out a second run of a
+    change that had already been applied. All three transitions now serialise on one lock.
+    """
+    store = ChangeStore(tmp_path, 3600)
+    spent = store.create("tofu.apply", "proxmox", "already applied", "h")
+    store.approve(spent.id)
+    store.consume(spent.id, "tofu.apply", "proxmox", needs_approval=True)
+    with pytest.raises(OpsError, match="is applied, not pending"):
+        store.approve(spent.id)
+
+    dropped = store.create("tofu.apply", "proxmox", "cancelled", "h")
+    store.discard(dropped.id)
+    with pytest.raises(OpsError, match="is discarded, not pending"):
+        store.approve(dropped.id)
+    with pytest.raises(OpsError, match="was discarded"):
+        store.consume(dropped.id, "tofu.apply", "proxmox", needs_approval=False)
+
+
+def test_a_change_id_is_validated_before_it_is_used_as_a_path(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    store = ChangeStore(tmp_path, 3600)
+    store.create("tofu.apply", "proxmox", "plan", "h")
+    for bad in ("../escape", "c-../../etc/passwd", "", "nope"):
+        with pytest.raises(OpsError, match="invalid change id"):
+            store.discard(bad)
+        with pytest.raises(OpsError, match="invalid change id"):
+            store.approve(bad)
+    assert not list(tmp_path.glob("*escape*")), "nothing was created outside the store"

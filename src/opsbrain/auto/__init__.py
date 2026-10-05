@@ -6,6 +6,16 @@ path is a second, policy-checked way to obtain an approval, and it is off unless
 
 from __future__ import annotations
 
+from .approval import (  # noqa: F401
+    Approval,
+    ApprovalBinding,
+    ApprovalStore,
+    LeaseState,
+    StaleReason,
+    binding_for,
+    execute_once,
+    verify,
+)
 from .evidence import (  # noqa: F401
     Check,
     EvidenceBundle,
@@ -38,6 +48,14 @@ from .service import AutoService  # noqa: F401
 
 __all__ = [
     "CONTRACT_VERSION",
+    "Approval",
+    "ApprovalBinding",
+    "ApprovalStore",
+    "LeaseState",
+    "StaleReason",
+    "binding_for",
+    "execute_once",
+    "verify",
     "ChangePlan",
     "Outcome",
     "PlanError",

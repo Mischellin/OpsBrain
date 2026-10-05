@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -30,8 +31,13 @@ def test_tofu_plan_without_changes(ops, fake) -> None:  # type: ignore[no-untype
     assert "cd /root/tofu && set -a && . /root/.tofu.env" in script and "-detailed-exitcode" in script
 
 
+PLAN_SHA = "@@OPSBRAIN-PLAN-SHA " + "ab" * 32 + "@@"
+#: The saved-plan path, as it appears inside the generated shell script.
+PLAN_PATH_RE = re.compile(r"[.]opsbrain/j-[0-9a-f]{8}[.]tfplan")
+
+
 def test_tofu_apply_requires_human_approval_and_applies_the_saved_plan(ops, fake) -> None:  # type: ignore[no-untyped-def]
-    fake.on(r"tofu plan", f"Plan: 0 to add, 1 to change, 0 to destroy.\n{JSON_MARK}\n{PLAN_JSON}\n", rc=2)
+    fake.on(r"tofu plan", f"Plan: 0 to add, 1 to change, 0 to destroy.\n{PLAN_SHA}\n{JSON_MARK}\n{PLAN_JSON}\n", rc=2)
     plan = ops.tofu_plan()
     assert plan["change"].startswith("c-") and plan["resources"] == [
         {"addr": "proxmox_vm.web", "action": "change", "attrs": ["cores"]}]
@@ -45,17 +51,82 @@ def test_tofu_apply_requires_human_approval_and_applies_the_saved_plan(ops, fake
     assert not any("tofu apply" in script for _, script in fake.calls)
 
     approve(ops, plan["change"])
+    # The runner re-hashes the saved plan in the same shell that applies it, so a plan replaced in between
+    # is refused rather than run under an approval for the original actions.
     fake.on(r"tofu apply", "Apply complete! Resources: 0 added, 1 changed, 0 destroyed.\n@@OPSBRAIN-POSTPLAN 0@@\n")
     applied = ops.tofu_apply(plan["change"])
     assert applied["ok"] and applied["applied"]["changed"] == 1 and applied["post_plan_clean"] is True
     script = next(script for _, script in fake.calls if "tofu apply" in script)
     assert ".opsbrain/j-" in script and ".tfplan" in script
+    assert "sha256sum" in script and "ab" * 32 in script, "the apply verifies the plan bytes it is about to run"
+    # The path that is hashed and the path that is applied must be the same object. Hashing the saved plan
+    # and applying the saved plan are two opens of one mutable name, so a replacement between them runs
+    # unchecked bytes under the approval that was just consumed. The copy's name comes from this shell, so
+    # a replacer cannot have chosen it in advance.
+    saved = PLAN_PATH_RE.search(script)
+    assert saved is not None, "the saved plan path is in the script"
+    assert f"cp -- {saved.group(0)} $held" in script, "the applied plan is a copy, not the saved path"
+    assert "sha256sum $held" in script, "the copy is what gets hashed"
+    assert "lock-timeout=60s $held" in script, "the copy is what gets applied"
+    # The `cd` into the stack has to come before the hash: a detached job starts in the login directory, and
+    # the plan path is relative to the stack, so hashing first reported every valid plan as missing.
+    assert script.index("cd ") < script.index("sha256sum"), "the hash runs inside the stack directory"
+    # The saved plan is removed with the copy, on every path. A saved plan left behind holds whatever the
+    # stack's variables were, on the runner, until some later plan happens to be a day old - or forever.
+    assert "held_gone" in script
+    assert "rc=$?; held_gone;" in script, "the apply path removes both files"
+    assert "held_gone; echo \"@@OPSBRAIN-PLAN-MISMATCH" in script, "so does the refusal path"
     with pytest.raises(OpsError, match="single use"):
         ops.tofu_apply(plan["change"])
 
 
+def test_the_reviewed_plan_is_one_artifact_hashed_shown_and_applied(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    """Hashing the file `tofu` wrote and then showing that file were two opens of one mutable path.
+
+    Replacing it in between gave the change record the checksum of plan A and the resource summary of
+    plan B, and restoring A before the apply passed the checksum guard with bytes nobody reviewed. So the
+    plan is written to a scratch name, copied to a held read-only artifact, and that one artifact is
+    hashed, shown and later applied.
+    """
+    fake.on(r"tofu plan", f"Plan: 0 to add, 1 to change, 0 to destroy.\n{PLAN_SHA}\n{JSON_MARK}\n{PLAN_JSON}\n", rc=2)
+    ops.tofu_plan()
+    script = next(script for _, script in fake.calls if "tofu plan" in script)
+    assert "-out=" in script
+    copy = re.search(r"cp -- (\S+) (\S+) && chmod 400 (\S+);", script)
+    assert copy is not None, "the plan is copied to a held, read-only artifact"
+    scratch, held, chmodded = copy.group(1), copy.group(2), copy.group(3)
+    assert scratch != held, "tofu writes to a scratch name; the held one is what everything else reads"
+    assert chmodded == held, "and the held artifact is the read-only one"
+    assert script.index(f"sha256sum {held}") < script.index(f"show -json {held}"), \
+        "the checksum and the document the approver reads come from the same bytes"
+    assert held in script.split("tofu show")[0], "and it is the one plan, not the scratch file"
+
+
+def test_a_replaced_plan_file_is_refused_instead_of_applied(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    """The digest the approval was granted for and the bytes on disk are the same check, not two."""
+    fake.on(r"tofu plan", f"Plan: 0 to add, 1 to change, 0 to destroy.\n{PLAN_SHA}\n{JSON_MARK}\n{PLAN_JSON}\n", rc=2)
+    plan = ops.tofu_plan()
+    approve(ops, plan["change"])
+    fake.on(r"tofu apply", "@@OPSBRAIN-PLAN-MISMATCH " + "cd" * 32 + "@@\n", rc=78)
+    out = ops.tofu_apply(plan["change"])
+    assert out["ok"] is False and out["plan_changed"] is True
+    assert out["found"] == "cd" * 32
+    assert "plan again" in out["hint"]
+    assert "post_plan_clean" not in out, "the apply never ran, so there is no post-plan result to report"
+
+
+def test_a_plan_without_a_readable_digest_is_not_offered_for_approval(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    """No digest means no check. Such a plan must not become an approvable change."""
+    fake.on(r"tofu plan", f"Plan: 0 to add, 1 to change, 0 to destroy.\n{JSON_MARK}\n{PLAN_JSON}\n", rc=2)
+    plan = ops.tofu_plan()
+    assert "next" not in plan, "an unchecksummed plan is not handed to a human for approval"
+    assert "plan digest unreadable" in plan["warning"]
+    assert not [change for change in ops.changes.list()], "no change record was created at all"
+
+
 def test_destructive_plan_is_flagged_and_needs_allow_destroy(ops, fake) -> None:  # type: ignore[no-untyped-def]
-    fake.on(r"tofu plan", f"Plan: 0 to add, 0 to change, 1 to destroy.\n{JSON_MARK}\n{DESTROY_JSON}\n", rc=2)
+    fake.on(r"tofu plan",
+            f"Plan: 0 to add, 0 to change, 1 to destroy.\n{PLAN_SHA}\n{JSON_MARK}\n{DESTROY_JSON}\n", rc=2)
     plan = ops.tofu_plan()
     assert plan["dangerous"] is True and plan["destroy"] == 1
     assert "--allow-destroy" in ops.tofu_apply(plan["change"])["next"]
@@ -214,3 +285,52 @@ def test_agent_socket_falls_back_to_launchd(config, monkeypatch) -> None:  # typ
 def test_unreachable_host_reports_the_reason(ops, fake) -> None:  # type: ignore[no-untyped-def]
     fake.on(r"uptime_s", "Permission denied (publickey).", rc=255)
     assert ops.hosts_status(["pve"])["hosts"]["pve"]["warn"] == ["unreachable: Permission denied (publickey)."]
+
+
+def test_an_interrupted_plan_does_not_leave_its_partial_file_forever(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    """The age-based sweep matched only `*.tfplan`, and an interrupted plan writes `*.partial`.
+
+    A saved plan may hold the stack's variable values, so leaving one on the runner because the shell was
+    killed mid-command is not a thing to shrug at.
+    """
+    fake.on(r"tofu plan", "No changes.")
+    ops.tofu_plan()
+    script = next(script for _, script in fake.calls if "tofu plan" in script)
+    assert "*.partial" in script, "abandoned partials are swept like saved plans"
+    assert "-mmin +1440" in script
+
+
+def test_a_marker_without_the_refusal_exit_code_does_not_override_a_successful_apply(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    """A provisioner echoing the marker must not be able to report a successful apply as "nothing applied"."""
+    fake.on(r"tofu plan", f"Plan: 0 to add, 1 to change, 0 to destroy.\n{PLAN_SHA}\n{JSON_MARK}\n{PLAN_JSON}\n", rc=2)
+    plan = ops.tofu_plan()
+    approve(ops, plan["change"])
+    fake.on(r"tofu apply", "Apply complete! Resources: 0 added, 1 changed, 0 destroyed.\n"
+                           "@@OPSBRAIN-PLAN-MISMATCH deadbeefdeadbeef@@\n@@OPSBRAIN-POSTPLAN 0@@\n")
+    out = ops.tofu_apply(plan["change"])
+    assert out["ok"] is True, "the apply's own result stands"
+    assert "plan_changed" not in out
+    assert out["marker_without_refusal"] == "deadbeefdeadbeef", "the stray marker is reported as noise"
+
+
+def test_a_refusal_still_reports_the_mismatch(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    fake.on(r"tofu plan", f"Plan: 0 to add, 1 to change, 0 to destroy.\n{PLAN_SHA}\n{JSON_MARK}\n{PLAN_JSON}\n", rc=2)
+    plan = ops.tofu_plan()
+    approve(ops, plan["change"])
+    fake.on(r"tofu apply", "@@OPSBRAIN-PLAN-MISMATCH " + "cd" * 32 + "@@\n", rc=78)
+    out = ops.tofu_apply(plan["change"])
+    assert out["ok"] is False and out["plan_changed"] is True
+
+
+def test_a_plan_with_no_usable_digest_is_removed_not_merely_refused(ops, fake) -> None:  # type: ignore[no-untyped-def]
+    """A saved plan can carry the stack's variable values.
+
+    Refusing to create a change left the file for the age-based sweep, which only runs on the next
+    `tofu plan` - so it stayed until some later plan happened to be a day old, or forever if none did.
+    """
+    fake.on(r"tofu plan", f"Plan: 0 to add, 1 to change, 0 to destroy.\n{JSON_MARK}\n{PLAN_JSON}\n", rc=2)
+    out = ops.tofu_plan()
+    assert "plan digest unreadable" in out["warning"]
+    assert not ops.changes.list(), "no change record was created, so nothing can be approved"
+    removals = [script for _, script in fake.calls if "rm -f" in script and "opsbrain/j-" in script]
+    assert removals, "the unusable plan was removed from the runner"

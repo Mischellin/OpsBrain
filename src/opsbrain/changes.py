@@ -7,16 +7,20 @@ approved by a human with `opsbrain approve <id>` on a terminal. A change is sing
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import re
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .util import OpsError, compact, new_id, now, write_private
+from .util import OpsError, compact, file_lock, new_id, now, write_private
 
 _ID = re.compile(r"^c-[0-9a-f]{8}$")
+#: The id becomes a lock filename, so it is validated as one before it is used as one.
+_CHANGE_ID = re.compile(r"^c-[0-9a-f]{8,64}$")
 PENDING, APPROVED, APPLIED, DISCARDED = "pending", "approved", "applied", "discarded"
 
 
@@ -88,44 +92,76 @@ class ChangeStore:
         return sorted(changes, key=lambda change: change.created, reverse=True)
 
     def approve(self, change_id: str, *, allow_dangerous: bool = False) -> Change:
-        change = self.get(change_id)
-        if change.state != PENDING:
-            raise OpsError(f"change {change_id} is {change.state}, not pending")
-        if change.expired:
-            raise OpsError(f"change {change_id} has expired; plan again")
-        if change.dangerous and not allow_dangerous:
-            raise OpsError(f"change {change_id} destroys or replaces resources: approve with --allow-destroy")
-        change.state, change.allow_dangerous, change.decided_at = APPROVED, allow_dangerous, now()
-        self._save(change)
+        # approve/discard/consume are three transitions of one record and share one lock. Locking only
+        # `consume` leaves the window this closes: a concurrent `approve` reads PENDING, `consume` writes
+        # APPLIED, and `approve` writes APPROVED back over it - handing out a second run of a spent change.
+        with self._transition(change_id):
+            change = self.get(change_id)
+            if change.state != PENDING:
+                raise OpsError(f"change {change_id} is {change.state}, not pending")
+            if change.expired:
+                raise OpsError(f"change {change_id} has expired; plan again")
+            if change.dangerous and not allow_dangerous:
+                raise OpsError(f"change {change_id} destroys or replaces resources: "
+                               f"approve with --allow-destroy")
+            change.state, change.allow_dangerous, change.decided_at = APPROVED, allow_dangerous, now()
+            self._save(change)
         return change
 
     def discard(self, change_id: str) -> Change:
-        change = self.get(change_id)
-        if change.state not in (PENDING, APPROVED):
-            raise OpsError(f"change {change_id} is already {change.state}")
-        change.state, change.decided_at = DISCARDED, now()
-        self._save(change)
+        # The whole read-check-write is inside the lock. Taking it only around the read - as an earlier fix
+        # did - serialises nothing at all: the check and the write still straddle the unlock.
+        with self._transition(change_id):
+            change = self.get(change_id)
+            if change.state not in (PENDING, APPROVED):
+                raise OpsError(f"change {change_id} is already {change.state}")
+            change.state, change.decided_at = DISCARDED, now()
+            self._save(change)
         return change
 
     def consume(self, change_id: str, capability: str, target: str, *, needs_approval: bool,
                 content_hash: str | None = None) -> Change:
-        """Validates and burns the change. Raises unless everything matches."""
-        change = self.get(change_id)
-        if change.capability != capability or change.target != target:
-            raise OpsError(f"change {change_id} is for {change.capability}:{change.target}")
-        if change.expired:
-            raise OpsError(f"change {change_id} has expired; plan again")
-        if change.state == APPLIED:
-            raise OpsError(f"change {change_id} was already applied (single use)")
-        if change.state == DISCARDED:
-            raise OpsError(f"change {change_id} was discarded")
-        if content_hash is not None and content_hash != change.hash:
-            raise OpsError(f"change {change_id}: the code or arguments changed since it was planned; plan again")
-        if change.dangerous and not change.allow_dangerous:
-            raise OpsError(f"change {change_id} is destructive: a human must run "
-                           f"`opsbrain approve {change_id} --allow-destroy`")
-        if needs_approval and change.state != APPROVED:
-            raise OpsError(f"change {change_id} is not approved: a human must run `opsbrain approve {change_id}`")
-        change.state, change.decided_at = APPLIED, now()
-        self._save(change)
-        return change
+        """Validates and burns the change, atomically. Raises unless everything matches.
+
+        The read-check-write is one critical section. Two HTTP requests, or two OpsBrain processes, both
+        used to read APPROVED before either wrote APPLIED, and both ran the mutation - which breaks the
+        single-use guarantee in exactly the case it exists for: a retry, or a double submit.
+        """
+        with self._transition(change_id):
+            change = self.get(change_id)
+            if change.capability != capability or change.target != target:
+                raise OpsError(f"change {change_id} is for {change.capability}:{change.target}")
+            if change.expired:
+                raise OpsError(f"change {change_id} has expired; plan again")
+            if change.state == APPLIED:
+                raise OpsError(f"change {change_id} was already applied (single use)")
+            if change.state == DISCARDED:
+                raise OpsError(f"change {change_id} was discarded")
+            if content_hash is not None and content_hash != change.hash:
+                raise OpsError(
+                    f"change {change_id}: the code or arguments changed since it was planned; plan again")
+            if change.dangerous and not change.allow_dangerous:
+                raise OpsError(f"change {change_id} is destructive: a human must run "
+                               f"`opsbrain approve {change_id} --allow-destroy`")
+            if needs_approval and change.state != APPROVED:
+                raise OpsError(f"change {change_id} is not approved: a human must run `opsbrain approve "
+                               f"{change_id}`")
+            change.state, change.decided_at = APPLIED, now()
+            self._save(change)
+            return change
+
+    @contextlib.contextmanager
+    def _transition(self, change_id: str) -> Iterator[None]:
+        """Exclusive over the whole store directory, so two processes cannot consume one change.
+
+        A kernel-held lock, not a lock file reclaimed by age. Reclaiming by mtime let a *slow* process -
+        a stalled write, a suspended one - lose its lock to a second writer, and when it finally ran its
+        cleanup it unlinked the replacement, admitting a third. Two read-modify-write passes then
+        interleaved on one record, which is the thing the lock exists to prevent. `flock` cannot fail that
+        way: the kernel drops it when the holder dies, so a crash needs no reclaim at all.
+        """
+        if not _CHANGE_ID.fullmatch(change_id):
+            # The id reaches a filename, so it is checked before it is used as one.
+            raise OpsError(f"invalid change id: {change_id!r}")
+        with file_lock(self.root / f"{change_id}.transition.lock"):
+            yield
