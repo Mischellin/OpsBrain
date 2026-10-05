@@ -464,7 +464,9 @@ def test_a_spent_approval_does_not_open_a_second_run(ops, tmp_path) -> None:  # 
                    "subject": f"{change.capability}:{change.target}", "targets": [change.target],
                    "evidence_ids": ["ev-aaaaaaaabbbbbbbb"], "policy_version": "v1",
                    "profile": bound_for(change).profile,
-                   "change_id": bound_for(change).change_id}
+                   "profile_version": bound_for(change).profile_version,
+                   "change_id": bound_for(change).change_id,
+                   "profile_requirements": bound_for(change).profile_requirements}
     engine.approvals.consume(approval, binding_now, owner="w", idempotency_key="k")
     ops.changes.attach_approval(change.id, approval)
     with pytest.raises(OpsError, match="consumed"):
@@ -1381,6 +1383,30 @@ def test_a_report_naming_this_plan_is_accepted_by_a_service_that_produced_it(ops
     assert out["decision"]["decision"] == "APPROVE", out["decision"].get("detail", out)
 
 
+# ------------------------------------------------------- the profile's own requirements, and identity
+def test_a_profile_that_requires_evidence_refuses_a_plan_that_cites_none(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`allowed_*` and `allow_autonomous` were the only fields enforced.
+
+    A profile could demand evidence, preconditions, verification or a second review and still see an
+    APPROVE with none of them, because nothing read those four lists.
+    """
+    from opsbrain.auto.config import AutoConfig
+
+    ops.config = ops.config.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
+        decision={"mode": "autonomous"},
+        profiles=[_profile(require_evidence=["inventory"])])})
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    assert ops.auto.review_plan(plan)["outcome"] == "approvable"
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY"
+    assert "requires evidence" in out["decision"]["detail"]
+
+
 def test_an_approval_is_labelled_with_the_profile_the_plan_was_reviewed_under(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
     """The default profile is the default for a plan that names none - not for one that names another.
 
@@ -1608,6 +1634,100 @@ def test_the_refusal_code_is_one_a_client_can_enumerate() -> None:
     assert DecisionReason.PLAN_CHANGED.value in set(all_reason_codes())
 
 
+def test_tightening_a_profile_makes_the_approvals_it_granted_stale(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """#9: a profile is a set of requirements that can be rewritten in place.
+
+    Requiring an extra review of `secrets` left every approval already issued under it spendable, because
+    nothing in the binding had moved - it named the profile, and the profile still had the same name. A
+    version is the fact that makes a requirements change visible.
+    """
+    from opsbrain.auto.approval import ApprovalStore
+    from opsbrain.auto.config import AutoConfig, PolicyProfileConfig
+    from opsbrain.auto.decision import ApprovalEngine
+
+    def config_with(version: str) -> Any:
+        return AutoConfig(
+            enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
+            decision={"mode": "autonomous", "default_profile": "general"},
+            profiles=[PolicyProfileConfig(name="general"),
+                      PolicyProfileConfig(name="secrets", allowed_targets=["proxmox"], version=version)])
+
+    ops.config = ops.config.model_copy(update={"auto": config_with("1")})
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id), profile="secrets")
+    ops.auto.review_plan(plan)
+    approval = ops.auto.decide_change(change.id, plan.id)["approval"]
+    assert ApprovalStore(ops.auto.root / "approvals").get(approval).binding.profile_version == "1"
+
+    # The operator tightens the same profile. Its name is unchanged; its requirements are not.
+    # A fresh engine over the tightened configuration - the same way a restarted server would see it.
+    from opsbrain.auto.approval import ApprovalStore as Store
+
+    engine = ApprovalEngine(ops.config.model_copy(update={"auto": config_with("2")}).auto,
+                            Store(ops.auto.root / "approvals"))
+    assert Store(ops.auto.root / "approvals").get(approval).binding.profile_version == "1"
+    with pytest.raises(OpsError, match="profile_version_changed"):
+        engine.gate(ops.changes.get(change.id), spend=False)
+
+
+def test_a_risk_class_is_a_floor_the_profile_cannot_go_below() -> None:
+    """`classification` used to be a word in a config file.
+
+    `extra_reviews: 1` on a `critical` profile meant one review, and nothing said that was too few. Now
+    the class states how many reviews it is worth and a configuration asking for fewer is rejected at
+    load time rather than quietly governing less than its own name claims.
+    """
+    from opsbrain.auto.config import PolicyProfileConfig
+
+    assert PolicyProfileConfig(name="general", classification="low", extra_reviews=0).min_reviews == 0
+    with pytest.raises(ValueError, match="requires at least 1 review"):
+        PolicyProfileConfig(name="general", classification="medium", extra_reviews=0)
+    with pytest.raises(ValueError, match="requires at least 2 review"):
+        PolicyProfileConfig(name="general", classification="high", extra_reviews=1)
+    # Exceeding the floor is fine - the profile may be stricter than its class.
+    assert PolicyProfileConfig(name="general", classification="medium", extra_reviews=3).min_reviews == 1
+
+
+def test_a_serious_class_must_state_whether_autonomy_is_allowed() -> None:
+    """`allow_autonomous` defaults to True, and a `critical` profile should not inherit that silently."""
+    from opsbrain.auto.config import PolicyProfileConfig
+
+    with pytest.raises(ValueError, match="allow_autonomous must be stated"):
+        PolicyProfileConfig(name="general", classification="critical", extra_reviews=2)
+    explicit = PolicyProfileConfig(name="general", classification="critical", extra_reviews=2,
+                                   allow_autonomous=False)
+    assert explicit.allow_autonomous is False
+
+
+def test_a_class_floor_is_met_by_actually_running_the_reviews(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The floor is a promise the system keeps, not a wall a caller hits.
+
+    `review_plan` asks the profile how many reviews its class is worth and runs that many, so a `medium`
+    profile gets its two sessions and the decision proceeds. The refusal remains for the case where the
+    runner cannot deliver them.
+    """
+    from opsbrain.auto.config import AutoConfig, PolicyProfileConfig
+
+    ops.config = ops.config.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
+        decision={"mode": "autonomous", "default_profile": "secrets"},
+        profiles=[PolicyProfileConfig(name="secrets", classification="medium", extra_reviews=2,
+                                      allowed_targets=["proxmox"], allow_autonomous=True)])})
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id), profile="secrets")
+    assert ops.auto._required_runs(plan) == 2, "the class says two, and the reviewer is asked for two"
+    ops.auto.review_plan(plan)
+    assert len(ops.auto.preflight().get_by_plan(plan.id)["review_refs"]) == 2
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "APPROVE", out["decision"].get("detail", out)
+
+
 def test_a_configured_review_floor_is_satisfiable_when_the_reviews_really_ran(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
     """`decision.required_reviews` was compared against a number nothing ever set.
 
@@ -1634,7 +1754,7 @@ def test_a_configured_review_floor_is_satisfiable_when_the_reviews_really_ran(op
                                 args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
                                 details={"plan_sha256": "ab" * 32})
     plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id), profile="secrets")
-    ops.auto.review_plan(plan, runs=2)  # #9 derives this from the profile
+    ops.auto.review_plan(plan)
     assert len(ops.auto.preflight().get_by_plan(plan.id)["review_refs"]) == 2, "two reviews really ran"
     out = ops.auto.decide_change(change.id, plan.id)
     assert out["decision"]["decision"] == "APPROVE", (
@@ -1676,11 +1796,64 @@ def test_two_reviews_that_disagree_block_the_decision(ops, tmp_path) -> None:  #
                                 args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
                                 details={"plan_sha256": "ab" * 32})
     plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id), profile="secrets")
-    ops.auto.review_plan(plan, runs=2)  # #9 derives this from the profile
+    ops.auto.review_plan(plan)
     out = ops.auto.decide_change(change.id, plan.id)
     assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY", (
         "the last review passing does not make two disagreeing reviews agree")
     assert "disagree" in out["decision"]["detail"], out["decision"]["detail"]
+
+
+def test_a_floor_the_runner_cannot_meet_still_blocks(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """If the second session cannot be produced, the class floor is not quietly waived."""
+    from opsbrain.auto.config import AutoConfig, PolicyProfileConfig
+
+    ops.config = ops.config.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token=TOKEN, review={"runner": "codex", "max_retries": 0},
+        decision={"mode": "autonomous", "default_profile": "secrets"},
+        profiles=[PolicyProfileConfig(name="secrets", classification="high", extra_reviews=2,
+                                      allowed_targets=["proxmox"], allow_autonomous=True)])})
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id), profile="secrets")
+    ops.auto.review_plan(plan)
+    record = ops.auto.preflight().get_by_plan(plan.id)
+    # A second session that failed is not a second session.
+    record["review_refs"] = record["review_refs"][:1]
+    ops.auto.preflight().store.put(f"pf-{plan.plan_hash[:16]}", record)
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY"
+    assert "2 reviews (high class, 1 ran)" in out["decision"]["detail"]
+
+
+def test_a_profile_requirement_is_matched_against_its_field_not_against_prose(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Saying "systemd" in the diagnosis is not declaring `systemd:unit-start`.
+
+    The requirements were matched by substring against the whole plan, which is a textual substitute for a
+    structured requirement - and structured requirements are the entire point of a profile.
+    """
+    from opsbrain.auto.config import AutoConfig, PolicyProfileConfig
+
+    ops.config = ops.config.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
+        decision={"mode": "autonomous", "default_profile": "secrets"},
+        profiles=[PolicyProfileConfig(name="secrets", allowed_targets=["proxmox"],
+                                      require_verification=["systemd:unit-start"])])})
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id), profile="secrets")
+    ops.auto.review_plan(plan)
+    from opsbrain.auto.plan import ChangePlan
+
+    stored = ChangePlan.from_dict(ops.auto.preflight().get_by_plan(plan.id)["plan_document"])
+    assert stored.profile == "secrets", "the profile survives into the record the decision reads"
+    assert ops.auto._profile_gaps(stored, change, review_ids=("rv-0000abcd",)), "and is what the gate uses"
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY"
+    assert "systemd:unit-start" in out["decision"]["detail"]
 
 
 def test_a_needs_evidence_verdict_reaches_the_retry_branch() -> None:
@@ -1778,6 +1951,51 @@ def test_the_advertised_mcp_flow_can_actually_be_started(ops, tmp_path) -> None:
         "the steps the instructions name are the ones the action table carries")
 
 
+def test_a_profile_rewritten_without_a_version_bump_still_invalidates_its_approvals(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The version is a label the operator bumps; the requirements digest is the content behind it.
+
+    Tightening `secrets` without touching `version` changed the rules while keeping both the name and the
+    label, so "approved under `secrets` v1" stayed true and the approval remained spendable. This is the
+    last piece of OPS-AUTO-10: the history of a decision now says what it was decided under.
+    """
+    from opsbrain.auto.approval import ApprovalStore
+    from opsbrain.auto.config import AutoConfig, PolicyProfileConfig
+
+    def cfg(extra_reviews: int) -> Any:
+        return AutoConfig(
+            enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
+            decision={"mode": "autonomous", "default_profile": "secrets"},
+            profiles=[PolicyProfileConfig(name="secrets", version="1", extra_reviews=extra_reviews,
+                                          allowed_targets=["proxmox"], allow_autonomous=True)])
+
+    ops.config = ops.config.model_copy(update={"auto": cfg(1)})
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id), profile="secrets")
+    ops.auto.review_plan(plan)
+    approval = ops.auto.decide_change(change.id, plan.id)["approval"]
+    granted_under = ApprovalStore(ops.auto.root / "approvals").get(approval).binding.profile_requirements
+    assert granted_under, "the approval records what the profile stood for, not only its name"
+
+    # The operator tightens the rules and forgets to bump the version.
+    engine = ApprovalEngine(ops.config.model_copy(update={"auto": cfg(3)}).auto,
+                            ApprovalStore(ops.auto.root / "approvals"))
+    with pytest.raises(OpsError, match="profile_requirements_changed"):
+        engine.gate(ops.changes.get(change.id), spend=False)
+
+
+def test_two_profiles_with_one_name_and_different_rules_are_distinguishable() -> None:
+    from opsbrain.auto.config import PolicyProfileConfig
+
+    tight = PolicyProfileConfig(name="secrets", allowed_targets=["p"], extra_reviews=2)
+    loose = PolicyProfileConfig(name="secrets", allowed_targets=["p"])
+    assert tight.requirements_digest() != loose.requirements_digest()
+    assert tight.requirements_digest() == PolicyProfileConfig(
+        name="secrets", allowed_targets=["p"], extra_reviews=2).requirements_digest()
+
+
 def test_a_change_discarded_before_publication_leaves_no_approval_and_stays_decidable(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
     """The state check, the publish and the record have to be one step, not three in a row.
 
@@ -1861,6 +2079,58 @@ def test_an_autonomous_ansible_apply_settles_its_lease_when_the_job_finishes(ops
     assert settled.outcome.get("executed") is True, (
         f"the job ran and the record still says the approval was not executed: {settled.outcome}")
     assert settled.state.value == "consumed", settled.state
+
+
+def test_a_profile_that_does_not_allow_unrecoverable_work_refuses_a_plan_that_proposes_it(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`irreversible` says whether this class may accept unrecoverable work, so false has to refuse.
+
+    Read only as "must carry a reason", the flag let an `IRREVERSIBLE` step through every profile that
+    left it at its default - on the strength of the reason field the plan duly supplied. `change.dangerous`
+    is an independent field and need not catch it.
+    """
+    from opsbrain.auto.config import AutoConfig, PolicyProfileConfig
+    from opsbrain.auto.plan import ChangePlan, ProposedChange, Reversibility
+
+    def plan_with(bundle_id: str) -> Any:
+        return ChangePlan.build(
+            objective="drain the old nodes", diagnosis="they hold state nothing else has",
+            changes=[ProposedChange(capability="tofu.apply", target="web-1", how="drain and remove",
+                                    arguments=dict(PLAN_ARGS), reversible=Reversibility.IRREVERSIBLE,
+                                    irreversible_reason="state is not replicated anywhere else")],
+            evidence_refs=[bundle_id], evidence_bundle=bundle_id, targets=["web-1"],
+            post_checks=["systemctl show logrotate.service"], rollback="", versions={"systemd": "252"},
+            profile="secrets", created=1_700_000_000.0)
+
+    ops.config = ops.config.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
+        decision={"mode": "autonomous", "default_profile": "secrets"},
+        profiles=[PolicyProfileConfig(name="secrets", extra_reviews=1, allowed_targets=["web-1"],
+                                      irreversible=False)])})
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "web-1", "drain", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = plan_with(_bundle(ops, tmp_path, change.id))
+    ops.auto.review_plan(plan)
+    out = ops.auto.decide_change(change.id, plan.id)
+    assert out["decision"]["decision"] == "BLOCKED_AUTONOMOUSLY", out
+    assert "unrecoverable" in out["decision"]["detail"], out["decision"]["detail"]
+
+    # And a profile that does enable it is not blocked on the same plan.
+    ops.config = ops.config.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token=TOKEN, review={"runner": "codex"},
+        decision={"mode": "autonomous", "default_profile": "secrets"},
+        profiles=[PolicyProfileConfig(name="secrets", extra_reviews=1, allowed_targets=["web-1"],
+                                      irreversible=True)])})
+    _autonomous_ops(ops, tmp_path)
+    other = ops.changes.create("tofu.apply", "web-1", "drain the old nodes", "ph-1",
+                               args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                               details={"plan_sha256": "ab" * 32})
+    permitted = plan_with(_bundle(ops, tmp_path, other.id))
+    allowed = ops.auto.review_plan(permitted)
+    assert allowed["outcome"] == "approvable", allowed
+    assert ops.auto.decide_change(other.id, permitted.id)["decision"]["decision"] == "APPROVE", (
+        "a profile that enables unrecoverable work is not blocked on the same plan")
 
 
 def test_turning_off_allow_destructive_invalidates_an_approval_that_was_minted_with_it_on(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]

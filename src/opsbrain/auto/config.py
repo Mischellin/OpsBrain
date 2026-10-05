@@ -13,6 +13,7 @@ from typing import Any
 from pydantic import Field, field_validator, model_validator
 
 from ..models import Access, _Model
+from ..util import digest as _digest
 
 PROFILE_NAMES = ("general", "network", "firewall", "vpn", "reboot", "auth", "secrets", "storage",
                  "k8s-control-plane", "dns")
@@ -159,11 +160,26 @@ class DecisionConfig(_Model):
         return self.mode == "autonomous" and not self.emergency_stop
 
 
+#: How many independent reviews each risk class is worth. A class that needs two reviews cannot be
+#: configured down to one - that is the whole point of naming it.
+_CLASSIFICATION_REVIEWS: dict[str, int] = {"low": 0, "medium": 1, "high": 2, "critical": 2}
+_CLASSIFICATIONS = tuple(_CLASSIFICATION_REVIEWS)
+#: Classes where "a human can decide" must be written down, not inherited from a default of True.
+_NEEDS_EXPLICIT_AUTONOMY = frozenset({"high", "critical"})
+
+
 class PolicyProfileConfig(_Model):
     """Per-profile requirements. `classification` is derived from config, never from a worker's claim."""
 
     name: str
     classification: str = "low"
+    #: What this profile means *now*, bumped by the operator whenever its requirements change.
+    #:
+    #: An approval is bound to the profile that granted it, and a profile is a set of requirements that
+    #: can be rewritten in place. Without a version, tightening `secrets` to require an extra review left
+    #: every approval already issued under it spendable: nothing in the binding had moved, because the
+    #: binding only named the profile. With one, a requirements change is a fact the gate can see.
+    version: str = "1"
     require_evidence: list[str] = Field(default_factory=list)
     require_preconditions: list[str] = Field(default_factory=list)
     require_verification: list[str] = Field(default_factory=list)
@@ -184,9 +200,55 @@ class PolicyProfileConfig(_Model):
     @field_validator("classification")
     @classmethod
     def _class(cls, value: str) -> str:
-        if value not in ("low", "medium", "high", "critical"):
-            raise ValueError("classification must be low | medium | high | critical")
+        if value not in _CLASSIFICATIONS:
+            raise ValueError(f"classification must be one of {list(_CLASSIFICATIONS)}")
         return value
+
+    @model_validator(mode="after")
+    def _classification_is_a_floor(self) -> PolicyProfileConfig:
+        """The risk class sets a *minimum*, and the profile may exceed it but never undercut it.
+
+        A classification that only labelled the profile was a word in a config file: `extra_reviews: 1` on
+        a `critical` profile meant one review, and nothing anywhere said that was too few. Now the class
+        says how many reviews the class is worth, and a configuration that asks for fewer is rejected at
+        load time rather than quietly governing less than its own name claims.
+        """
+        floor = _CLASSIFICATION_REVIEWS[self.classification]
+        if self.extra_reviews < floor:
+            raise ValueError(
+                f"profile {self.name!r} is classified {self.classification!r}, which requires at least "
+                f"{floor} review(s), but extra_reviews is {self.extra_reviews}")
+        if self.classification in _NEEDS_EXPLICIT_AUTONOMY and "allow_autonomous" not in self.model_fields_set:
+            raise ValueError(
+                f"profile {self.name!r} is classified {self.classification!r}, so allow_autonomous must be "
+                f"stated explicitly rather than defaulted: the default is True, and a class this serious "
+                f"should not inherit it silently")
+        return self
+
+    @property
+    def min_reviews(self) -> int:
+        """How many independent reviews this class is worth, whatever the profile asks for."""
+        return _CLASSIFICATION_REVIEWS[self.classification]
+
+    def requirements_digest(self) -> str:
+        """A hash over what this profile actually requires - everything that governs a decision.
+
+        The name and the version are what an approval records; this is what they stand for. Without it,
+        "the change was approved under `secrets`" cannot be read back as "under *these* rules", and two
+        profiles sharing a name across a rewrite are indistinguishable.
+        """
+        return _digest({
+            "classification": self.classification,
+            "require_evidence": sorted(self.require_evidence),
+            "require_preconditions": sorted(self.require_preconditions),
+            "require_verification": sorted(self.require_verification),
+            "allowed_targets": sorted(self.allowed_targets),
+            "allowed_capabilities": sorted(self.allowed_capabilities),
+            "recovery_actions": sorted(self.recovery_actions),
+            "extra_reviews": self.extra_reviews,
+            "irreversible": self.irreversible,
+            "allow_autonomous": self.allow_autonomous,
+        })
 
 
 class VerifyConfig(_Model):

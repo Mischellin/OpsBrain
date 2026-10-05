@@ -219,8 +219,15 @@ class ApprovalEngine:
         # The profile in force is the one the plan was reviewed under, recorded at issuance - not the
         # configured default, which is only the default for a plan that names no profile of its own.
         in_force = str(change.details.get("profile") or self.config.decision.default_profile)
+        # The version *currently configured*, not the one recorded at issuance - exactly as with the
+        # policy version above. Comparing against the recorded one would make the check a tautology: the
+        # binding and the record would always agree, and tightening a profile would change nothing.
+        configured = self._profile_config(in_force)
+        in_force_version = configured.version
+        in_force_requirements = configured.requirements_digest()
         reasons = stale_reasons(approval.binding, self._current_for(
-            change, self.config.decision.policy_version, in_force))
+            change, self.config.decision.policy_version, in_force, in_force_version,
+            in_force_requirements))
         if reasons:
             raise OpsError(f"approval {approval.id} is STALE ({', '.join(reasons)})")
         # The destructive opt-in, re-read at the moment the approval is spent. It is a kill switch, and a
@@ -244,12 +251,14 @@ class ApprovalEngine:
             if approval.outcome.get("idempotency_key") == f"change:{change.id}":
                 return True
             self.approvals.consume(approval.id, self._current_for(
-                change, self.config.decision.policy_version, in_force),
+                change, self.config.decision.policy_version, in_force, in_force_version,
+                in_force_requirements),
                                    owner=f"engine:{change.id}", idempotency_key=f"change:{change.id}")
         return True
 
     @staticmethod
-    def _current_for(change: Any, policy_version: str, profile: str) -> dict[str, Any]:
+    def _current_for(change: Any, policy_version: str, profile: str,
+                     profile_version: str = "1", profile_requirements: str = "") -> dict[str, Any]:
         """The change's own facts, as the approval must be checked against them.
 
         Derived from the record, never from the binding: comparing `binding.evidence_ids` with
@@ -276,7 +285,17 @@ class ApprovalEngine:
             # policy version. Without it the comparison is equal by construction and a reclassification
             # from `general` to a stricter profile would leave the approval spendable.
             "profile": profile,
+            "profile_version": profile_version,
+            "profile_requirements": profile_requirements,
         }
+
+    def _profile_config(self, name: str) -> Any:
+        """The configured profile, or a stand-in that grants nothing when the operator defined none."""
+        for profile in self.config.profiles:
+            if profile.name == name:
+                return profile
+        return type("Absent", (), {"version": "1", "name": name,
+                                  "requirements_digest": staticmethod(lambda: "")})()
 
     def _budget_exhausted(self, inputs: Inputs) -> str:
         """Which of the operator's ceilings this workflow has already reached, if any.
@@ -639,6 +658,8 @@ class ApprovalEngine:
                 binding.change_id, approval_id, evidence_ids=list(binding.evidence_ids),
                 policy_version=binding.policy_version, plan_id=plan_id, decision=record.decision.value,
                 arguments_hash=binding.arguments_hash, profile=binding.profile,
+                profile_version=binding.profile_version,
+                profile_requirements=binding.profile_requirements,
                 decision_record=record.to_dict())
         except OpsError:
             self.approvals.withdraw(approval_id, binding)

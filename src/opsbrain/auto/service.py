@@ -27,7 +27,7 @@ from .config import AutoConfig
 from .decision import ApprovalEngine, Reason
 from .evidence import EvidenceBundle, EvidenceCollector, EvidenceStore, Observation, check_evidence, passed, reason_code
 from .ledger import BudgetLedger
-from .plan import ChangePlan
+from .plan import ChangePlan, Reversibility
 from .preflight import Outcome, Preflight, PreflightResult, unverified_targets, verification_targets
 from .review import (
     CONTRACT_VERSION,
@@ -419,7 +419,7 @@ class AutoService:
         # `runs` defaults to what the plan's own profile asks for. Making the caller pass it would let a
         # profile demanding two reviews be satisfied by one, because the caller decides and the caller can
         # be wrong - the same shape as a caller supplying the verdict itself.
-        wanted = max(1, runs) if runs is not None else 1
+        wanted = max(1, runs) if runs is not None else self._required_runs(plan)
         result: PreflightResult = self.preflight().run(plan, bundle, runs=wanted)
         self.audit.record(event="preflight", plan=plan.id, outcome=result.outcome.value,
                           approvable=result.approvable, reason=result.reason, review=result.review_id)
@@ -590,6 +590,11 @@ class AutoService:
                 secondary_verdict = str(other.get("verdict") or "")
             except OpsError:
                 secondary_status, secondary_verdict = "", ""
+        unmet = self._profile_gaps(plan, change, review_ids=review_ids)
+        if unmet:
+            return self._decision_refused(change_id, plan_id,
+                                          f"profile {plan.profile!r} requires {unmet}, and this plan does "
+                                          f"not state them", review_id=result.review_id)
         # `Core.require` *raises* on a denial, so asking it left `policy_allows` permanently true and
         # the engine's documented DENY/policy_forbids outcome unreachable for a real denied change -
         # callers saw an unstructured tool error instead. The decision is taken here and the policy
@@ -682,6 +687,10 @@ class AutoService:
                               policy_version=self.auto.decision.policy_version,
                               arguments_hash=arguments,
                               profile=plan.profile or self.auto.decision.default_profile,
+                              profile_version=(self._profile_for(plan).version
+                                               if self._profile_for(plan) else "1"),
+                              profile_requirements=(self._profile_for(plan).requirements_digest()
+                                                    if self._profile_for(plan) else ""),
                               evidence_expires_in_s=evidence_remaining)
         # The engine records the decision and attaches the approval under the change's own transition, so
         # there is no second, unsynchronised write here to lose a race against a `discard`.
@@ -732,6 +741,69 @@ class AutoService:
         from ..policy import decide as policy_decide
 
         return policy_decide(self.core.config.policy, change.capability, change.target)
+
+    def _required_runs(self, plan: Any) -> int:
+        """How many independent reviews the plan's profile is worth."""
+        profile = self._profile_for(plan)
+        return 1 if profile is None else max(1, profile.extra_reviews, profile.min_reviews)
+
+    def _profile_gaps(self, plan: Any, change: Any, *,
+                      review_ids: Sequence[str] = ()) -> str:
+        """What this plan does not state that its profile requires, as one readable clause.
+
+        `allowed_*` and `allow_autonomous` were the only fields enforced, so a profile could demand
+        evidence, preconditions, verification or a second review and still see an APPROVE with none.
+        """
+        profile = self._profile_for(plan)
+        if profile is None:
+            return ""
+        missing: list[str] = []
+        for field, required in (("evidence", profile.require_evidence),
+                                ("precondition", profile.require_preconditions),
+                                ("verification", profile.require_verification)):
+            missing += [f"{field} {item!r}" for item in required
+                        if not self._plan_states(plan, field, item)]
+        # The effective floor, which is the class's - the configured number can only be higher, because
+        # the config layer refuses a profile that asks for less than its own classification is worth.
+        needed = max(profile.extra_reviews, profile.min_reviews)
+        if needed and len(review_ids) < needed:
+            missing.append(f"{needed} reviews ({profile.classification} class, {len(review_ids)} ran)")
+        if profile.irreversible and not any(step.irreversible_reason for step in plan.changes):
+            missing.append("an irreversible_reason on its steps")
+        # And the other direction, which the line above never covered. `irreversible` says whether this
+        # class may accept unrecoverable work, so a profile that does not enable it has to *refuse* a
+        # plan that proposes some - not merely stop asking for a reason. Reading the flag only as "must
+        # carry a reason" let an `IRREVERSIBLE` step through every profile, on the strength of the reason
+        # field it duly supplied, and `change.dangerous` is an independent field that need not catch it.
+        if not profile.irreversible:
+            unrecoverable = [step.how for step in plan.changes
+                             if step.reversible.value == Reversibility.IRREVERSIBLE.value]
+            if unrecoverable:
+                missing.append(f"profile {profile.name!r} does not accept unrecoverable work, and this plan "
+                               f"proposes {len(unrecoverable)}: {'; '.join(sorted(unrecoverable))[:120]}")
+        return ", ".join(missing)
+
+    @staticmethod
+    def _plan_states(plan: Any, field: str, item: str) -> bool:
+        """Whether one structured field of the plan carries the thing a profile names.
+
+        Field by field, never by searching the whole plan. A prose match meant `require_verification:
+        [systemd:unit-start]` was satisfied by the word "systemd" appearing in the diagnosis, with no step
+        declaring that check at all - a textual substitute for a structured requirement, which is the one
+        thing a profile is for.
+        """
+        wanted = item.casefold().strip()
+        if field == "verification":
+            return any(step.declared_check.casefold() == wanted for step in plan.changes)
+        if field == "evidence":
+            named = {ref.casefold() for ref in plan.evidence_refs}
+            if plan.evidence_bundle:
+                named.add(plan.evidence_bundle.casefold())
+            return wanted in named
+        if field == "precondition":
+            return any(wanted in line.casefold() or line.casefold() in wanted
+                       for line in plan.preconditions)
+        return False
 
     def _profile_for(self, plan: Any) -> Any:
         """The policy profile the plan is filed under, or None when the operator defined none."""

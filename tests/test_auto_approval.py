@@ -45,7 +45,9 @@ def current(**overrides: Any) -> dict[str, Any]:
     binding = a_binding()
     base: dict[str, Any] = {"plan_hash": binding.plan_hash, "arguments_hash": binding.arguments_hash,
                             "subject": binding.subject, "policy_version": binding.policy_version,
-                            "profile": binding.profile, "change_id": binding.change_id,
+                            "profile": binding.profile, "profile_version": binding.profile_version,
+                            "change_id": binding.change_id,
+                            "profile_requirements": binding.profile_requirements,
                             "targets": list(binding.targets), "evidence_ids": list(binding.evidence_ids)}
     return {**base, **overrides}
 

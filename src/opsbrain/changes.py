@@ -206,6 +206,7 @@ class ChangeStore:
     # `list[str]` annotation here is not a type at all and mypy is right to say so.
     def record_decision_inputs(self, change_id: str, *, evidence_ids: Sequence[str], policy_version: str,
                               plan_id: str, decision: str, arguments_hash: str = "", profile: str = "",
+                              profile_version: str = "", profile_requirements: str = "",
                               decision_record: dict[str, Any] | None = None) -> Change:
         """Record what the decision engine decided against, so the gate can check it later.
 
@@ -221,14 +222,15 @@ class ChangeStore:
             change = self._record_decision_locked(change_id, evidence_ids=evidence_ids,
                                                   policy_version=policy_version, plan_id=plan_id,
                                                   decision=decision, arguments_hash=arguments_hash,
-                                                  profile=profile,
+                                                  profile=profile, profile_version=profile_version,
+                                                  profile_requirements=profile_requirements,
                                                   decision_record=decision_record)
             self._save(change)
         return change
 
     def record_and_attach(self, change_id: str, approval_id: str, *, evidence_ids: Sequence[str],
                           policy_version: str, plan_id: str, decision: str, arguments_hash: str = "",
-                          profile: str = "",
+                          profile: str = "", profile_version: str = "", profile_requirements: str = "",
                           decision_record: dict[str, Any] | None = None) -> Change:
         """Record what was decided *and* attach the approval, inside one transition.
 
@@ -250,7 +252,8 @@ class ChangeStore:
             change = self._record_decision_locked(change_id, evidence_ids=evidence_ids,
                                                   policy_version=policy_version, plan_id=plan_id,
                                                   decision=decision, arguments_hash=arguments_hash,
-                                                  profile=profile,
+                                                  profile=profile, profile_version=profile_version,
+                                                  profile_requirements=profile_requirements,
                                                   decision_record=decision_record)
             change.engine_approval = approval_id
             self._save(change)
@@ -264,6 +267,10 @@ class ChangeStore:
                           "policy_version": fields["policy_version"], "plan_id": fields["plan_id"],
                           "decision": fields["decision"], "arguments_hash": fields["arguments_hash"],
                           **({"profile": fields["profile"]} if fields.get("profile") else {}),
+                          **({"profile_version": fields["profile_version"]}
+                             if fields.get("profile_version") else {}),
+                          **({"profile_requirements": fields["profile_requirements"]}
+                             if fields.get("profile_requirements") else {}),
                           **({"decision_id": record["id"]} if record and record.get("id") else {}),
                           **({"decision_record": record} if record else {})}
         return change

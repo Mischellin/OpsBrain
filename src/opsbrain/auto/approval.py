@@ -47,6 +47,8 @@ class StaleReason(StrEnum):
     EVIDENCE_CHANGED = "evidence_changed"
     POLICY_CHANGED = "policy_changed"
     PROFILE_CHANGED = "profile_changed"
+    PROFILE_VERSION_CHANGED = "profile_version_changed"
+    PROFILE_REQUIREMENTS_CHANGED = "profile_requirements_changed"
     CHANGE_SWAPPED = "change_swapped"
     SUBJECT_CHANGED = "subject_changed"
     UNBOUND = "unbound"
@@ -95,6 +97,8 @@ class ApprovalBinding:
     evidence_ids: tuple[str, ...]
     policy_version: str
     profile: str = "general"
+    profile_version: str = "1"
+    profile_requirements: str = ""
     expires_s: float = 3600.0
     created: float = field(default_factory=now)
 
@@ -119,7 +123,9 @@ class ApprovalBinding:
         return {"contract_version": CONTRACT_VERSION, "change_id": self.change_id, "subject": self.subject,
                 "plan_hash": self.plan_hash, "arguments_hash": self.arguments_hash,
                 "targets": list(self.targets), "evidence_ids": list(self.evidence_ids),
-                "policy_version": self.policy_version, "profile": self.profile}
+                "policy_version": self.policy_version, "profile": self.profile,
+                "profile_version": self.profile_version,
+                "profile_requirements": self.profile_requirements}
 
     @property
     def binding_hash(self) -> str:
@@ -154,6 +160,8 @@ class ApprovalBinding:
             plan_hash=str(data.get("plan_hash", "")), arguments_hash=str(data.get("arguments_hash", "")),
             targets=tuple(data.get("targets", [])), evidence_ids=tuple(data.get("evidence_ids", [])),
             policy_version=str(data.get("policy_version", "")), profile=str(data.get("profile", "general")),
+            profile_version=str(data.get("profile_version", "1")),
+            profile_requirements=str(data.get("profile_requirements", "") or ""),
             expires_s=float(data.get("expires_s", 3600.0)),
             created=_persisted_created(data))
 
@@ -185,7 +193,15 @@ def stale_reasons(binding: ApprovalBinding, current: dict[str, Any]) -> tuple[st
                         # operation reclassified from `general` to `secrets` left the plan, the subject and
                         # the policy-version string untouched, so this comparison never noticed and the
                         # approval granted under the looser profile stayed spendable under the stricter one.
-                        ("profile", StaleReason.PROFILE_CHANGED)):
+                        ("profile", StaleReason.PROFILE_CHANGED),
+                        # A profile can be rewritten in place. Its name is then unchanged while its
+                        # requirements are not, so the name alone cannot tell an old approval from one
+                        # granted under the rules now in force.
+                        ("profile_version", StaleReason.PROFILE_VERSION_CHANGED),
+                        # The version is a label the operator bumps; this is the content behind it. A
+                        # profile rewritten without a version bump changed the rules while keeping both
+                        # the name and the label, and an approval could not tell.
+                        ("profile_requirements", StaleReason.PROFILE_REQUIREMENTS_CHANGED)):
         expected = getattr(binding, name)
         # An absent field is a mismatch, not a free pass. Comparing only when the caller supplied a truthy
         # value meant `consume(id, {"plan_hash": expected})` verified one field out of five.
@@ -489,7 +505,7 @@ def _locked(path: Path) -> Iterator[None]:
 
 
 def binding_for(change: Any, *, evidence_ids: Sequence[str] = (), policy_version: str,
-                profile: str = "general",
+                profile: str = "general", profile_version: str = "1", profile_requirements: str = "",
                 expires_s: float = 3600.0,
                 arguments_hash: str | None = None,
                 evidence_expires_in_s: float | None = None) -> ApprovalBinding:
@@ -542,7 +558,8 @@ def binding_for(change: Any, *, evidence_ids: Sequence[str] = (), policy_version
         # No sentinel. `DecisionConfig.policy_version` defaults to `v1`, so an approval built with
         # "unset" was either refused the moment it was spent, or - worse - the caller mirrored "unset" so
         # it would work, and then the approval never went stale when the policy version actually moved.
-        policy_version=policy_version, profile=profile, expires_s=lifetime, created=now())
+        policy_version=policy_version, profile=profile, profile_version=profile_version,
+        profile_requirements=profile_requirements, expires_s=lifetime, created=now())
 
 
 def verify(approval: Approval, current: dict[str, Any]) -> tuple[str, ...]:
