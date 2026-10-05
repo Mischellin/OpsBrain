@@ -255,6 +255,12 @@ class VerificationReport:
         out: dict[str, Any] = {
             "change": self.change_id, "status": self.status.value, "is_pass": self.is_pass,
             "checks": len(self.results), "by_status": self.by_status(),
+            # How long this was watched, which is a fact about the evidence and not a detail of it: the
+            # rollout gate compares it against what each stage asked to be observed for, and a client
+            # driving a rollout through the tool surface has nothing else to compare. Dropping it here
+            # made every stage read as "observed for 0s" and refuse, and a caller that supplied the
+            # number itself would be the only way through.
+            "observation_s": round(self.observation_s, 1),
         }
         outstanding = [*self.with_status(CheckStatus.FAIL), *self.with_status(CheckStatus.UNKNOWN),
                        *self.with_status(CheckStatus.NOT_RUN)]

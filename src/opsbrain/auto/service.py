@@ -316,6 +316,7 @@ class AutoService:
                                       max_artifact_bytes=self.auto.evidence.max_bundle_bytes)
         self._collector = collector
         self._preflight: Preflight | None = None
+        self._rollouts: RecordStore | None = None
         self._engine: ApprovalEngine | None = None
         self._verifier: Verifier | None = None
         #: Bound by `Core` right after construction. The Verifier needs a Core, and Core builds this
@@ -381,6 +382,138 @@ class AutoService:
         if self._preflight is None:
             self._preflight = Preflight(self.auto, self.reviews, self.root, self.evidence)
         return self._preflight
+
+    # -- rollout ---------------------------------------------------------------------------------
+    def rollouts(self) -> RecordStore:
+        """Durable stage outcomes, so a restart resumes instead of repeating the canary."""
+        if self._rollouts is None:
+            self._rollouts = RecordStore(self.root / "rollouts", ("ro",))
+        return self._rollouts
+
+    def start_rollout(self, change_id: str, plan_id: str, stages: Sequence[Any], *,
+                      hosts: dict[str, Any] | None = None, **strategy: Any) -> dict[str, Any]:
+        """Open a staged rollout for a plan that has already been applied to its canary.
+
+        Three refusals happen before any record is written, because all three are answers about whether
+        this work may proceed at all:
+
+        * the capability has no rollout strategy, or the strategy it names is not one that can be walked
+          in stages - an OpenTofu `-target` is the case that matters, since it looks like a gradual
+          rollout and decides strictly less than one;
+        * the stages do not match the plan they claim to be rolling out;
+        * no host in the first stage could serve as a canary, because of quorum, dependencies, or an
+          account of itself that says it must not.
+
+        The stage list is digested into the record here, and every later gate re-derives the digest from
+        the stages it is about to run - so a rollout cannot be widened while it is in flight.
+        """
+        from .rollout import Rollout, Stage, select_canary, stageable
+
+        self.guard_enabled()
+        if self.core is None:
+            raise OpsError("a rollout needs a Core; build OpsBrain, not AutoService alone")
+        change = self.core.changes.get(change_id)
+        record = self.preflight().get_by_plan(plan_id)
+        plan = ChangePlan.from_dict(record["plan_document"])
+        if plan.id != plan_id or (record.get("plan_hash") and plan.plan_hash != record["plan_hash"]):
+            raise OpsError(f"the preflight record for {plan_id} carries a different plan: the stored review "
+                           "says nothing about it")
+        refusal = stageable(change.capability, **strategy)
+        if refusal:
+            raise OpsError(f"{change.capability} cannot be rolled out in stages: {refusal}")
+        typed = tuple(stage if isinstance(stage, Stage) else Stage.from_dict(dict(stage)) for stage in stages)
+        rollout = Rollout(change_id=change_id, plan_id=plan_id, plan_hash=plan.plan_hash, stages=typed,
+                          created=now())
+        choice = select_canary(hosts or {}, typed[0].targets)
+        if not choice.found:
+            raise OpsError(f"this rollout has no canary to start with: {choice.reason}")
+        rollout.canary = choice.host
+        self.rollouts().put(rollout.id, rollout.to_dict())
+        self.audit.record(event="rollout", change=change_id, plan=plan_id, rollout=rollout.id,
+                          canary=choice.host, stages=len(typed))
+        return {**rollout.to_dict(), "canary": choice.host, "current": rollout.current,
+                "complete": rollout.complete}
+
+    def advance_rollout(self, rollout_id: str, *, report: dict[str, Any] | None = None,
+                        postflight_outcome: str = "", stages: Sequence[Any] | None = None) -> dict[str, Any]:
+        """Gate the stage that is next and, only if the gate passes, promote it.
+
+        A stage is entered under a claim, so a second process cannot run the same one twice, and the
+        stages about to be gated are re-checked against the record's digest first. `stages` is what the
+        caller is about to run; passing the stored ones would make the check compare the record with
+        itself, which is how a rollout ends up measuring something narrower than what was done.
+        """
+        from .rollout import Rollout, Stage, StageState, Stop, gate, select_canary
+
+        self.guard_enabled()
+        rollout = Rollout.from_dict(self.rollouts().get(rollout_id))
+        walked = (tuple(stages) if stages is not None else rollout.stages)
+        typed = tuple(stage if isinstance(stage, Stage) else Stage.from_dict(dict(stage)) for stage in walked)
+        rollout.assert_unchanged(typed, rollout.plan_id, rollout.plan_hash)
+        if rollout.complete:
+            return {**rollout.to_dict(), "next": "every stage has been promoted", "promoted": True,
+                    "current": rollout.current, "complete": rollout.complete}
+        index = rollout.current
+        stage = typed[index]
+        if index == 0:
+            # The canary was chosen when the rollout opened. Re-deriving it here means a topology that
+            # changed in between is caught before the first host is touched, not after.
+            choice = select_canary({}, stage.targets)
+            if not choice.found and rollout.canary not in stage.targets:
+                raise OpsError(f"the canary {rollout.canary!r} is no longer in the first stage: {choice.reason}")
+        verified = VerificationReport.from_dict(report) if report else None
+        promoted, stop, why = gate(stage, verified, postflight_outcome=postflight_outcome)
+        if not promoted:
+            rollout.states[index] = StageState.FAILED.value
+            self.rollouts().put(rollout.id, rollout.to_dict())
+            self.audit.record(event="rollout", change=rollout.change_id, rollout=rollout.id, stage=index,
+                              state=stop.value, reason=why)
+            return {**rollout.to_dict(), "next": why, "promoted": False, "stop": stop.value,
+                    "current": rollout.current, "complete": rollout.complete}
+        rollout.states[index] = StageState.PROMOTED.value
+        self.rollouts().put(rollout.id, rollout.to_dict())
+        self.audit.record(event="rollout", change=rollout.change_id, rollout=rollout.id, stage=index,
+                          state=StageState.PROMOTED.value, targets=list(stage.targets))
+        nxt = "rollout complete" if rollout.complete else f"stage {index + 1} may start"
+        return {**rollout.to_dict(), "next": nxt, "promoted": True, "stop": Stop.NONE.value,
+                "current": rollout.current, "complete": rollout.complete}
+
+    def rollback_rollout(self, rollout_id: str) -> dict[str, Any]:
+        """Undo a stage, and only where a plan said in advance that it could be undone.
+
+        Automatic rollback is for work that declared a concrete undo. A change that named no rollback,
+        or named one that is a compensation rather than an undo, is reported as not rolled back - with
+        the reason - rather than handed to a generic script that would produce a second, unplanned
+        change to infrastructure that is already in the state nobody wanted.
+        """
+        from .rollout import Rollout, StageState
+
+        self.guard_enabled()
+        if self.core is None:
+            raise OpsError("a rollout needs a Core; build OpsBrain, not AutoService alone")
+        rollout = Rollout.from_dict(self.rollouts().get(rollout_id))
+        record = self.preflight().get_by_plan(rollout.plan_id)
+        plan = ChangePlan.from_dict(record["plan_document"])
+        reversible = [step.reversible for step in plan.changes]
+        if not reversible or any(kind is Reversibility.IRREVERSIBLE for kind in reversible):
+            self.audit.record(event="rollback", change=rollout.change_id, rollout=rollout.id, applied=False,
+                              reason="no reversible undo")
+            return {"rolled_back": False, "reason": "this change declared no reversible undo, so there is "
+                                                     "nothing safe to run; rolling it back is a new change "
+                                                     "and needs its own plan and review"}
+        if not plan.rollback:
+            return {"rolled_back": False, "reason": "the plan names no rollback to run"}
+        index = max((i for i, state in enumerate(rollout.states) if state == StageState.PROMOTED.value),
+                    default=-1)
+        if index < 0:
+            return {"rolled_back": False, "reason": "no stage was promoted, so there is nothing to undo"}
+        for later in range(index, len(rollout.states)):
+            rollout.states[later] = StageState.ROLLED_BACK.value
+        self.rollouts().put(rollout.id, rollout.to_dict())
+        self.audit.record(event="rollback", change=rollout.change_id, rollout=rollout.id, applied=True,
+                          undo=plan.rollback, stage=index)
+        return {"rolled_back": True, "undo": plan.rollback, "stage": index,
+                "next": f"run the plan's own undo ({plan.rollback}) and report what it left behind"}
 
     def review_plan(self, plan: ChangePlan, *, evidence: str = "", runs: int | None = None) -> dict[str, Any]:
         """Review a plan before anything changes, and answer with the outcome, not a boolean.
