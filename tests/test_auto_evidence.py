@@ -823,11 +823,21 @@ def test_a_bundle_that_was_never_stored_is_missing_not_tampered(tmp_path: Path) 
     assert reason_code(store.verify(bundle.id)) == Reason.EVIDENCE_MISSING.value
 
 
-def test_a_render_whose_framing_alone_exceeds_the_budget_says_so(tmp_path: Path) -> None:
+def test_a_budget_too_small_for_the_evidence_is_refused_rather_than_faked(tmp_path: Path) -> None:
+    """The budget is a ceiling on what the reviewer may be sent, never a licence to send less silently."""
     bundle = collected(tmp_path)
-    rendered = render_for_reviewer(bundle, max_chars=40)
-    assert len(rendered) < 200, "a hard budget must be honoured even by the fixed framing"
-    assert "truncated" in rendered
+    for budget in (40, 200, 600, 1_079):
+        with pytest.raises(EvidenceError):
+            render_for_reviewer(bundle, max_chars=budget)
+    # The floor: a budget that fits the framing and the entries is sent whole.
+    assert "truncated" not in render_for_reviewer(bundle, max_chars=20_000)
+
+
+def test_a_render_that_fits_is_sent_whole(tmp_path: Path) -> None:
+    bundle = collected(tmp_path)
+    rendered = render_for_reviewer(bundle, max_chars=20_000)
+    assert "truncated" not in rendered
+    assert bundle.entries[0].command_id in rendered
 
 
 def test_an_observation_naming_no_command_is_refused(tmp_path: Path) -> None:

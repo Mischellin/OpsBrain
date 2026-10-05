@@ -21,8 +21,10 @@ from typing import TYPE_CHECKING, Any
 from ..audit import AuditLog
 from ..util import OpsError, new_id
 from .config import AutoConfig
-from .evidence import EvidenceCollector, EvidenceStore, Observation, passed, reason_code
+from .evidence import EvidenceBundle, EvidenceCollector, EvidenceStore, Observation, check_evidence, passed, reason_code
 from .ledger import BudgetLedger
+from .plan import ChangePlan
+from .preflight import Outcome, Preflight, PreflightResult, unverified_targets, verification_targets
 from .review import (
     CONTRACT_VERSION,
     Reviewer,
@@ -80,12 +82,11 @@ class ReviewService:
         self._recover_usage()
 
     def _recover_usage(self) -> None:
-        """Rebuild the counters from the durable budget ledger.
+        """Rebuild the counters from the stored reviews.
 
-        A restart must not hand out a fresh `max_model_calls` and a fresh `budget_usd`, and a separately
-        invoked `opsbrain autonomy status` must report what the server actually spent. The ceilings are
-        only ceilings if they survive a restart and if every reserved attempt is in the ledger - including
-        the ones that went on to fail, since a failed attempt still cost money.
+        Without this a restart hands out a fresh `max_model_calls` and a fresh `budget_usd`, and a
+        separately invoked `opsbrain autonomy status` reports zero for work the server already did. The
+        ceilings are only ceilings if they survive a restart.
         """
         ledger = self.ledger
         with self._lock:
@@ -94,9 +95,15 @@ class ReviewService:
             self._tokens_out = ledger.output_tokens
             self._spend_usd = ledger.spend_usd
 
-    def _is_stub(self) -> bool:
-        """True only for the built-in stub. A test that injects its own fake is a test, and must keep working."""
-        return type(self.reviewer()) is FakeReviewer
+    def is_stub(self) -> bool:
+        """True only for the stub the *configuration* selected, not for one a caller injected.
+
+        Both are `FakeReviewer` instances, and the difference is not the class but where it came from: the
+        default runner is a stub nobody chose, while an injected reviewer - a test double or a real
+        integration - is something a caller picked on purpose, and a guard must not overrule that on the
+        basis of a config field the caller never touched.
+        """
+        return self._reviewer is None and self.reviews.runner == "fake"
 
     def _id_lock(self, review_id: str) -> threading.Lock:
         """One lock per review id, so parallel redelivery of the same request does not review it twice."""
@@ -122,12 +129,10 @@ class ReviewService:
         return limit / 1_000_000 * USD_PER_MILLION_TOKENS
 
     def _reserve(self, request: ReviewRequest) -> None:
-        """Admit one attempt, against a balance every process can see.
+        """Counts a call before it happens, against both the call count and the projected spend.
 
-        Reserved per attempt, not per request: `run_review` may invoke the reviewer up to
-        `max_retries + 1` times, and one reservation per request would let three paid calls pass a single
-        check. The check and the record happen inside the ledger's lock, so a server and a CLI racing on
-        the same data directory cannot both be admitted against the same money.
+        Reserving per attempt, not per request: `run_review` may invoke the reviewer up to
+        `max_retries + 1` times, and a single reservation would let three paid calls pass one check.
         """
         admitted, reason = self.ledger.admit(
             self.projected_cost(request), kind="reserve",
@@ -139,9 +144,7 @@ class ReviewService:
             raise BudgetExceeded(reason)
 
     def _charge(self, result: ReviewResult) -> None:
-        """Record what an admitted attempt actually cost, so the ceiling is measured against reality."""
-        self.ledger.reconcile(0.0, kind="settle",
-                              input_tokens=result.usage.input_tokens,
+        self.ledger.reconcile(0.0, kind="settle", input_tokens=result.usage.input_tokens,
                               output_tokens=result.usage.output_tokens)
         with self._lock:
             self._tokens_in = self.ledger.input_tokens
@@ -183,7 +186,7 @@ class ReviewService:
             # The master switch, enforced here as well as at the facade. This method is public, and a
             # pipeline that is "off" but still answers review requests has a gate that is a convention.
             raise OpsError("auto.enabled is false: the review pipeline is off")
-        if self.reviews.runner == "fake" and self._is_stub():
+        if self.is_stub():
             # The stub answers PASS to anything, and it is the documented default. With `auto.enabled:
             # true` and nothing else configured, it would otherwise manufacture a permission.
             return ReviewResult.failure(request, RunnerStatus.UNAVAILABLE,
@@ -199,8 +202,7 @@ class ReviewService:
             request = ReviewRequest(**{**request.__dict__, "context": clipped})
         request = request.with_id()
         # The lease has to outlive the whole retry window, or a redelivery arriving while the original
-        # attempt is still running sees a stale claim, starts a second paid review, and deduplication
-        # quietly stops deduplicating.
+        # attempt still runs sees a stale claim and starts a second paid review.
         ttl = self.reviews.timeout_s * (self.reviews.max_retries + 1) + 60.0
         claim = self.root / "claims" / f"{request.review_id}.claim"
         # The lock covers the in-process race; the claim file covers two processes (a server and the CLI).
@@ -301,15 +303,18 @@ class AutoService:
 
     def __init__(self, config: Config, *, reviewer: Reviewer | None = None, reviewer_factory: Any = None,
                  root: Path | None = None, collector: EvidenceCollector | None = None):
+        self.audit = AuditLog(config.data_path / "audit.jsonl")
         self.config = config
         self.auto: AutoConfig = config.auto
         self.root = root or (config.data_path / "auto")
         self.reviews = ReviewService(self.auto, self.root, reviewer=reviewer, reviewer_factory=reviewer_factory)
-        self.evidence = EvidenceStore(self.root / "evidence", max_artifact_bytes=self.auto.evidence.max_bundle_bytes)
-        self.audit = AuditLog(config.data_path / "audit.jsonl")
-        self._collector: EvidenceCollector | None = collector
+        self.evidence = EvidenceStore(self.root / "evidence",
+                                      max_artifact_bytes=self.auto.evidence.max_bundle_bytes)
+        self._collector = collector
+        self._preflight: Preflight | None = None
         self._verifier: Verifier | None = None
-        #: Bound by `Core` right after construction: the Verifier needs a Core, and Core builds this service.
+        #: Bound by `Core` right after construction. The Verifier needs a Core, and Core builds this
+        #: service, so the link is made explicitly by the owner rather than passed in and defaulted.
         self.core: Any = None
 
     @property
@@ -320,14 +325,22 @@ class AutoService:
     def autonomous(self) -> bool:
         return self.enabled and self.auto.decision.autonomous
 
+    def guard_enabled(self) -> None:
+        if not self.enabled:
+            raise OpsError("autonomous pipeline is disabled: set auto.enabled=true in the config")
+
     # -- evidence ---------------------------------------------------------------------------------
     def collector(self, *, allowed: Sequence[str], change_id: str = "") -> EvidenceCollector:
-        """A collector bound to an explicit capability allowlist; nothing else may be collected."""
+        """The collector is created with an explicit capability allowlist and nothing else.
+
+        A collector without a list of permitted probes would let any capability the service can reach end
+        up inside a bundle, so it is never defaulted: the caller has to say what may be collected.
+        """
         if not allowed:
             raise OpsError("evidence collection needs an explicit list of allowed capabilities")
         if self._collector is None:
             return EvidenceCollector(self.evidence, self.auto.evidence, allowed=allowed, change_id=change_id)
-        # An injected collector is a test double. Rebound to this request rather than returned as it was
+        # An injected collector is a test double. Rebind it to this request rather than returning it as
         # configured earlier, so the per-call allowlist and change binding cannot be quietly bypassed.
         self._collector.allowed = frozenset(allowed)
         self._collector.change_id = change_id
@@ -353,17 +366,77 @@ class AutoService:
     def evidence_list(self, limit: int = 20) -> Records:
         return self.evidence.list(limit)
 
-    def evidence_overview(self) -> dict[str, Any]:
-        bundles = self.evidence.list(1000)
-        return {"bundles": len(bundles), "fresh_window_s": self.auto.evidence.max_age_s,
-                "max_bundle_bytes": self.auto.evidence.max_bundle_bytes,
-                "require_inventory_hash": self.auto.evidence.require_inventory_hash,
-                "require_target_identity": self.auto.evidence.require_target_identity,
-                "recent": bundles[:5]}
+    # -- preflight --------------------------------------------------------------------------------
+    def preflight(self) -> Preflight:
+        if self._preflight is None:
+            self._preflight = Preflight(self.auto, self.reviews, self.root, self.evidence)
+        return self._preflight
+
+    def review_plan(self, plan: ChangePlan, *, evidence: str = "") -> dict[str, Any]:
+        """Review a plan before anything changes, and answer with the outcome, not a boolean.
+
+        `evidence` is a bundle id; when given, its redacted render travels with the plan so the reviewer
+        judges the plan against the observations it claims to rest on rather than against its own summary.
+        """
+        self.guard_enabled()
+        # The plan names its own evidence. Trusting only the caller's argument would let a plan that
+        # declares a bundle be reviewed against a different one - or against none at all.
+        bundle_id = evidence or plan.evidence_bundle
+        bundle: EvidenceBundle | None = None
+        if bundle_id:
+            try:
+                bundle = self.evidence.get(bundle_id)
+            except OpsError as exc:
+                # A plan that names a bundle nobody stored is not reviewable, and an exception here would
+                # leave the caller with a stack trace instead of a decision.
+                refused = self.preflight().refuse(plan, Outcome.INCOMPLETE,
+                                                  f"the plan names evidence {bundle_id}, which cannot be read: {exc}")
+                self.audit.record(event="preflight", plan=plan.id, outcome=refused.outcome.value,
+                                  approvable=False, reason=refused.reason, review="")
+                return refused.to_dict()
+            # The expected change is the one the bundle itself recorded, or none at all when it is not
+            # bound. Passing a prefix of the plan id compared "pl" against every entry and rejected each
+            # one for belonging to something else.
+            checks = check_evidence(bundle, self.evidence.load_artifacts(bundle)[0],
+                                    change_id=bundle.change_id or None)
+            if reason_code(checks) != "evidence_fresh":
+                refused = self.preflight().refuse(plan, Outcome.INCOMPLETE,
+                                                  f"the evidence bundle the plan names is {reason_code(checks)}: "
+                                                  f"{next((c.detail for c in checks if not c.ok), 'unusable')}")
+                self.audit.record(event="preflight", plan=plan.id, outcome=refused.outcome.value,
+                                  approvable=False, reason=refused.reason, review="")
+                return refused.to_dict()
+        result: PreflightResult = self.preflight().run(plan, bundle)
+        self.audit.record(event="preflight", plan=plan.id, outcome=result.outcome.value,
+                          approvable=result.approvable, reason=result.reason, review=result.review_id)
+        return result.to_dict()
+
+    def preflight_list(self, limit: int = 20) -> Records:
+        return self.preflight().list(limit)
+
+    def plan_summary(self, document: dict[str, Any]) -> dict[str, Any]:
+        return ChangePlan.from_dict(document).summary()
+
+    def verify_plan(self, plan_id: str) -> dict[str, Any]:
+        """Verify a change from the targets its own plan declared.
+
+        The change id is the plan's, never a caller's: a report that is not attributable to the change it
+        describes proves nothing, and this is the one surface where that is cheap to get wrong.
+        """
+        self.guard_enabled()
+        record = self.preflight().get_by_plan(plan_id)
+        plan = ChangePlan.from_dict(record["plan_document"])
+        targets = verification_targets(plan)
+        if not targets:
+            return {"plan": plan_id, "status": "not_verifiable",
+                    "unverified_targets": list(unverified_targets(plan)),
+                    "approvable": False,
+                    "note": "the plan declares no target a registered check can be run against"}
+        return self.verify_change(plan.id, targets, applied_at=plan.created,
+                                 declared=record.get("declared_checks", ()))
 
     # -- verification -----------------------------------------------------------------------------
     def verifier(self) -> Verifier:
-        """The Verifier needs a Core, and Core builds this service, so the link is made by the owner."""
         if self._verifier is None:
             if self.core is None:
                 raise OpsError("verification needs a Core; build OpsBrain, not AutoService alone")
@@ -385,17 +458,22 @@ class AutoService:
     def verify_overview(self) -> dict[str, Any]:
         if self.core is None:
             return {"bound": False}
+        verifier = self.verifier()
         return {
             "bound": True,
             "observation_s": self.auto.verify.observation_s,
             "require_observation": self.auto.verify.require_observation,
             "allow_state_changing_checks": self.auto.verify.allow_state_changing_checks,
-            "available": list(self.verifier().available()),
+            "available": list(verifier.available()),
         }
 
-    def guard_enabled(self) -> None:
-        if not self.enabled:
-            raise OpsError("autonomous pipeline is disabled: set auto.enabled=true in the config")
+    def evidence_overview(self) -> dict[str, Any]:
+        bundles = self.evidence.list(1000)
+        return {"bundles": len(bundles), "fresh_window_s": self.auto.evidence.max_age_s,
+                "max_bundle_bytes": self.auto.evidence.max_bundle_bytes,
+                "require_inventory_hash": self.auto.evidence.require_inventory_hash,
+                "require_target_identity": self.auto.evidence.require_target_identity,
+                "recent": bundles[:5]}
 
     def overview(self) -> dict[str, Any]:
         return {
@@ -410,4 +488,7 @@ class AutoService:
             "auth": self.auto.review.auth,
             "budget": self.reviews.usage(),
             "reviews": len(self.reviews.list(1000)),
+            "evidence": self.evidence_overview(),
+            "verify": self.verify_overview(),
+            "preflights": len(self.preflight().list(1000)),
         }

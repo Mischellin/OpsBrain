@@ -22,6 +22,8 @@ from .evidence import (  # noqa: F401
     reason_code,
     render_for_reviewer,
 )
+from .plan import ChangePlan, PlanError, ProposedChange, Reversibility, Risk  # noqa: F401
+from .preflight import Outcome, Preflight, PreflightResult  # noqa: F401
 from .review import (  # noqa: F401
     CONTRACT_VERSION,
     Finding,
@@ -36,12 +38,21 @@ from .service import AutoService  # noqa: F401
 
 __all__ = [
     "CONTRACT_VERSION",
+    "ChangePlan",
+    "Outcome",
+    "PlanError",
+    "Preflight",
+    "PreflightResult",
+    "ProposedChange",
+    "Reversibility",
+    "Risk",
     "AutoService",
     "Check",
     "EvidenceBundle",
     "EvidenceCollector",
     "EvidenceEntry",
     "EvidenceError",
+    "EvidenceBundle",
     "EvidenceStore",
     "Finding",
     "Observation",

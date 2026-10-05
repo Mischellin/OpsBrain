@@ -18,13 +18,25 @@ PROFILE_NAMES = ("general", "network", "firewall", "vpn", "reboot", "auth", "sec
                  "k8s-control-plane", "dns")
 
 #: Reason codes the decision engine may emit. Stable strings: tests and audits match on them.
-REASON_CODES = (
-    "review_passed", "review_blocked", "review_failed", "review_missing", "evidence_fresh", "evidence_stale",
-    "evidence_missing", "evidence_tampered", "policy_allows", "policy_forbids", "policy_unclassified",
-    "target_not_in_scope", "destructive_requires_human", "verdict_disagreement", "budget_exhausted",
+#: What the *decision engine* may say. The reasons a check can produce live on `evidence.Reason` and are
+#: merged in by `all_reason_codes`, so a code the pipeline emits is a code a caller can enumerate.
+DECISION_REASON_CODES = (
+    "review_passed", "review_blocked", "review_failed", "review_missing", "policy_allows", "policy_forbids",
+    "policy_unclassified", "destructive_requires_human", "verdict_disagreement", "budget_exhausted",
     "retries_exhausted", "unknown_target", "approval_stale", "lease_taken", "precondition_failed",
     "verification_failed", "verification_unknown", "autonomy_revoked", "emergency_stop",
 )
+
+
+def all_reason_codes() -> tuple[str, ...]:
+    """Every code the pipeline can emit, sorted. The one list a caller needs."""
+    from .evidence import Reason
+
+    return tuple(sorted({*DECISION_REASON_CODES, *(reason.value for reason in Reason)}))
+
+
+#: Kept for callers that only need the decision half; `all_reason_codes` is the complete set.
+REASON_CODES = DECISION_REASON_CODES
 
 
 class ReviewConfig(_Model):
@@ -95,6 +107,8 @@ class EvidenceConfig(_Model):
 
     max_age_s: float = Field(default=900, gt=0, le=86_400)
     require_target_identity: bool = True
+    #: Extra prefixes the operator declares read-only, on top of the built-in set in `preflight`.
+    read_only_probes: list[str] = Field(default_factory=list)
     require_inventory_hash: bool = True
     require_observation_time: bool = True  # a reading whose age cannot be established is not fresh
     max_bundle_bytes: int = Field(default=1_000_000, ge=1024, le=100_000_000)
