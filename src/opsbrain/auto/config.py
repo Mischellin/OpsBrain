@@ -96,6 +96,7 @@ class EvidenceConfig(_Model):
     max_age_s: float = Field(default=900, gt=0, le=86_400)
     require_target_identity: bool = True
     require_inventory_hash: bool = True
+    require_observation_time: bool = True  # a reading whose age cannot be established is not fresh
     max_bundle_bytes: int = Field(default=1_000_000, ge=1024, le=100_000_000)
 
 

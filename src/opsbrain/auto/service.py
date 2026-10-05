@@ -13,12 +13,15 @@ Outside it, budgets do not exist and redelivery double-charges. Inside it:
 from __future__ import annotations
 
 import threading
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ..audit import AuditLog
 from ..util import OpsError, new_id
 from .config import AutoConfig
+from .evidence import EvidenceCollector, EvidenceStore, Observation, passed, reason_code
 from .ledger import BudgetLedger
 from .review import (
     CONTRACT_VERSION,
@@ -296,11 +299,14 @@ class AutoService:
     """Facade the rest of OpsBrain talks to. Owns the review service and, later, the pipeline stages."""
 
     def __init__(self, config: Config, *, reviewer: Reviewer | None = None, reviewer_factory: Any = None,
-                 root: Path | None = None):
+                 root: Path | None = None, collector: EvidenceCollector | None = None):
         self.config = config
         self.auto: AutoConfig = config.auto
         self.root = root or (config.data_path / "auto")
         self.reviews = ReviewService(self.auto, self.root, reviewer=reviewer, reviewer_factory=reviewer_factory)
+        self.evidence = EvidenceStore(self.root / "evidence", max_artifact_bytes=self.auto.evidence.max_bundle_bytes)
+        self.audit = AuditLog(config.data_path / "audit.jsonl")
+        self._collector: EvidenceCollector | None = collector
 
     @property
     def enabled(self) -> bool:
@@ -309,6 +315,47 @@ class AutoService:
     @property
     def autonomous(self) -> bool:
         return self.enabled and self.auto.decision.autonomous
+
+    # -- evidence ---------------------------------------------------------------------------------
+    def collector(self, *, allowed: Sequence[str], change_id: str = "") -> EvidenceCollector:
+        """A collector bound to an explicit capability allowlist; nothing else may be collected."""
+        if not allowed:
+            raise OpsError("evidence collection needs an explicit list of allowed capabilities")
+        if self._collector is None:
+            return EvidenceCollector(self.evidence, self.auto.evidence, allowed=allowed, change_id=change_id)
+        # An injected collector is a test double. Rebound to this request rather than returned as it was
+        # configured earlier, so the per-call allowlist and change binding cannot be quietly bypassed.
+        self._collector.allowed = frozenset(allowed)
+        self._collector.change_id = change_id
+        return self._collector
+
+    def collect_evidence(self, objective: str, observations: Sequence[Observation], *, allowed: Sequence[str],
+                         change_id: str = "", **fields: Any) -> dict[str, Any]:
+        """Collect a bundle, persist it, and answer with its summary - never with payload text."""
+        self.guard_enabled()
+        bundle = self.collector(allowed=allowed, change_id=change_id).collect(objective, observations, **fields)
+        saved = self.evidence.save(bundle)
+        self.audit.record(event="evidence_collected", bundle=saved.id, change=change_id,
+                          entries=len(saved.entries), digest=saved.digest)
+        return saved.summary()
+
+    def verify_evidence(self, bundle_id: str, *, now_s: float | None = None,
+                        change_id: str | None = None) -> dict[str, Any]:
+        """Re-derive every hash and re-test every policy. The first reason code is the one to log."""
+        checks = self.evidence.verify(bundle_id, now_s=now_s, change_id=change_id)
+        return {"bundle": bundle_id, "reason": reason_code(checks), "passed": passed(checks),
+                "checks": [check.to_dict() for check in checks]}
+
+    def evidence_list(self, limit: int = 20) -> Records:
+        return self.evidence.list(limit)
+
+    def evidence_overview(self) -> dict[str, Any]:
+        bundles = self.evidence.list(1000)
+        return {"bundles": len(bundles), "fresh_window_s": self.auto.evidence.max_age_s,
+                "max_bundle_bytes": self.auto.evidence.max_bundle_bytes,
+                "require_inventory_hash": self.auto.evidence.require_inventory_hash,
+                "require_target_identity": self.auto.evidence.require_target_identity,
+                "recent": bundles[:5]}
 
     def guard_enabled(self) -> None:
         if not self.enabled:
