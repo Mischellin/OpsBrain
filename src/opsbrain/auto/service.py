@@ -317,6 +317,7 @@ class AutoService:
         self._collector = collector
         self._preflight: Preflight | None = None
         self._rollouts: RecordStore | None = None
+        self._recoveries: RecordStore | None = None
         self._engine: ApprovalEngine | None = None
         self._verifier: Verifier | None = None
         #: Bound by `Core` right after construction. The Verifier needs a Core, and Core builds this
@@ -382,6 +383,89 @@ class AutoService:
         if self._preflight is None:
             self._preflight = Preflight(self.auto, self.reviews, self.root, self.evidence)
         return self._preflight
+
+    # -- recovery --------------------------------------------------------------------------------
+    def recoveries(self) -> RecordStore:
+        """Durable attempt history, so a restart neither repeats a side effect nor resets the budget."""
+        if self._recoveries is None:
+            self._recoveries = RecordStore(self.root / "recovery", ("rc",))
+        return self._recoveries
+
+    def start_recovery(self, change_id: str, plan_id: str) -> dict[str, Any]:
+        """Open a recovery loop for a change whose plan did not work out.
+
+        The permitted actions come from the profile the plan was reviewed under - the one field of
+        `PolicyProfileConfig` that was configured, documented, and never read. A profile that named
+        nothing gets no loop at all: the actions a system may try on its own have to be written down by
+        whoever owns the infrastructure, not inferred by a caller asking for one.
+
+        The baselines are recorded so the ceilings are measured against *this* loop. The review ledger is
+        cumulative, so measuring the loop's budget against it reported a new loop as already exhausted
+        before it had spent anything.
+        """
+        from .recovery import Recovery, Step
+
+        self.guard_enabled()
+        if self.core is None:
+            raise OpsError("recovery needs a Core; build OpsBrain, not AutoService alone")
+        change = self.core.changes.get(change_id)
+        if change.state == "discarded":
+            raise OpsError(f"change {change_id} was discarded; there is nothing to recover, and a loop "
+                           "over it would be a way to start the work again without a new plan")
+        record = self.preflight().get_by_plan(plan_id)
+        plan = ChangePlan.from_dict(record["plan_document"])
+        if plan.id != plan_id or (record.get("plan_hash") and plan.plan_hash != record["plan_hash"]):
+            raise OpsError(f"the preflight record for {plan_id} carries a different plan: the stored review "
+                           "says nothing about it")
+        profile = self._profile_for(plan)
+        permitted = tuple(action for action in (profile.recovery_actions if profile else ())
+                          if action in {member.value for member in Step})
+        if not permitted:
+            raise OpsError(f"profile {plan.profile!r} names no recovery actions, so there is nothing this "
+                           "system is permitted to try on its own; name them in the profile, or repair it "
+                           "by hand")
+        loop = Recovery(change_id=change_id, permitted=permitted,
+                        baseline_calls=self.reviews.ledger.calls, baseline_spend=self.reviews.ledger.spend_usd)
+        self.recoveries().put(loop.id, loop.to_dict())
+        self.audit.record(event="recovery", change=change_id, plan=plan_id, recovery=loop.id,
+                          permitted=list(permitted))
+        return loop.report()
+
+    def record_recovery_attempt(self, recovery_id: str, step: str, *, before: dict[str, Any],
+                                after: dict[str, Any], claimed: bool = False, plan_id: str = "",
+                                change_id: str = "", calls_used: int = 0, spend_usd: float = 0.0,
+                                stop: str = "", reason: str = "") -> dict[str, Any]:
+        """Fold one attempt into the loop, and answer with the state rather than with another question.
+
+        A mutating step is refused unless it names a *new* plan and a *new* change. That is the property
+        the whole loop exists to keep: the change that failed keeps its spent approval, and the repair
+        goes back through preflight, review and the engine like any other change. A retry that named the
+        old ones would inherit the old change's authorisation, which is precisely what the gate is there
+        to stop.
+        """
+        from .recovery import Observation, Recovery, Step, Stop, permits_new_change
+
+        self.guard_enabled()
+        loop = Recovery.from_dict(self.recoveries().get(recovery_id))
+        if step in {member.value for member in Step} and permits_new_change(step) and not (plan_id and change_id):
+            raise OpsError(f"step {step!r} changes infrastructure, so it needs its own plan and its own "
+                           f"change; reusing {loop.change_id}'s approval is not recovery, it is a second run "
+                           f"of work the gate already refused to authorise twice")
+        attempt = loop.record(step, Observation.from_dict(before), Observation.from_dict(after),
+                              claimed=claimed, plan_id=plan_id, change_id=change_id, calls_used=calls_used,
+                              spend_usd=spend_usd,
+                              stop=Stop(stop) if stop else Stop.NONE, reason=reason)
+        self.recoveries().put(loop.id, loop.to_dict())
+        self.audit.record(event="recovery", change=loop.change_id, recovery=loop.id, step=step,
+                          attempt=attempt.number, progress=attempt.progress.made, why=attempt.progress.why,
+                          stop=loop.stop)
+        return loop.report()
+
+    def recovery_status(self, recovery_id: str) -> dict[str, Any]:
+        from .recovery import Recovery
+
+        self.guard_enabled()
+        return Recovery.from_dict(self.recoveries().get(recovery_id)).report()
 
     # -- rollout ---------------------------------------------------------------------------------
     def rollouts(self) -> RecordStore:
