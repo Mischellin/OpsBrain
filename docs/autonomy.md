@@ -199,3 +199,33 @@ The neighbouring switches are deliberately narrower:
 Turning the whole subsystem off is `auto.enabled: false`. Every other setting is inert in that case,
 including the emergency stop, which then has nothing to stop.
 
+## Postflight: asking whether it worked
+
+The rest of the pipeline asks two questions before a change runs: *is this plan worth running* (the
+preflight) and *did the facts move the way the plan said they would* (verification). Neither asks the
+question an operator has afterwards. A change can pass review, apply cleanly, and satisfy every check it
+declared while leaving the underlying problem exactly as it was. Postflight is that question, and it is
+the one place in the loop a model is allowed to answer.
+
+It is an observation, and two things keep it from becoming a second authority:
+
+1. **The outcome vocabulary has no member meaning "authorise".** The outcomes are `confirmed`, `not_met`
+   and `unclear`. Authorisation is the deterministic engine's job, and a postflight that could approve
+   would be a way around it.
+2. **It cannot be told to confirm.** `confirmed` requires a verification report that actually ran.
+   Without one, or with one whose status is not a pass, the most it can say is `unclear` - a model asked
+   to judge an outcome nobody measured will agree with whatever it is shown. When the checks *did* run
+   and reported a failure, the answer is `not_met` without the model being consulted at all.
+
+The report is supplied by the caller, which is why the change's own state is checked first: a report can
+be produced for a change that was discarded, and every check in it will pass, because none of them ever
+touched anything. A discarded change gets `unclear`, with the reviewer never called.
+
+What the reviewer is shown is the goal the plan set, the checks it declared, the rollback that exists,
+and the verification report itself - plus a plain statement that authorising is not its to do. It is
+judged under its own rubric (`opsbrain-rubric-postflight-1`), because a postflight answered from the
+plan's cache would not be judging anything.
+
+The judgement and the state it was made against are both written to the audit. `confirmed` recorded
+against a change still sitting in `pending` is a statement about the audit trail, not about the world,
+and the two are written side by side so they can be read against each other.

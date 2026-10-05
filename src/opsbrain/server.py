@@ -22,7 +22,7 @@ from .util import OpsError, write_private
 #: The steps a client performs to reach an autonomous apply, in order. The `autonomy` action table and the
 #: instructions below both name these, because a flow the client is told about and a surface that cannot
 #: carry it is worse than either one alone.
-AUTONOMOUS_FLOW = ("review-plan", "decide")
+AUTONOMOUS_FLOW = ("review-plan", "decide", "postflight")
 
 _COMMON = (
     "OpsBrain operates the infrastructure with compact answers. Start with `overview`, then `docs action=status` for "
@@ -52,12 +52,19 @@ def build_instructions(config: Any) -> str:
     # the same tuple the action table dispatches on. Prose here that drifts from the table is a client
     # following the instructions into an action that does not exist.
     steps = ", then ".join(f"action={step}" for step in AUTONOMOUS_FLOW)
+    # The apply and the verification sit *between* the decision and the judgement, and they are named
+    # here explicitly. The steps were once listed as review, decide, postflight - which describes a
+    # workflow that never changes anything: a client following it to the letter reaches the postflight
+    # with a change still pending and no report of anything having happened, and is told the change did
+    # what it was supposed to.
     return _COMMON + (
-        f"Mutations need no human step, in this order. Call `autonomy` with {steps}, then run the "
-        "capability's own apply tool (`tofu` or `ansible` action=apply change_id=<id>) to spend the approval. "
-        "The plan goes in `document` as JSON for review-plan, and the change id in `id` and the reviewed plan "
-        "id in `plan` for decide. An APPROVE issues the approval the apply spends; a RETRY means review "
-        "again; BLOCKED_AUTONOMOUSLY means it stopped and says why."
+        f"Mutations need no human step, in this order. Call `autonomy` with {steps}, and between the "
+        "second and the third run the capability's own apply tool (`tofu` or `ansible` action=apply "
+        "change_id=<id>) to spend the approval, then `autonomy` action=verify-plan with the **reviewed "
+        "plan id** in `id` - not the change id, which this action looks its plan up by. The plan goes in "
+        "`document` as JSON for review-plan, the change id in `id` and the reviewed plan id in `plan` for "
+        "decide, and the verify-plan report in `document` for postflight. An APPROVE issues the approval "
+        "the apply spends; a RETRY means review again; BLOCKED_AUTONOMOUSLY means it stopped and says why."
         + _TAIL
     )
 
@@ -209,7 +216,7 @@ def build_server(ops: OpsBrain) -> MCPServer:
     @server.tool()
     def autonomy(action: Literal[  # noqa: A002
         "status", "capabilities", "reviews", "evidence", "bundles", "verify_evidence", "reasons", "checks",
-        "verify-plan", "review-plan", "decide"
+        "verify-plan", "review-plan", "decide", "postflight"
     ] = "status", limit: int = 20, id: str | None = None, plan: str | None = None,
         # `str`, never `str | None`: the MCP layer pre-parses a string argument into JSON whenever the
         # annotation is anything other than exactly `str`, so a client that did the obvious thing - sent
@@ -218,7 +225,7 @@ def build_server(ops: OpsBrain) -> MCPServer:
         # them called the Python method instead of the tool. An empty string is still "not supplied":
         # `_need` treats it as missing.
         document: str = "") -> str:
-        """Autonomous pipeline; `review-plan` and `decide` write, and neither applies anything.
+        """Autonomous pipeline; `review-plan` and `postflight` write, and neither applies anything.
 
         status: switches, mode, budget, evidence, verification
         capabilities: is the reviewer runnable; it never claims an unchecked model
@@ -227,9 +234,9 @@ def build_server(ops: OpsBrain) -> MCPServer:
         reasons: every reason code the pipeline can emit
         checks: what verification can demand, and why each check exists
         verify-plan: verify a change against the targets its own plan declared
-        review-plan -> decide: in order. `review-plan` takes the plan as JSON in `document`; `decide`
-            needs `id` (the change) and `plan`. An APPROVE issues the approval the apply spends, so nothing
-            waits on a human.
+        review-plan -> decide -> postflight: in order. The last three need `id` (the change) and `plan`;
+            `review-plan` takes the plan as JSON in `document`, `postflight` the report in `document`
+            too. An APPROVE issues the approval the apply spends, so nothing waits on a human.
         """
         return ops.call("autonomy", {"action": action, "id": id, "plan": plan},
                        lambda: _dispatch(action, {
@@ -248,7 +255,10 @@ def build_server(ops: OpsBrain) -> MCPServer:
             # ended at "no preflight record".
             "review-plan": lambda: ops.auto.review_plan(
                 ChangePlan.from_dict(json.loads(_need(document, "document")))),
-            "decide": lambda: ops.auto.decide_change(_need(id, "id"), _need(plan, "plan"))}))
+            "decide": lambda: ops.auto.decide_change(_need(id, "id"), _need(plan, "plan")),
+            "postflight": lambda: ops.auto.postflight(_need(id, "id"), _need(plan, "plan"),
+                                                     verification=(json.loads(_need(document, "document"))
+                                                                   if document else None))}))
 
     return server
 

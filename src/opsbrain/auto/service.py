@@ -844,6 +844,76 @@ class AutoService:
         return (f"profile {profile.name!r} does not cover the target {change.target!r}; it covers "
                 f"{', '.join(sorted(profile.allowed_targets))}")
 
+    def _execution_recorded(self, change: Any) -> bool:
+        """Whether the spent lease has a recorded result, and therefore whether the work finished.
+
+        `applied` is written when the lease is consumed, which is before the detached job runs - it means
+        "authorised and dispatched", not "landed". The completion flag lives on the approval and is set
+        by `record_outcome` alone, so it is the one durable fact that distinguishes a finished execution
+        from a running one, and the only one a postflight may rely on.
+        """
+        approval_id = str(change.engine_approval or "")
+        if not approval_id or self.engine() is None or self.engine().approvals is None:
+            return False
+        try:
+            approval = self.engine().approvals.get(approval_id)  # type: ignore[union-attr]
+        except OpsError:
+            return False
+        return bool(approval.outcome.get("executed"))
+
+    def postflight(self, change_id: str, plan_id: str, *,
+                   verification: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Ask whether the change achieved its goal, and record the answer against the change.
+
+        The judgement is an observation, not an authority: the postflight can say the work did not land,
+        but it cannot authorise anything, and it cannot be shown a passing report that was never produced.
+        """
+        from .postflight import postflight as judge
+        from .postflight import unobserved
+
+        self.guard_enabled()
+        change = self.core.changes.get(change_id)
+        # The change remembers which plan it was decided under, and the postflight asks whether *that*
+        # plan's goal was met. Taking a caller's `plan_id` at its word let any stored plan be judged
+        # against this change - so the objective, the post-checks and the whole rubric were about
+        # something the change never ran, and the audit entry said otherwise.
+        recorded = str(change.details.get("plan_id") or "")
+        if recorded and plan_id != recorded:
+            raise OpsError(f"change {change_id} was decided under plan {recorded}, not {plan_id}; judging "
+                           f"it against {plan_id} would be assessing one piece of work by another's criteria")
+        # A change that has not finished running has no outcome to observe. `applied` is not that fact:
+        # it is set when the lease is consumed, which happens *before* the detached job runs, so it
+        # means "authorised and dispatched" rather than "landed". Refusing on every state but `discarded`
+        # let a caller submit a matching PASS report for a change still sitting in `pending` and be told
+        # the work succeeded. What settles it is a recorded execution result.
+        outcome_recorded = self._execution_recorded(change)
+        if change.state != "applied" or not outcome_recorded:
+            refused = unobserved(change_id, plan_id,
+                                 f"the change is {change.state} and "
+                                 f"{'its result was recorded' if outcome_recorded else 'nothing has recorded '
+                                    'its result yet'}; a postflight judges work that ran, and this has not "
+                                    f"finished running")
+            self.audit.record(event="postflight", change=change_id, plan=plan_id, state=change.state,
+                              outcome=refused.outcome.value, reason=refused.reason, review=refused.review_id)
+            return {**refused.to_dict(), "next": "apply the change and record what it did, then judge it"}
+        record = self.preflight().get_by_plan(plan_id)
+        plan = ChangePlan.from_dict(record["plan_document"])
+        # `plan.id` covers the arguments; `plan_hash` covers the objective, the post-checks and the
+        # rollback - which are exactly the criteria the judgement reasons over. Checking the id alone let
+        # a self-consistent document that keeps the same operations and changes those criteria pass, and
+        # the change would be judged by a rubric nobody reviewed.
+        if plan.id != plan_id or (record.get("plan_hash") and plan.plan_hash != record["plan_hash"]):
+            raise OpsError(f"the preflight record for {plan_id} carries a different plan: the stored review "
+                           "says nothing about it")
+        result = judge(self.reviews, change_id=change_id, plan_id=plan_id, objective=plan.objective,
+                       post_checks=tuple(plan.post_checks), rollback=plan.rollback,
+                       verification=verification)
+        # The state travels with the judgement: a `confirmed` recorded against a change that was still
+        # `pending` is a fact about the audit trail, and the trail is what an operator later reads.
+        self.audit.record(event="postflight", change=change_id, plan=plan_id, state=change.state,
+                          outcome=result.outcome.value, reason=result.reason, review=result.review_id)
+        return {**result.to_dict(), "next": result.next_action()}
+
     def _evidence_state(self, evidence_ids: Sequence[str],
                         change_id: str = "") -> tuple[tuple[str, ...], str, float]:
         """Re-read and re-check every bundle a decision rests on, and answer with what is true now.

@@ -755,6 +755,103 @@ def _passing_report(change_id: str) -> dict[str, Any]:
             "evidence_refs": ["ev-aaaaaaaabbbbbbbb"]}
 
 
+def test_a_change_that_ran_is_judged_against_the_goal_its_own_plan_set(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The one question the rest of the pipeline never asks: did it actually work?
+
+    Everything before this answers "is this work worth running" and "did the facts move the way the plan
+    said". Neither is "did it help". A change can apply cleanly, satisfy every check it declared, and
+    leave the problem exactly as it was.
+    """
+    change, plan = _applied_change(ops, tmp_path)
+    out = ops.auto.postflight(change.id, plan.id, verification=_passing_report(change.id))
+    assert out["outcome"] == "confirmed", out
+    assert out["next"] == "the change did what the plan said; close it"
+    assert out["review_id"].startswith("rv-"), "a confirmation is somebody's answer, not the absence of one"
+
+
+def test_the_reviewer_is_shown_the_report_and_told_it_cannot_authorise(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Ground truth in, authority out.
+
+    The reviewer is asked to judge, not to recall: the verification report travels in the request, and the
+    request says in as many words that authorising is not its to do. A postflight that could approve
+    would be a second way around the deterministic engine, which is the one thing the whole design is
+    built to prevent.
+    """
+    change, plan = _applied_change(ops, tmp_path)
+    ops.auto.postflight(change.id, plan.id, verification=_passing_report(change.id))
+    asked = ops.auto.reviews._reviewer.requests[-1]
+    assert "systemctl show logrotate" in asked.context, "the checks the plan declared travel with the request"
+    assert "PASS" in asked.context, "so does what the verification actually reported"
+    assert "authorisation is not yours to give" in asked.context, asked.context
+    assert asked.rubric_version != "", "a postflight answered from the preflight's cache would judge nothing"
+
+
+def test_a_change_that_never_ran_cannot_be_confirmed_by_a_passing_report(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The report is supplied by the caller, so its saying `PASS` is worth exactly nothing on its own.
+
+    A change that was discarded has an outcome, and it is "nothing ran". A report can be produced for it
+    anyway, and every check in that report will pass - because none of them ever touched anything. The
+    one fact that settles this is the change's own state, so that is what the guard reads.
+    """
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    ops.auto.review_plan(plan)
+    ops.changes.discard(change.id)
+    before = len(ops.auto.reviews._reviewer.requests)
+    out = ops.auto.postflight(change.id, plan.id, verification=_passing_report(change.id))
+    assert out["outcome"] == "unclear", out
+    assert "discarded" in out["reason"], out
+    assert out["review_id"] == "", "nobody was asked about work that never ran"
+    assert len(ops.auto.reviews._reviewer.requests) == before, "the model was consulted anyway"
+
+
+def test_the_report_reaches_the_postflight_the_way_a_client_sends_it(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The JSON argument has to survive the MCP layer, which used to rewrite it before it got there.
+
+    The surface carries JSON in one parameter, `document`. The MCP server pre-parses a string argument
+    into JSON whenever the annotation is anything other than exactly `str` - a convenience aimed at
+    Claude Desktop - so a client that did the obvious thing and sent the plan or the report as a JSON
+    string had it turned into a dict, and then rejected as "not a string". `review-plan` was therefore
+    unreachable over the real surface, and no test caught it because every one of them called the Python
+    method rather than the tool. Both halves of the flow are exercised here through the tool itself.
+    """
+    import asyncio as _asyncio
+
+    from opsbrain.server import build_server
+
+    change, plan = _applied_change(ops, tmp_path)
+    server = build_server(ops)
+
+    submitted = json.loads(json.dumps(plan.to_dict()))
+    reviewed = _asyncio.run(server.call_tool("autonomy", {
+        "action": "review-plan", "document": json.dumps(submitted)}))
+    assert json.loads(reviewed.content[0].text)["plan"] == plan.id
+
+    result = _asyncio.run(server.call_tool("autonomy", {
+        "action": "postflight", "id": change.id, "plan": plan.id,
+        "document": json.dumps(_passing_report(change.id))}))
+    payload = json.loads(result.content[0].text)
+    assert payload["outcome"] == "confirmed", payload
+    assert payload["plan_id"] == plan.id, "the answer is about the plan it was asked about"
+
+
+def test_the_postflight_records_the_state_it_judged_against(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`confirmed` against a change still sitting in `pending` is a statement about the audit trail.
+
+    The trail is what an operator reads later, and "the model said it worked" is not a fact about the
+    world. The state travels with the judgement so the two can be read against each other.
+    """
+    change, plan = _applied_change(ops, tmp_path)
+    ops.auto.postflight(change.id, plan.id, verification=_passing_report(change.id))
+    events = [row for row in ops.audit.entries() if row.get("event") == "postflight"]
+    assert events, "the judgement left no trace"
+    assert events[-1]["state"] == "applied", events[-1]
+    assert events[-1]["outcome"] == "confirmed", events[-1]
+
+
 def test_a_change_against_a_target_the_plan_never_named_is_refused(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
     """The review covers the targets the plan names, and nothing else."""
     _autonomous_ops(ops, tmp_path)
@@ -1074,8 +1171,8 @@ def test_the_instructions_describe_the_path_the_deployment_actually_has(ops) -> 
         assert f"action={step}" in text, f"the flow needs {step} and the instructions do not name it: {text}"
     assert "autonomy" in text, "the tool the steps belong to is named"
     assert "opsbrain approve" not in text, "the path that is guaranteed to fail is not"
-    assert text.index("action=review-plan") < text.index("action=decide"), (
-        "the order is the one the gate needs: review, then decide")
+    assert text.index("action=review-plan") < text.index("action=decide") < text.index("action=postflight"), (
+        "the order is the one the gate needs: review, then decide, then judge what it did")
 
 
 def test_the_reviewer_is_shown_the_arguments_the_approval_is_bound_to() -> None:
@@ -1947,7 +2044,7 @@ def test_the_advertised_mcp_flow_can_actually_be_started(ops, tmp_path) -> None:
     assert reviewed["plan"] == plan.id, "a plan round-tripped through the wire is the same plan"
     out = ops.auto.decide_change(change.id, plan.id)
     assert out["decision"]["decision"] == "APPROVE", out["decision"].get("detail", out)
-    assert AUTONOMOUS_FLOW == ("review-plan", "decide"), (
+    assert AUTONOMOUS_FLOW == ("review-plan", "decide", "postflight"), (
         "the steps the instructions name are the ones the action table carries")
 
 
@@ -2051,6 +2148,27 @@ def test_a_needs_evidence_retry_obeys_every_ceiling_not_just_the_repair_count(tm
     # And with budget left it still retries, so the ceiling is what changed and not the verdict.
     assert broke.decide(inputs(review_verdict="NEEDS_EVIDENCE", attempts=0, calls_used=0),
                         "pl-1", "ah-1", change_id="c-1", review_ids=reviews).decision is D.RETRY
+
+
+def test_the_instructions_name_the_apply_and_the_verification_between_decide_and_postflight(ops) -> None:  # type: ignore[no-untyped-def]
+    """The advertised flow has to actually change something, or it is a diagram of a workflow.
+
+    The steps were listed as review, decide, postflight. A client following that to the letter reaches
+    the judgement with a change still pending and no report of anything having happened - and is told the
+    change did what it was supposed to. The apply is what spends the approval; the verification is what
+    the judgement reasons over.
+    """
+    from opsbrain.auto.config import AutoConfig
+    from opsbrain.server import build_instructions
+
+    autonomous = ops.config.model_copy(update={"auto": AutoConfig(
+        enabled=True, autonomy_token=TOKEN, decision={"mode": "autonomous"})})
+    text = build_instructions(autonomous)
+    assert "action=apply" in text, "nothing in the instructions spends the approval"
+    assert "action=verify-plan" in text, "and nothing measures whether the change worked"
+    # Naming them is not enough on its own: the postflight judges what the verification measured, so the
+    # two have to be placed between the decision and the judgement, and the text has to say where.
+    assert "between the second and the third" in text, text[text.index("action=decide"):][:200]
 
 
 def test_an_autonomous_ansible_apply_settles_its_lease_when_the_job_finishes(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -2195,3 +2313,21 @@ def test_a_change_a_real_ansible_check_produced_can_still_be_decided(ops, tmp_pa
     assert out["decision"]["decision"] == "APPROVE", out["decision"].get("detail", out)
 
 
+def test_a_postflight_is_refused_while_the_apply_is_still_only_authorised(ops, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`applied` is written when the lease is consumed, which is before the detached job runs.
+
+    Refusing on every state but `discarded` let a caller submit a matching PASS report for a change still
+    in `pending` and be told the work succeeded. What settles it is a recorded execution result.
+    """
+    _autonomous_ops(ops, tmp_path)
+    change = ops.changes.create("tofu.apply", "proxmox", "restart logrotate", "ph-1",
+                                args={"plan_file": ".opsbrain/j-1234abcd.tfplan"},
+                                details={"plan_sha256": "ab" * 32})
+    plan = _plan_for_change(bundle_id=_bundle(ops, tmp_path, change.id))
+    ops.auto.review_plan(plan)
+    ops.auto.decide_change(change.id, plan.id)
+
+    out = ops.auto.postflight(change.id, plan.id, verification=_passing_report(change.id))
+    assert out["outcome"] == "unclear", out
+    assert out["review_id"] == "", "nobody was asked about work that has not run"
+    assert "has not finished running" in out["reason"], out["reason"]
