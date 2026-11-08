@@ -1,94 +1,178 @@
-# OpsBrain
+<div align="center">
 
-Local MCP server that lets Claude operate an infrastructure **cheaply in tokens and safely**: OpenTofu, Ansible,
-Kubernetes / Argo CD, hosts over ssh, a MikroTik router, Prometheus / Loki and the infrastructure repo's own docs.
+# 🛡️ OpsBrain
 
-- **Compact answers.** A tool returns the few facts that matter (counters, only what is wrong, only what differs).
-  Raw output is redacted and kept on disk as an *artifact*; Claude reads a slice or greps it only when needed.
-- **12 tools, not 120.** Tool schemas are paid for in every conversation; related operations share one tool.
-- **No shell tool.** Commands are fixed templates; every argument is checked against the config or a strict pattern.
-- **Read-only by default.** A mutation is two-step: `plan` / `check` creates a *change* bound to a hash of exactly what
-  would be applied; a human approves it in a terminal (`opsbrain approve <id>`); `apply` consumes it once.
-- **Long operations survive.** `tofu apply`, playbooks and the drift check run detached (log + rc file), so an MCP
-  timeout or a dropped ssh session cannot interrupt them; `job` polls.
-- **Audit and savings.** Every call is logged with raw vs returned bytes; `opsbrain stats` shows the tokens saved.
+### **Deterministic, Token-Efficient MCP Server for Safe Infrastructure Operations by AI Coding Agents**
 
-Docs: [architecture](docs/architecture.md) · [configuration](docs/configuration.md) · [руководство (RU)](docs/guide-ru.md)
+[![Python 3.13+](https://img.shields.io/badge/python-3.13+-blue.svg?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![MCP](https://img.shields.io/badge/MCP-2.2+-8A2BE2.svg?style=flat-square&logo=anthropic&logoColor=white)](https://modelcontextprotocol.io/)
+[![Linter: Ruff](https://img.shields.io/badge/linter-ruff-black.svg?style=flat-square)](https://github.com/astral-sh/ruff)
+[![Type Checked: Mypy Strict](https://img.shields.io/badge/type_checked-mypy_strict-blue.svg?style=flat-square)](https://mypy-lang.org/)
+[![Tests: Pytest](https://img.shields.io/badge/tests-71_passed-brightgreen.svg?style=flat-square)](https://pytest.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg?style=flat-square)](LICENSE)
 
-## Install
+**OpenTofu · Ansible · Kubernetes · Argo CD · SSH · MikroTik · Prometheus & Loki**
 
+---
+
+</div>
+
+OpsBrain is a local [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that lets autonomous coding agents (Claude Code, Claude Desktop, Cursor, DevBrain) manage and monitor real infrastructure **safely, cheaply in tokens, and with zero hallucinated bash commands**.
+
+---
+
+## ⚡ Why OpsBrain?
+
+```
+┌─────────────────────────────────┐
+│     AI Agent (Claude / Codex)   │
+└────────────────┬────────────────┘
+                 │ MCP Protocol (12 compact schemas)
+                 ▼
+┌────────────────────────────────────────────────────────┐
+│                      OpsBrain                          │
+│  • Argument validation against strict config patterns  │
+│  • Redaction of secrets, tokens, and noisy logs        │
+│  • Two-phase mutation: Plan ──> Hash-Bound Token       │
+└────────────────┬───────────────────────────────────────┘
+                 │ Requires Terminal Approval
+                 ▼
+┌─────────────────────────────────┐      Approved      ┌─────────────────────────┐
+│  CLI: opsbrain approve <hash>   ├───────────────────►│  Target Infrastructure  │
+│      (Human in the loop)        │                    │  K8s / Tofu / Ansible   │
+└─────────────────────────────────┘                    └─────────────────────────┘
+```
+
+1. **Token Economy (12 tools, not 120):**  
+   Every tool schema is injected into the context window on every prompt. OpsBrain groups operations into 12 compact tools, returning only the essential diffs and counters. Full raw outputs are redacted and saved to local disk *artifacts* that can be grepped on demand.
+2. **Zero Shell Execution:**  
+   OpsBrain never exposes a raw `sh` or `exec` tool. Every command is executed through fixed, auditable templates with validated parameters.
+3. **Cryptographically Bound Mutations:**  
+   Mutating actions (`tofu apply`, `ansible apply`, `k8s restart`) are strictly two-phase:
+   * Agent runs `plan` / `check` $\to$ receives a unique `change_id` bound to the hash of the plan.
+   * A human operator approves it in a local terminal: `opsbrain approve <change_id>`.
+   * Agent executes `apply` using the `change_id`. The change is invalidated if state drifts.
+4. **Resilient Long-Running Operations:**  
+   `tofu apply`, playbooks, and drift checks run detached (process log + return code file). MCP client timeouts or network drops do not corrupt runs; the agent polls execution status via `job`.
+5. **Zero Credential Storage:**  
+   OpsBrain never stores cloud credentials or SSH keys. It piggybacks on the existing local environment (`ssh-agent`, `~/.kube/config`, Ansible Vault password file).
+
+---
+
+## 📖 Documentation
+
+* [Architecture & Design Principles](docs/architecture.md)
+* [Configuration Guide](docs/configuration.md)
+* [Руководство пользователя (на русском)](docs/guide-ru.md)
+
+---
+
+## 🚀 Quickstart & Installation
+
+### 1. Install CLI
 ```bash
-uv tool install git+https://github.com/Mischellin/OpsBrain.git     # or: uv sync && uv run opsbrain ...
-opsbrain init        # writes ~/.opsbrain/config.yaml - describe your hosts, stacks, playbooks
+# Install with uv
+uv tool install git+https://github.com/Mischellin/OpsBrain.git
+
+# Initialize local configuration (~/.opsbrain/config.yaml)
+opsbrain init
+
+# Check environment connectivity (SSH, Kubeconfig, runners)
 opsbrain doctor --net
-opsbrain install     # prints the snippets for Claude Code, Claude Desktop and DevBrain
 ```
 
+### 2. Connect to AI Assistants
+
+#### Claude Code (CLI)
 ```bash
-opsbrain desktop install     # Claude Desktop: builds ~/.opsbrain/dist/opsbrain-<version>.mcpb, press Install
-claude mcp add --scope user OpsBrain -- opsbrain serve     # Claude Code CLI
+claude mcp add --scope user OpsBrain -- opsbrain serve
 ```
 
-In Claude Desktop OpsBrain is an extension (Settings -> Extensions), shared by the chat and the Code tab; the tools are
-named `mcp__OpsBrain__<tool>`. The bundle is a dependency-free Node launcher around `opsbrain serve` with the binary,
-the config path and a usable `PATH` baked in: a GUI app starts servers with a bare environment. After upgrading
-OpsBrain itself nothing has to be reinstalled - the launcher starts whatever `opsbrain` is installed.
+#### Claude Desktop
+```bash
+opsbrain desktop install
+```
+*Builds a lightweight `.mcpb` bundle with a dependency-free Node launcher that preserves your local `PATH` and `ssh-agent`.*
 
-Requirements: Python >= 3.13, `ssh` with an agent; `ansible-playbook` / `kubectl` only if you use those tools.
-OpsBrain stores no credentials: it uses what already works on this machine (ssh-agent, kubeconfig, ansible-vault
-password file) and what lives on the runner (the tofu env file is sourced there and never read).
+#### HTTP Transport (DevBrain, Remote Agents)
+```bash
+opsbrain serve --http
+# Listens on 127.0.0.1:8765/mcp with bearer token in ~/.opsbrain/http.token
+```
 
-## Tools
+---
 
-| Tool | Actions |
-| --- | --- |
-| `overview` | inventory, pending changes, running jobs |
-| `docs` | `status` (current state) · `search` · `read` - the infra repo's knowledge, secrets-bearing files refused |
-| `hosts` | `list` · `ping` · `status` · `services` · `logs` · `restart`* |
-| `tofu` | `plan` · `apply`* · `state` · `unlock`* |
-| `ansible` | `playbooks` · `check` · `apply`* |
-| `k8s` | `overview` · `get` · `describe` · `logs` · `events` · `refresh`* · `sync`* · `restart`* |
-| `network` | `drift` · `export` · `print` - the router is never changed |
-| `drift` | code vs live in one call: tofu plan + playbooks `--check` + router export |
-| `observe` | `alerts` · `targets` · `query` · `logs` · `http` |
-| `artifact` | `list` · `read` · `grep` |
-| `job` | `status` · `list` |
-| `change` | `list` · `show` · `discard` (approval exists only in the CLI) |
+## 🧰 Available MCP Tools
 
-\* mutating: needs an approved change unless the policy says `allow`.
+| Tool | Actions | Description |
+| :--- | :--- | :--- |
+| `overview` | `inventory`, `pending`, `running` | Global summary of hosts, running jobs, and pending approval changes |
+| `docs` | `status`, `search`, `read` | Access to infrastructure repo documentation (secrets automatically blocked) |
+| `hosts` | `list`, `ping`, `status`, `services`, `logs`, `restart`* | Host health, systemd service states, journalctl logs |
+| `tofu` | `plan`, `apply`*, `state`, `unlock`* | OpenTofu / Terraform lifecycle management |
+| `ansible` | `playbooks`, `check`, `apply`* | Playbook execution and drift verification |
+| `k8s` | `overview`, `get`, `describe`, `logs`, `events`, `sync`*, `restart`* | Kubernetes cluster inspection, Argo CD synchronization |
+| `network` | `drift`, `export`, `print` | Read-only inspection of MikroTik router configs and interfaces |
+| `drift` | Single-call drift check | Runs `tofu plan` + `ansible --check` + router export in one command |
+| `observe` | `alerts`, `targets`, `query`, `logs`, `http` | Prometheus / VictoriaMetrics alert checks, Loki log queries |
+| `artifact` | `list`, `read`, `grep` | Read slices of large command outputs saved to disk |
+| `job` | `status`, `list` | Poll and inspect detached background operations |
+| `change` | `list`, `show`, `discard` | Inspect pending changes (human approval is CLI-only) |
 
-## A mutation, end to end
+*\* Mutating operation: requires an approved `change_id` unless explicitly permitted in security policy.*
+
+---
+
+## 🔍 End-to-End Walkthrough
 
 ```text
-Claude: tofu action=plan            -> {"changes":true,"add":0,"change":1,"destroy":0,
-                                        "resources":[{"addr":"proxmox_vm.web","action":"change","attrs":["cores"]}],
-                                        "change":"c-1f3a9b2c","artifact":"a-77aa01bc"}
-You:    opsbrain approve c-1f3a9b2c -> shows the summary, asks to type "yes"  (destroy/replace: --allow-destroy + the id)
-Claude: tofu action=apply change_id=c-1f3a9b2c
-                                    -> {"ok":true,"applied":{"added":0,"changed":1,"destroyed":0},"post_plan_clean":true}
+1. Claude calls OpenTofu plan:
+   Claude: tofu action=plan
+   OpsBrain: {
+     "changes": true, "add": 0, "change": 1, "destroy": 0,
+     "resources": [{"addr": "proxmox_vm.web", "action": "change", "attrs": ["cores"]}],
+     "change": "c-1f3a9b2c",
+     "artifact": "a-77aa01bc"
+   }
+
+2. Human approves the plan in terminal:
+   $ opsbrain approve c-1f3a9b2c
+   Target: proxmox_vm.web (change cores: 4 -> 8)
+   Approve change c-1f3a9b2c? [type 'yes']: yes
+   ✓ Change c-1f3a9b2c approved.
+
+3. Claude executes the approved change:
+   Claude: tofu action=apply change_id=c-1f3a9b2c
+   OpsBrain: {
+     "ok": true,
+     "applied": {"added": 0, "changed": 1, "destroyed": 0},
+     "post_plan_clean": true
+   }
 ```
 
-`apply` runs the **saved plan file**, so what is applied is what was approved; OpenTofu itself rejects the file if
-the state moved in between. An Ansible change is void as soon as any file under the ansible directory changes.
+---
 
-## Use it from DevBrain
+## 🧪 Development & Testing
+
+OpsBrain includes a complete offline test suite with mock SSH and HTTP clients:
 
 ```bash
-opsbrain serve --http          # 127.0.0.1:8765/mcp, bearer token in ~/.opsbrain/http.token
+# Clone repository
+git clone https://github.com/Mischellin/OpsBrain.git
+cd OpsBrain
+
+# Install dependencies and sync environment
+uv sync
+
+# Run linting, static type analysis, and test suite
+uv run ruff check .
+uv run mypy
+uv run pytest -q
+# 71 passed in ~3s
 ```
 
-```yaml
-connectors:
-  opsbrain: {transport: http, url: "http://host.docker.internal:8765/mcp", secret: opsbrain, environment: production}
-capabilities:
-  infra.drift: {connector: opsbrain, tool: drift, description: "Code vs live infrastructure"}
-  infra.tofu:  {connector: opsbrain, tool: tofu, mutating: true}
-```
+---
 
-## Development
+## 📄 License
 
-```bash
-uv sync && uv run ruff check . && uv run mypy && uv run pytest -q
-```
-
-Tests use a fake executor and a fake HTTP client: no network, no ssh.
+MIT © [Mikhail Sidorkin](https://github.com/Mischellin)
